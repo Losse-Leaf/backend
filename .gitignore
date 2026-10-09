@@ -7,6 +7,8 @@
 loose-leaf-server
 chimu-server
 server
+tmp/
+build-errors.log
 
 # Local database files
 *.db

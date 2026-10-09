@@ -3,16 +3,18 @@ package config
 import (
 	"bufio"
 	"os"
+	"strconv"
 	"strings"
 )
 
 type R2Config struct {
-	AccountID       string
-	AccessKeyID     string
-	SecretAccessKey string
-	BucketName      string
-	Endpoint        string
-	PublicDomain    string
+	AccountID            string
+	AccessKeyID          string
+	SecretAccessKey      string
+	BucketName           string
+	Endpoint             string
+	PublicDomain         string
+	PresignExpireSeconds int // 临时签名 URL 有效期 (秒)，默认 1800 秒 (30 分钟)
 }
 
 type Config struct {
@@ -24,11 +26,14 @@ type Config struct {
 
 var AppConfig Config
 
-// loadDotEnv 轻量读取当前工作目录下的 .env 文件
+// loadDotEnv 轻量读取当前工作目录或 backend/ 下的 .env 文件
 func loadDotEnv() {
 	file, err := os.Open(".env")
 	if err != nil {
-		return
+		file, err = os.Open("backend/.env")
+		if err != nil {
+			return
+		}
 	}
 	defer file.Close()
 
@@ -62,7 +67,7 @@ func LoadConfig() Config {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "8088"
 	}
 
 	adminKey := strings.TrimSpace(os.Getenv("ADMIN_API_KEY"))
@@ -73,13 +78,29 @@ func LoadConfig() Config {
 		endpoint = "https://" + accountID + ".r2.cloudflarestorage.com"
 	}
 
+	expireSec := 1800 // 默认 30 分钟 (1800 秒)
+	if s := os.Getenv("R2_PRESIGN_EXPIRES"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			expireSec = v
+		}
+	} else if s := os.Getenv("R2_PRESIGN_EXPIRE_MINUTES"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			expireSec = v * 60
+		}
+	} else if s := os.Getenv("R2_PRESIGN_EXPIRE_SECONDS"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			expireSec = v
+		}
+	}
+
 	r2Cfg := R2Config{
-		AccountID:       accountID,
-		AccessKeyID:     strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
-		SecretAccessKey: strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
-		BucketName:      strings.TrimSpace(os.Getenv("R2_BUCKET_NAME")),
-		Endpoint:        endpoint,
-		PublicDomain:    strings.TrimRight(strings.TrimSpace(os.Getenv("R2_PUBLIC_DOMAIN")), "/"),
+		AccountID:            accountID,
+		AccessKeyID:          strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
+		SecretAccessKey:      strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
+		BucketName:           strings.TrimSpace(os.Getenv("R2_BUCKET_NAME")),
+		Endpoint:             endpoint,
+		PublicDomain:         strings.TrimRight(strings.TrimSpace(os.Getenv("R2_PUBLIC_DOMAIN")), "/"),
+		PresignExpireSeconds: expireSec,
 	}
 
 	AppConfig = Config{

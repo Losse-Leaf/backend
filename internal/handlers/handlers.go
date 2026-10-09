@@ -76,12 +76,30 @@ func formatDatesFromTime(e *models.LifeEntry) {
 	e.Date = fmt.Sprintf("%s.%s.%s", e.Year, e.Month, e.Day)
 }
 
-// populateAttachmentURLs 填充附件的公开或代理访问 URL
+// populateAttachmentURLs 填充附件的动态临时预签名访问 URL (默认 30 分钟有效)
 func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	for i := range atts {
-		atts[i].URL = storage.GetPublicURL(atts[i].ObjectKey)
+		atts[i].URL = storage.SignResourceURL(atts[i].ObjectKey)
 	}
 	return atts
+}
+
+// signImagesString 对逗号分割的图片相对路径或 URL 列表进行批量动态签名
+func signImagesString(imagesStr string) string {
+	imagesStr = strings.TrimSpace(imagesStr)
+	if imagesStr == "" {
+		return ""
+	}
+	parts := strings.Split(imagesStr, ",")
+	var signedParts []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		signedParts = append(signedParts, storage.SignResourceURL(p))
+	}
+	return strings.Join(signedParts, ",")
 }
 
 // ==========================================
@@ -131,15 +149,15 @@ func CreateLifeEntry(c *gin.Context) {
 			Where("id IN ?", req.AttachmentIDs).
 			Update("entry_id", entry.ID)
 
-		// 同步到旧版 images 字段以保证老组件兼容
+		// 同步到旧版 images 字段以保证老组件兼容 (存相对路径 keys，查询时动态签名)
 		var atts []models.Attachment
 		db.DB.Where("id IN ?", req.AttachmentIDs).Find(&atts)
 		if len(atts) > 0 {
-			var urls []string
+			var keys []string
 			for _, a := range atts {
-				urls = append(urls, storage.GetPublicURL(a.ObjectKey))
+				keys = append(keys, a.ObjectKey)
 			}
-			entry.Images = strings.Join(urls, ",")
+			entry.Images = strings.Join(keys, ",")
 			db.DB.Model(&entry).Update("images", entry.Images)
 		}
 	}
@@ -147,6 +165,11 @@ func CreateLifeEntry(c *gin.Context) {
 	// 重新预加载关联
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
 	entry.Attachments = populateAttachmentURLs(entry.Attachments)
+	if entry.Images != "" {
+		entry.Images = signImagesString(entry.Images)
+	} else if len(entry.Attachments) > 0 {
+		entry.Images = entry.Attachments[0].URL
+	}
 
 	Success(c, entry)
 }
@@ -208,8 +231,10 @@ func GetLifeEntriesV1(c *gin.Context) {
 
 	for i := range entries {
 		entries[i].Attachments = populateAttachmentURLs(entries[i].Attachments)
-		// 如果 images 为空但有附件，反向补齐 images 供首屏渲染
-		if entries[i].Images == "" && len(entries[i].Attachments) > 0 {
+		// 动态签名现有 images 字段中的相对路径 (或回退到首个附件的动态签名地址)
+		if entries[i].Images != "" {
+			entries[i].Images = signImagesString(entries[i].Images)
+		} else if len(entries[i].Attachments) > 0 {
 			entries[i].Images = entries[i].Attachments[0].URL
 		}
 	}
@@ -232,7 +257,9 @@ func GetLifeEntryByID(c *gin.Context) {
 	}
 
 	entry.Attachments = populateAttachmentURLs(entry.Attachments)
-	if entry.Images == "" && len(entry.Attachments) > 0 {
+	if entry.Images != "" {
+		entry.Images = signImagesString(entry.Images)
+	} else if len(entry.Attachments) > 0 {
 		entry.Images = entry.Attachments[0].URL
 	}
 
@@ -306,6 +333,11 @@ func UpdateLifeEntry(c *gin.Context) {
 
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
 	entry.Attachments = populateAttachmentURLs(entry.Attachments)
+	if entry.Images != "" {
+		entry.Images = signImagesString(entry.Images)
+	} else if len(entry.Attachments) > 0 {
+		entry.Images = entry.Attachments[0].URL
+	}
 
 	Success(c, entry)
 }
@@ -428,7 +460,7 @@ func CompleteUpload(c *gin.Context) {
 		return
 	}
 
-	att.URL = storage.GetPublicURL(att.ObjectKey)
+	att.URL = storage.SignResourceURL(att.ObjectKey)
 	Success(c, att)
 }
 
@@ -825,6 +857,51 @@ func GetNowStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, now)
 }
 
+// UpdateNowStatus 更新「此刻的我」当下状态 (需管理员/已配对凭据)
+func UpdateNowStatus(c *gin.Context) {
+	var now models.NowStatus
+	db.DB.FirstOrCreate(&now)
+
+	var req models.NowStatus
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+
+	if req.Building != "" {
+		now.Building = strings.TrimSpace(req.Building)
+	}
+	if req.Learning != "" {
+		now.Learning = strings.TrimSpace(req.Learning)
+	}
+	if req.Playing != "" {
+		now.Playing = strings.TrimSpace(req.Playing)
+	}
+	if req.Listening != "" {
+		now.Listening = strings.TrimSpace(req.Listening)
+	}
+	if req.Reading != "" {
+		now.Reading = strings.TrimSpace(req.Reading)
+	}
+	if req.Thinking != "" {
+		now.Thinking = strings.TrimSpace(req.Thinking)
+	}
+	if req.Using != "" {
+		now.Using = strings.TrimSpace(req.Using)
+	}
+	if req.Location != "" {
+		now.Location = strings.TrimSpace(req.Location)
+	}
+	now.LastUpdated = time.Now().Format("2006.01.02")
+
+	if err := db.DB.Save(&now).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新当下状态失败: "+err.Error())
+		return
+	}
+
+	Success(c, now)
+}
+
 func GetProjects(c *gin.Context) {
 	var projects []models.Project
 	query := db.DB.Order("`order` ASC, id DESC")
@@ -877,14 +954,87 @@ func GetConfig(c *gin.Context) {
 	var config models.SiteConfig
 	if err := db.DB.First(&config).Error; err != nil {
 		c.JSON(http.StatusOK, models.SiteConfig{
-			SiteName:  "迟暮的生活档案馆",
-			Domain:    "codeactivityhub.top",
-			ICPNumber: "浙ICP备2026081664号",
-			ICPLink:   "https://beian.miit.gov.cn",
+			SiteName:        "散页 · Living Archive",
+			SiteSubtitle:    "迟暮的生活数字档案馆",
+			CuratorName:     "迟暮",
+			CuratorEn:       "ChiMu",
+			DefaultLocation: "中国 · 杭州",
+			Domain:          "codeactivityhub.top",
+			ICPNumber:       "浙ICP备2026081664号",
+			ICPLink:         "https://beian.miit.gov.cn",
 		})
 		return
 	}
 	c.JSON(http.StatusOK, config)
+}
+
+func GetConfigV1(c *gin.Context) {
+	var config models.SiteConfig
+	if err := db.DB.First(&config).Error; err != nil {
+		config = models.SiteConfig{
+			SiteName:        "散页 · Living Archive",
+			SiteSubtitle:    "迟暮的生活数字档案馆",
+			CuratorName:     "迟暮",
+			CuratorEn:       "ChiMu",
+			DefaultLocation: "中国 · 杭州",
+			Domain:          "codeactivityhub.top",
+			ICPNumber:       "浙ICP备2026081664号",
+			ICPLink:         "https://beian.miit.gov.cn",
+		}
+	}
+	Success(c, config)
+}
+
+func UpdateConfig(c *gin.Context) {
+	var config models.SiteConfig
+	db.DB.FirstOrCreate(&config)
+
+	var req models.SiteConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+
+	if req.SiteName != "" {
+		config.SiteName = strings.TrimSpace(req.SiteName)
+	}
+	if req.SiteSubtitle != "" {
+		config.SiteSubtitle = strings.TrimSpace(req.SiteSubtitle)
+	}
+	if req.CuratorName != "" {
+		config.CuratorName = strings.TrimSpace(req.CuratorName)
+	}
+	if req.CuratorEn != "" {
+		config.CuratorEn = strings.TrimSpace(req.CuratorEn)
+	}
+	if req.DefaultLocation != "" {
+		config.DefaultLocation = strings.TrimSpace(req.DefaultLocation)
+	}
+	if req.SiteDesc != "" {
+		config.SiteDesc = strings.TrimSpace(req.SiteDesc)
+	}
+	if req.Domain != "" {
+		config.Domain = strings.TrimSpace(req.Domain)
+	}
+	if req.ICPNumber != "" {
+		config.ICPNumber = strings.TrimSpace(req.ICPNumber)
+	}
+	if req.ICPLink != "" {
+		config.ICPLink = strings.TrimSpace(req.ICPLink)
+	}
+	if req.PoliceNumber != "" {
+		config.PoliceNumber = strings.TrimSpace(req.PoliceNumber)
+	}
+	if req.PoliceCode != "" {
+		config.PoliceCode = strings.TrimSpace(req.PoliceCode)
+	}
+
+	if err := db.DB.Save(&config).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新站点配置失败: "+err.Error())
+		return
+	}
+
+	Success(c, config)
 }
 
 func HealthCheck(c *gin.Context) {

@@ -1,52 +1,99 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"net/http"
 	"strings"
+	"time"
 
 	"chimu-lab/internal/config"
+	"chimu-lab/internal/db"
+	"chimu-lab/internal/models"
 
 	"github.com/gin-gonic/gin"
 )
 
-// AdminAuthRequired 管理员操作鉴权中间件
-// 当环境变量或 .env 中配置了 ADMIN_API_KEY 时，对写接口强制进行密钥核验
-// 若未配置 ADMIN_API_KEY，放行并允许本地开发快速体验
+// hashToken 计算 Token 的 SHA-256 哈希
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// AdminAuthRequired 管理员操作鉴权中间件 (支持母密钥与已配对设备双轨鉴权)
+// 轨一：匹配服务器 .env 中的 ADMIN_API_KEY (Master Key)
+// 轨二：匹配 devices 表中有效激活的 Device Token (受信任设备)
 func AdminAuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		expectedKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
-		if expectedKey == "" {
-			// 未设置密钥时放行（本地开发模式）
-			c.Next()
-			return
-		}
+		expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
 
-		// 1. 尝试从 Authorization: Bearer <key> 头部获取
-		authHeader := c.GetHeader("Authorization")
+		// 1. 提取客户端携带的 Token (按优先级检索各标准头)
 		token := ""
+
+		// (1) Authorization: Bearer <token>
+		authHeader := c.GetHeader("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 		}
 
-		// 2. 尝试从自定义 Header X-Admin-Key 获取
+		// (2) X-Device-Token: <token>
+		if token == "" {
+			token = strings.TrimSpace(c.GetHeader("X-Device-Token"))
+		}
+
+		// (3) X-Admin-Key: <token>
 		if token == "" {
 			token = strings.TrimSpace(c.GetHeader("X-Admin-Key"))
 		}
 
-		// 3. 尝试从 Query 参数获取 (备用)
+		// (4) Query 参数备用
 		if token == "" {
 			token = strings.TrimSpace(c.Query("admin_key"))
 		}
 
-		if token != expectedKey {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "未授权的写操作：请在右上角「设置 -> 管理员钥匙」中输入正确的密钥",
-				"data":    nil,
-			})
+		// 2. 轨一校验：比对母密钥 (Master Key) - 采用常数时间比较防范侧信道攻击
+		if token != "" && expectedMasterKey != "" {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(expectedMasterKey)) == 1 {
+				c.Set("auth_type", "master")
+				c.Next()
+				return
+			}
+		}
+
+		// 3. 轨二校验：比对已配对受信任设备令牌 (Device Token)
+		if token != "" && db.DB != nil {
+			tHash := hashToken(token)
+			var device models.Device
+			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).First(&device).Error; err == nil {
+				// 异步轻量更新设备的最近活跃时间
+				now := time.Now()
+				go func(dID uint, activeTime time.Time) {
+					if db.DB != nil {
+						_ = db.DB.Model(&models.Device{}).Where("id = ?", dID).Update("last_active_at", activeTime).Error
+					}
+				}(device.ID, now)
+
+				c.Set("auth_type", "device")
+				c.Set("device_id", device.DeviceID)
+				c.Set("device_name", device.Name)
+				c.Next()
+				return
+			}
+		}
+
+		// 4. 若服务器未配置母密钥，且处于本地无密开发模式，放行体验
+		if expectedMasterKey == "" {
+			c.Set("auth_type", "dev_open")
+			c.Next()
 			return
 		}
 
-		c.Next()
+		// 5. 校验均未通过，拒绝访问
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"code":    http.StatusUnauthorized,
+			"message": "未授权的写操作：无效的管理员密钥或设备凭证。请在右上角设置中核对，或通过配对扫码接入。",
+			"data":    nil,
+		})
 	}
 }

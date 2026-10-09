@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -69,10 +70,33 @@ func main() {
 		v1.GET("/projects/:id", handlers.GetProjectByID)
 		v1.GET("/stats", handlers.GetGlobalStats)
 
+		// 站点与主理人身份中枢 (全端动态获取，严禁前端硬编码)
+		v1.GET("/config", handlers.GetConfigV1)
+		v1.GET("/profile", handlers.GetCuratorProfile)
+
+		// 系统生命周期与初次装帧冷启动
+		v1.GET("/system/status", handlers.GetSystemStatus)
+		v1.POST("/system/bootstrap", handlers.BootstrapSystem)
+
+		// 网页端反向扫码登录与口令验证
+		v1.POST("/auth/qr/create", handlers.CreateQRSession)
+		v1.GET("/auth/qr/poll/:session_id", handlers.PollQRSession)
+		v1.POST("/auth/verify", handlers.VerifyPasscode)
+
+		// 设备免密配对 (公开握手接口)
+		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
+
+		// 统一文件临时签名接口 (公开只读，供各端获取动态有效访问 URL)
+		v1.GET("/files/sign", handlers.SignFileURL)
+		v1.POST("/files/sign-batch", handlers.SignFilesBatch)
+
 		// === 管理员写权限受保护接口 ===
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
 		{
+			// 统一文件直传接口 (支持 multipart/form-data，返回 R2 相对路径与临时预签名 URL)
+			write.POST("/files/upload", handlers.UnifiedUploadFile)
+
 			// Life Entries (生活档案)
 			write.POST("/entries", handlers.CreateLifeEntry)
 			write.PUT("/entries/:id", handlers.UpdateLifeEntry)
@@ -92,33 +116,59 @@ func main() {
 			write.POST("/projects", handlers.CreateProject)
 			write.PUT("/projects/:id", handlers.UpdateProject)
 			write.DELETE("/projects/:id", handlers.DeleteProject)
+
+			// 站点全局配置与主理人档案维护
+			write.PUT("/config", handlers.UpdateConfig)
+			write.PUT("/profile", handlers.UpdateCuratorProfile)
+
+			// 手机 App 确认授权网页扫码登录
+			write.POST("/auth/qr/authorize", handlers.AuthorizeQRSession)
+
+			// Device Pairing & Management (受信任设备管理)
+			write.POST("/auth/pair/init", handlers.InitPairing)
+			write.GET("/auth/devices", handlers.GetTrustedDevices)
+			write.DELETE("/auth/devices/:id", handlers.RevokeDevice)
+
+			// Now Status (此刻的我状态更新)
+			write.PUT("/now", handlers.UpdateNowStatus)
 		}
 	}
 
-	// 6. 兼容原有旧版只读路由
+	// 6. 兼容原有旧版只读与更新路由
 	api := r.Group("/api")
 	{
 		api.GET("/health", handlers.HealthCheck)
 		api.GET("/entries", handlers.GetLifeEntries)
 		api.GET("/now", handlers.GetNowStatus)
+		api.PUT("/now", middleware.AdminAuthRequired(), handlers.UpdateNowStatus)
 		api.GET("/projects", handlers.GetProjects)
 		api.GET("/archive", handlers.GetArchiveStats)
 		api.GET("/config", handlers.GetConfig)
+		api.PUT("/config", middleware.AdminAuthRequired(), handlers.UpdateConfig)
+		api.GET("/profile", handlers.GetCuratorProfile)
+		api.PUT("/profile", middleware.AdminAuthRequired(), handlers.UpdateCuratorProfile)
 	}
 
-	// 7. 前端静态文件托管（如果 web/dist 存在）
-	if stat, err := os.Stat("web/dist"); err == nil && stat.IsDir() {
-		r.Static("/assets", "web/dist/assets")
-		r.StaticFile("/favicon.ico", "web/dist/favicon.ico")
-		r.StaticFile("/favicon.svg", "web/dist/favicon.svg")
-		r.StaticFile("/icons.svg", "web/dist/icons.svg")
-		r.StaticFile("/robots.txt", "web/dist/robots.txt")
+	// 7. 前端静态文件托管（支持从根目录或 backend 目录下直接启动）
+	distDir := "web/dist"
+	if stat, err := os.Stat(distDir); err != nil || !stat.IsDir() {
+		if statUp, errUp := os.Stat("../web/dist"); errUp == nil && statUp.IsDir() {
+			distDir = "../web/dist"
+		}
+	}
+
+	if stat, err := os.Stat(distDir); err == nil && stat.IsDir() {
+		r.Static("/assets", filepath.Join(distDir, "assets"))
+		r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
+		r.StaticFile("/favicon.svg", filepath.Join(distDir, "favicon.svg"))
+		r.StaticFile("/icons.svg", filepath.Join(distDir, "icons.svg"))
+		r.StaticFile("/robots.txt", filepath.Join(distDir, "robots.txt"))
 
 		// SPA 单页应用回退到 index.html
 		r.NoRoute(func(c *gin.Context) {
-			c.File("web/dist/index.html")
+			c.File(filepath.Join(distDir, "index.html"))
 		})
-		log.Println("Serving frontend from web/dist")
+		log.Printf("Serving frontend from %s", distDir)
 	} else {
 		r.NoRoute(func(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{

@@ -51,9 +51,57 @@ go test -v ./...
 go run main.go
 ```
 
-## Docker 容器化部署
+## 生产编译与单二进制部署
+
+Go 语言最大的优势之一就是编译为**零外部依赖、CGO-Free 的单个静态可执行文件**，无需安装 Docker 或配置复杂的运行环境。
+
+### 1. 编译静态二进制
 
 ```bash
-# 使用 Docker Compose 一键启动
-docker compose up -d --build
+# 本地编译 (macOS / 当前系统)
+go build -ldflags="-s -w" -o server main.go
+
+# 交叉编译为 Linux (64位 x86 服务器)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server main.go
+
+# 交叉编译为 Linux ARM (如部分云服务器或树莓派)
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o server main.go
+```
+
+编译出的 `server` 单文件约 15~20MB，直接通过 `scp` 或 `rsync` 丢到服务器上即可。
+
+### 2. 服务器 Systemd 守护进程 (推荐)
+
+在 Linux 服务器创建服务配置文件 `/etc/systemd/system/loose-leaf.service`：
+
+```ini
+[Unit]
+Description=Loose Leaf Backend API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/loose-leaf/backend
+ExecStart=/var/www/loose-leaf/backend/server
+Restart=always
+RestartSec=3
+Environment=PORT=8088
+Environment=GIN_MODE=release
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启动与管理：
+
+```bash
+# 重新加载服务配置并开机自启
+sudo systemctl daemon-reload
+sudo systemctl enable loose-leaf
+sudo systemctl start loose-leaf
+
+# 查看运行状态与日志
+sudo systemctl status loose-leaf
+journalctl -u loose-leaf -f
 ```

@@ -1,0 +1,23 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+loose-leaf-server
+chimu-server
+server
+
+# Local database files
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Environment secrets
+.env
+.env.local
+
+# macOS & OS artifacts
+.DS_Store
+Thumbs.db

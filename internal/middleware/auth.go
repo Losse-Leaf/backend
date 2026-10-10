@@ -2,13 +2,11 @@ package middleware
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -25,7 +23,7 @@ func hashToken(token string) string {
 	return HashToken(token)
 }
 
-// ExtractToken 提取客户端携带的 Token (按优先级检索各标准头)
+// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer 与 X-Device-Token)
 func ExtractToken(c *gin.Context) string {
 	authHeader := c.GetHeader("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
@@ -40,7 +38,7 @@ func ExtractToken(c *gin.Context) string {
 	return strings.TrimSpace(c.Query("admin_key"))
 }
 
-// isSystemInitialized 检查系统是否已完成初次装帧或设置了主理人口令 (BE-13)
+// isSystemInitialized 检查系统是否已完成初次装帧并绑定激活首台设备 (BE-18, BE-19)
 func isSystemInitialized() bool {
 	if db.DB == nil {
 		return false
@@ -49,64 +47,45 @@ func isSystemInitialized() bool {
 	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 {
 		return false
 	}
-	return cfg.Initialized || strings.TrimSpace(cfg.MasterPasscode) != ""
+	return cfg.Initialized
 }
 
-// IsAdmin 判定当前请求是否具备管理员权限 (母密钥或有效激活设备)
+// isBootstrapOrPairingPath 判断当前请求是否为冷启动装帧或配对必需路径 (BE-18)
+func isBootstrapOrPairingPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/system/") || strings.HasPrefix(path, "/api/v1/auth/pair/")
+}
+
+// IsAdmin 判定当前请求是否具备主理人权限 (仅認 devices 表中 status = 'active' 的有效设备凭证 BE-18)
 func IsAdmin(c *gin.Context) bool {
-	if authType, exists := c.Get("auth_type"); exists && authType != "" {
+	if authType, exists := c.Get("auth_type"); exists && authType == "device" {
 		return true
 	}
 
 	token := ExtractToken(c)
-
-	expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
-	if token != "" && expectedMasterKey != "" {
-		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedMasterKey)) == 1 {
-			return true
-		}
+	if token == "" || db.DB == nil {
+		return false
 	}
 
-	if token != "" && db.DB != nil {
-		tHash := HashToken(token)
-		var count int64
-		if err := db.DB.Model(&models.Device{}).Where("token_hash = ? AND status = 'active'", tHash).Count(&count).Error; err == nil && count > 0 {
-			return true
-		}
-	}
-
-	// 仅当系统未初始化纯空态且未配置母密钥时，允许本地初始引导体验 (BE-13)
-	if expectedMasterKey == "" && !isSystemInitialized() {
+	tHash := HashToken(token)
+	var count int64
+	if err := db.DB.Model(&models.Device{}).Where("token_hash = ? AND status = 'active'", tHash).Count(&count).Error; err == nil && count > 0 {
 		return true
 	}
 
 	return false
 }
 
-// AdminAuthRequired 管理员操作鉴权中间件 (支持母密钥与已配对设备双轨鉴权)
-// 轨一：匹配服务器 .env 中的 ADMIN_API_KEY (Master Key)
-// 轨二：匹配 devices 表中有效激活的 Device Token (受信任设备)
+// AdminAuthRequired 管理员写操作与私密接口鉴权中间件 (BE-18)
+// 唯一凭证源：校验 SQLite devices 表中处于 active 状态的设备子钥匙 (token_hash)
+// 若系统尚未初始化 (initialized == false)，仅放行 /api/v1/system/* 与 /api/v1/auth/pair/* 等冷启动必需接口，严禁免密放行常规写接口
 func AdminAuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
-
-		// 1. 提取客户端携带的 Token (按优先级检索各标准头)
 		token := ExtractToken(c)
 
-		// 2. 轨一校验：比对母密钥 (Master Key) - 采用常数时间比较防范侧信道攻击
-		if token != "" && expectedMasterKey != "" {
-			if subtle.ConstantTimeCompare([]byte(token), []byte(expectedMasterKey)) == 1 {
-				c.Set("auth_type", "master")
-				c.Next()
-				return
-			}
-		}
-
-		// 3. 轨二校验：比对已配对受信任设备令牌 (Device Token)
 		if token != "" && db.DB != nil {
 			tHash := HashToken(token)
 			var device models.Device
-			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).First(&device).Error; err == nil {
+			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).Limit(1).Find(&device).Error; err == nil && device.ID > 0 {
 				// 异步轻量更新设备的最近活跃时间 (带 60 秒节流防抖 BE-03)
 				now := time.Now()
 				if now.Sub(device.LastActiveAt) > time.Minute {
@@ -125,17 +104,16 @@ func AdminAuthRequired() gin.HandlerFunc {
 			}
 		}
 
-		// 4. 仅当系统未初始化纯空态且未配置母密钥时，允许本地冷启动引导 (BE-13 核心防线)
-		if expectedMasterKey == "" && !isSystemInitialized() {
-			c.Set("auth_type", "dev_open")
+		// 若系统未初始化且请求属于冷启动装帧/配对路径，允许通行以完成首台设备引导 (BE-18)
+		if !isSystemInitialized() && isBootstrapOrPairingPath(c.Request.URL.Path) {
+			c.Set("auth_type", "bootstrap_open")
 			c.Next()
 			return
 		}
 
-		// 5. 校验均未通过，拒绝访问
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 			"code":    http.StatusUnauthorized,
-			"message": "未授权的写操作：无效的管理员密钥或设备凭证。请在右上角设置中核对，或通过配对扫码接入。",
+			"message": "未授权的操作：缺少有效的受信任设备凭证。请在欢迎扉页输入管理员密钥登录，或通过设备配对接入。",
 			"data":    nil,
 		})
 	}

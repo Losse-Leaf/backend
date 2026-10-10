@@ -59,7 +59,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.Device{},
 		&models.PairTicket{},
 		&models.CuratorProfile{},
-		&models.QRSession{},
 		&models.Wish{},
 		&models.Footprint{},
 	)

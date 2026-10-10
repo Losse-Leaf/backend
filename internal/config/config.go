@@ -18,10 +18,9 @@ type R2Config struct {
 }
 
 type Config struct {
-	DBPath      string
-	Port        string
-	AdminAPIKey string
-	R2          R2Config
+	DBPath string
+	Port   string
+	R2     R2Config
 }
 
 var AppConfig Config
@@ -72,8 +71,6 @@ func LoadConfig() Config {
 		port = "8088"
 	}
 
-	adminKey := strings.TrimSpace(os.Getenv("ADMIN_API_KEY"))
-
 	accountID := strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID"))
 	endpoint := strings.TrimSpace(os.Getenv("R2_ENDPOINT"))
 	if endpoint == "" && accountID != "" {
@@ -106,10 +103,9 @@ func LoadConfig() Config {
 	}
 
 	AppConfig = Config{
-		DBPath:      dbPath,
-		Port:        port,
-		AdminAPIKey: adminKey,
-		R2:          r2Cfg,
+		DBPath: dbPath,
+		Port:   port,
+		R2:     r2Cfg,
 	}
 
 	return AppConfig

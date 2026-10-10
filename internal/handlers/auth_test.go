@@ -21,7 +21,8 @@ func setupTestDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test in-memory db: %v", err)
 	}
-	_ = database.AutoMigrate(&models.Device{}, &models.PairTicket{})
+	_ = database.AutoMigrate(&models.Device{}, &models.PairTicket{}, &models.SiteConfig{})
+	database.Create(&models.SiteConfig{Initialized: true})
 	db.DB = database
 }
 

@@ -7,17 +7,18 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image/color"
 	"math/big"
 	"net/http"
 	"strings"
 	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
 	qrcode "github.com/skip2/go-qrcode"
+	"gorm.io/gorm"
 )
 
 // HashToken 计算 Token 的 SHA-256 哈希字符串，数据库仅存储哈希
@@ -58,9 +59,17 @@ func resolveHubURL(c *gin.Context) string {
 	return fmt.Sprintf("%s://%s", scheme, host)
 }
 
-// generateQRCodeDataURL 生成 base64 PNG Data URL 二维码 (RG-02)
+// generateQRCodeDataURL 生成散页纸墨风 base64 PNG Data URL 二维码 (RG-02, BE-20)
+// 前景墨色: 深暖墨黑 #181716 (R:24, G:23, B:22)
+// 背景纸色: 米白暖调棉纸 #F9F8F5 (R:249, G:248, B:245)
 func generateQRCodeDataURL(content string) string {
-	pngBytes, err := qrcode.Encode(content, qrcode.Medium, 256)
+	q, err := qrcode.New(content, qrcode.Medium)
+	if err != nil {
+		return ""
+	}
+	q.ForegroundColor = color.RGBA{R: 24, G: 23, B: 22, A: 255}
+	q.BackgroundColor = color.RGBA{R: 249, G: 248, B: 245, A: 255}
+	pngBytes, err := q.PNG(256)
 	if err != nil {
 		return ""
 	}
@@ -76,12 +85,18 @@ type InitPairingRequest struct {
 	DeviceHint string `json:"device_hint"`
 }
 
-// InitPairing 签发 5 分钟有效期的配对 Ticket 与 6 位 PIN 码 (需管理员/已配对凭据)
+// InitPairing 签发 5 分钟有效期的配对 Ticket 与 6 位 PIN 码 (需已授权设备凭据)
 func InitPairing(c *gin.Context) {
 	var req InitPairingRequest
 	_ = c.ShouldBindJSON(&req)
 
-	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(8))
+	hubURL := strings.TrimSpace(req.HubURL)
+	if hubURL == "" {
+		hubURL = resolveHubURL(c)
+	}
+	hubURL = strings.TrimRight(hubURL, "/")
+
+	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
 	pinCode := generatePinCode()
 	expiresIn := 300 // 5 分钟
 	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
@@ -89,6 +104,7 @@ func InitPairing(c *gin.Context) {
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
 		PinCode:   pinCode,
+		HubURL:    hubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,
 	}
@@ -97,12 +113,6 @@ func InitPairing(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "生成配对工单失败: "+err.Error())
 		return
 	}
-
-	hubURL := strings.TrimSpace(req.HubURL)
-	if hubURL == "" {
-		hubURL = resolveHubURL(c)
-	}
-	hubURL = strings.TrimRight(hubURL, "/")
 
 	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticketStr)
 	qrDataURL := generateQRCodeDataURL(qrPayload)
@@ -119,7 +129,7 @@ func InitPairing(c *gin.Context) {
 }
 
 // ==========================================
-// 2. 确认设备配对握手 (Confirm Pairing)
+// 2. 确认设备配对握手并激活系统 (Confirm Pairing & Activate BE-19)
 // ==========================================
 
 type ConfirmPairingRequest struct {
@@ -130,7 +140,8 @@ type ConfirmPairingRequest struct {
 	DeviceModel string `json:"device_model"`
 }
 
-// ConfirmPairing 新设备提交 Ticket 或 PIN 码完成握手，获取永久 Device Token
+// ConfirmPairing 新设备提交 Ticket 或 PIN 码完成握手，获取永久 Device Token；
+// 若当前系统尚未初始化 (initialized == false)，在同一事务中将 initialized 置为 true (BE-19)
 func ConfirmPairing(c *gin.Context) {
 	var req ConfirmPairingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -146,8 +157,9 @@ func ConfirmPairing(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	var ticket models.PairTicket
-	query := db.DB.Where("used = ? AND expires_at > ?", false, time.Now())
+	query := db.DB.Where("used = ? AND expires_at > ?", false, now)
 	if ticketVal != "" {
 		query = query.Where("ticket = ?", ticketVal)
 	} else {
@@ -159,21 +171,14 @@ func ConfirmPairing(c *gin.Context) {
 		return
 	}
 
-	// 核销该工单，杜绝重放攻击
-	now := time.Now()
-	ticket.Used = true
-	ticket.UsedAt = &now
-	db.DB.Save(&ticket)
-
-	// 生成设备独立凭证与唯一 ID
-	rawDeviceToken := fmt.Sprintf("lldt_live_%s", generateRandomHex(16))
-	tokenHash := HashToken(rawDeviceToken)
-
 	platform := strings.ToLower(strings.TrimSpace(req.Platform))
 	if platform == "" {
 		platform = "device"
 	}
-	deviceID := fmt.Sprintf("dev_%s_%s", platform, generateRandomHex(4))
+	dateTag := now.Format("20060102")
+	deviceID := fmt.Sprintf("dev_%s_%s_%s", platform, dateTag, generateRandomHex(2))
+	rawDeviceToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
+	tokenHash := HashToken(rawDeviceToken)
 
 	deviceName := strings.TrimSpace(req.DeviceName)
 	if deviceName == "" {
@@ -191,23 +196,147 @@ func ConfirmPairing(c *gin.Context) {
 		LastActiveAt: now,
 	}
 
-	if err := db.DB.Create(&device).Error; err != nil {
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&device).Error; err != nil {
+			return err
+		}
+
+		var cfg models.SiteConfig
+		tx.Limit(1).Find(&cfg)
+		if cfg.ID == 0 {
+			tx.FirstOrCreate(&cfg)
+		}
+
+		webCompanionToken := ""
+		// 若系统尚未完成首次装帧激活，在此事务中正式将 initialized 置为 true，并为发起装帧的浏览器签发伴生令牌 (BE-19)
+		if !cfg.Initialized {
+			if platform != "web" {
+				webCompanionToken = fmt.Sprintf("lldt_%s", generateRandomHex(16))
+				webDev := models.Device{
+					DeviceID:     fmt.Sprintf("dev_web_%s_%s", dateTag, generateRandomHex(2)),
+					Name:         fmt.Sprintf("Web 浏览器 · 伴生授权 (%s)", deviceName),
+					Platform:     "web",
+					TokenHash:    HashToken(webCompanionToken),
+					Status:       "active",
+					PairedAt:     now,
+					LastActiveAt: now,
+				}
+				if err := tx.Create(&webDev).Error; err != nil {
+					return err
+				}
+			} else {
+				webCompanionToken = rawDeviceToken
+			}
+
+			cfg.Initialized = true
+			cfg.UpdatedAt = now
+			if err := tx.Save(&cfg).Error; err != nil {
+				return err
+			}
+		}
+
+		ticket.Used = true
+		ticket.UsedAt = &now
+		ticket.PairedDeviceID = device.DeviceID
+		ticket.WebToken = webCompanionToken
+		return tx.Save(&ticket).Error
+	})
+
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "保存配对设备记录失败: "+err.Error())
 		return
 	}
 
-	hubURL := resolveHubURL(c)
+	hubURL := ticket.HubURL
+	if hubURL == "" {
+		hubURL = resolveHubURL(c)
+	}
 
-	Success(c, gin.H{
-		"device_id":    device.DeviceID,
-		"device_name":  device.Name,
-		"device_token": rawDeviceToken,
-		"hub_url":      hubURL,
+	c.JSON(http.StatusOK, Response{
+		Code:    http.StatusOK,
+		Message: "device paired successfully",
+		Data: gin.H{
+			"device_id":    device.DeviceID,
+			"device_name":  device.Name,
+			"platform":     device.Platform,
+			"paired_at":    device.PairedAt.Format(time.RFC3339),
+			"device_token": rawDeviceToken,
+			"initialized":  true,
+			"hub_url":      hubURL,
+		},
 	})
 }
 
 // ==========================================
-// 3. 设备列表与吊销管理
+// 3. 轮询配对工单与装帧激活状态 (Poll Pairing Status BE-19)
+// ==========================================
+
+// PollPairingStatus 公开轮询配对工单核销状态与系统初始化状态
+// GET /api/v1/auth/pair/status?ticket=pair_tk_...
+func PollPairingStatus(c *gin.Context) {
+	ticketVal := strings.TrimSpace(c.Query("ticket"))
+	if ticketVal == "" {
+		Error(c, http.StatusBadRequest, "缺少 ticket 参数")
+		return
+	}
+
+	var cfg models.SiteConfig
+	db.DB.Limit(1).Find(&cfg)
+
+	var ticket models.PairTicket
+	if err := db.DB.Where("ticket = ?", ticketVal).Limit(1).Find(&ticket).Error; err != nil || ticket.ID == 0 {
+		Success(c, gin.H{
+			"status":      "expired",
+			"initialized": cfg.Initialized,
+		})
+		return
+	}
+
+	if ticket.Used {
+		var devInfo any
+		if ticket.PairedDeviceID != "" {
+			var pairedDev models.Device
+			if err := db.DB.Where("device_id = ?", ticket.PairedDeviceID).Limit(1).Find(&pairedDev).Error; err == nil && pairedDev.ID > 0 {
+				devInfo = gin.H{
+					"device_id": pairedDev.DeviceID,
+					"name":      pairedDev.Name,
+					"platform":  pairedDev.Platform,
+					"paired_at": pairedDev.PairedAt.Format(time.RFC3339),
+				}
+			}
+		}
+
+		webToken := ticket.WebToken
+		if webToken != "" {
+			// 单次读取后立即清除数据库中的伴生明文令牌，防止重放泄露 (BE-19)
+			db.DB.Model(&ticket).Update("web_token", "")
+		}
+
+		Success(c, gin.H{
+			"status":      "paired",
+			"initialized": cfg.Initialized,
+			"device":      devInfo,
+			"web_token":   webToken,
+		})
+		return
+	}
+
+	if time.Now().After(ticket.ExpiresAt) {
+		Success(c, gin.H{
+			"status":      "expired",
+			"initialized": cfg.Initialized,
+		})
+		return
+	}
+
+	Success(c, gin.H{
+		"status":      "pending",
+		"initialized": cfg.Initialized,
+	})
+}
+
+// ==========================================
+// 4. 设备列表与吊销管理
 // ==========================================
 
 // GetTrustedDevices 获取已配对信任的设备列表
@@ -232,7 +361,6 @@ func RevokeDevice(c *gin.Context) {
 		return
 	}
 
-	// 标记为 revoked 状态或直接彻底移除
 	device.Status = "revoked"
 	if err := db.DB.Save(&device).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "吊销设备失败: "+err.Error())
@@ -248,199 +376,71 @@ func RevokeDevice(c *gin.Context) {
 }
 
 // ==========================================
-// 4. 网页端反向扫码登录与口令验证 (Reverse QR & Passcode)
+// 5. 日常欢迎扉页：输入管理员密钥以主人身份进入 (Verify Admin Key BE-18)
 // ==========================================
 
-type CreateQRRequest struct {
-	HubURL string `json:"hub_url"`
-}
-
-// CreateQRSession 申请网页端反向登录二维码 Session (公开)
-func CreateQRSession(c *gin.Context) {
-	var req CreateQRRequest
-	_ = c.ShouldBindJSON(&req)
-
-	sessionID := fmt.Sprintf("qr_sess_%s", generateRandomHex(8))
-	expiresIn := 120 // 2分钟
-	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
-
-	sess := models.QRSession{
-		SessionID: sessionID,
-		Status:    "pending",
-		ExpiresAt: expiresAt,
-	}
-
-	if err := db.DB.Create(&sess).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "创建扫码会话失败: "+err.Error())
-		return
-	}
-
-	hubURL := strings.TrimSpace(req.HubURL)
-	if hubURL == "" {
-		hubURL = resolveHubURL(c)
-	}
-	hubURL = strings.TrimRight(hubURL, "/")
-
-	qrPayload := fmt.Sprintf("looseleaf://login?hub=%s&session_id=%s", hubURL, sessionID)
-	qrDataURL := generateQRCodeDataURL(qrPayload)
-
-	Success(c, gin.H{
-		"session_id":         sessionID,
-		"hub_url":            hubURL,
-		"qr_payload":         qrPayload,
-		"qr_code_data_url":   qrDataURL,
-		"expires_in_seconds": expiresIn,
-	})
-}
-
-type AuthorizeQRRequest struct {
-	SessionID string `json:"session_id" binding:"required"`
-}
-
-// AuthorizeQRSession 手机 App 确认授权网页登录 (需已配对受信任设备或 Master Key 凭据)
-func AuthorizeQRSession(c *gin.Context) {
-	var req AuthorizeQRRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "缺少 session_id")
-		return
-	}
-
-	var sess models.QRSession
-	if err := db.DB.Where("session_id = ? AND expires_at > ?", req.SessionID, time.Now()).First(&sess).Error; err != nil {
-		Error(c, http.StatusBadRequest, "二维码会话无效或已过期，请刷新网页重试")
-		return
-	}
-
-	if sess.Status == "authorized" {
-		Success(c, gin.H{"message": "会话已处于授权状态"})
-		return
-	}
-
-	// 为该网页会话签发独立管理 Token
-	webToken := fmt.Sprintf("lltk_web_%s", generateRandomHex(16))
-	tokenHash := HashToken(webToken)
-
-	// 获取授权操作设备信息
-	authorDeviceName := "受信任移动设备"
-	if devName, exists := c.Get("device_name"); exists {
-		if s, ok := devName.(string); ok && s != "" {
-			authorDeviceName = s
-		}
-	}
-
-	device := models.Device{
-		DeviceID:     fmt.Sprintf("dev_web_%s", generateRandomHex(4)),
-		Name:         fmt.Sprintf("Web 浏览器 (由 %s 扫码授权)", authorDeviceName),
-		Platform:     "web",
-		TokenHash:    tokenHash,
-		Status:       "active",
-		PairedAt:     time.Now(),
-		LastActiveAt: time.Now(),
-	}
-	db.DB.Create(&device)
-
-	sess.Status = "authorized"
-	sess.Token = webToken
-	db.DB.Save(&sess)
-
-	Success(c, gin.H{
-		"session_id": sess.SessionID,
-		"status":     "authorized",
-		"message":    "网页端已成功授权登录",
-	})
-}
-
-// PollQRSession 网页端轮询反向扫码登录结果 (公开)
-func PollQRSession(c *gin.Context) {
-	sessionID := c.Param("session_id")
-	var sess models.QRSession
-
-	if err := db.DB.Where("session_id = ?", sessionID).First(&sess).Error; err != nil {
-		Success(c, gin.H{"status": "expired"})
-		return
-	}
-
-	if time.Now().After(sess.ExpiresAt) {
-		Success(c, gin.H{"status": "expired"})
-		return
-	}
-
-	if sess.Status == "authorized" {
-		Success(c, gin.H{
-			"status": "authorized",
-			"token":  sess.Token,
-		})
-		return
-	}
-
-	Success(c, gin.H{
-		"status": "pending",
-	})
-}
-
 type VerifyPasscodeRequest struct {
-	Passcode string `json:"passcode" binding:"required"`
+	Passcode   string `json:"passcode" binding:"required"`
+	DeviceName string `json:"device_name"`
 }
 
-// VerifyPasscode 主理人口令直接登入 (公开，验证成功颁发管理 Token)
+// VerifyPasscode 校验 SQLite site_configs.master_passcode 的 SHA-256 哈希，签发独立 Web 设备凭证 (BE-18)
 func VerifyPasscode(c *gin.Context) {
 	var req VerifyPasscodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "请输入口令")
+		Error(c, http.StatusBadRequest, "请输入管理员密钥")
 		return
 	}
 
 	inputPasscode := strings.TrimSpace(req.Passcode)
 	if inputPasscode == "" {
-		Error(c, http.StatusBadRequest, "口令不能为空")
+		Error(c, http.StatusBadRequest, "管理员密钥不能为空")
 		return
 	}
 
-	// 1. 比对 Master Key
-	masterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
-	matched := false
-	if masterKey != "" && subtle.ConstantTimeCompare([]byte(inputPasscode), []byte(masterKey)) == 1 {
-		matched = true
-	}
-
-	// 2. 比对 SiteConfig 中的 MasterPasscode
-	if !matched {
-		var cfg models.SiteConfig
-		if err := db.DB.First(&cfg).Error; err == nil && cfg.MasterPasscode != "" {
-			inputHash := HashToken(inputPasscode)
-			if subtle.ConstantTimeCompare([]byte(inputHash), []byte(cfg.MasterPasscode)) == 1 {
-				matched = true
-			}
-		}
-	}
-
-	// 3. 本地无密开发模式
-	if !matched && masterKey == "" {
-		matched = true
-	}
-
-	if !matched {
-		Error(c, http.StatusUnauthorized, "口令不正确，请重新输入")
+	var cfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 || strings.TrimSpace(cfg.MasterPasscode) == "" {
+		Error(c, http.StatusUnauthorized, "系统尚未完成首次装帧或未设定管理员密钥")
 		return
 	}
 
-	// 签发管理 Token 并写入 Device
-	loginToken := fmt.Sprintf("lltk_passcode_%s", generateRandomHex(16))
-	tokenHash := HashToken(loginToken)
+	inputHash := HashToken(inputPasscode)
+	if subtle.ConstantTimeCompare([]byte(inputHash), []byte(cfg.MasterPasscode)) != 1 {
+		Error(c, http.StatusUnauthorized, "管理员密钥不正确，请重新输入")
+		return
+	}
+
+	now := time.Now()
+	rawToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
+	tokenHash := HashToken(rawToken)
+	deviceID := fmt.Sprintf("dev_web_%s_%s", now.Format("20060102"), generateRandomHex(2))
+
+	deviceName := strings.TrimSpace(req.DeviceName)
+	if deviceName == "" {
+		deviceName = "Web 浏览器 · 主人密钥登录"
+	}
 
 	device := models.Device{
-		DeviceID:     fmt.Sprintf("dev_web_%s", generateRandomHex(4)),
-		Name:         "Web 控制台 (口令登录)",
+		DeviceID:     deviceID,
+		Name:         deviceName,
 		Platform:     "web",
 		TokenHash:    tokenHash,
 		Status:       "active",
-		PairedAt:     time.Now(),
-		LastActiveAt: time.Now(),
+		PairedAt:     now,
+		LastActiveAt: now,
 	}
-	db.DB.Create(&device)
+	if err := db.DB.Create(&device).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "签发设备凭证失败: "+err.Error())
+		return
+	}
 
-	Success(c, gin.H{
-		"token":   loginToken,
-		"message": "口令验证通过，已授权进入暗房管理中枢",
+	c.JSON(http.StatusOK, Response{
+		Code:    http.StatusOK,
+		Message: "密钥验证通过，已授权以主人身份进入",
+		Data: gin.H{
+			"token":       rawToken,
+			"device_id":   deviceID,
+			"device_name": deviceName,
+		},
 	})
 }

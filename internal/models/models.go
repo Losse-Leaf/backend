@@ -176,25 +176,18 @@ type Device struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// PairTicket 临时设备配对工单 (5分钟有效，单次核销)
+// PairTicket 临时设备配对工单 (5分钟有效，单次核销 BE-19)
 type PairTicket struct {
-	ID        uint       `gorm:"primaryKey" json:"id"`
-	Ticket    string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "pair_tk_9f82d1c6e4b8"
-	PinCode   string     `gorm:"index;size:16;not null" json:"pin_code"`     // e.g. "749210"
-	ExpiresAt time.Time  `gorm:"index;not null" json:"expires_at"`
-	Used      bool       `gorm:"index;default:false" json:"used"`
-	UsedAt    *time.Time `json:"used_at,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-}
-
-// QRSession 网页端反向扫码登录会话 (2分钟有效)
-type QRSession struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	SessionID string    `gorm:"uniqueIndex;size:64;not null" json:"session_id"` // e.g. "qr_sess_8910283b"
-	Status    string    `gorm:"index;size:32;default:pending" json:"status"`   // pending, authorized, expired
-	Token     string    `gorm:"size:128" json:"-"`                             // 授权通过后下发的管理 Token
-	ExpiresAt time.Time `gorm:"index;not null" json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
+	ID             uint       `gorm:"primaryKey" json:"id"`
+	Ticket         string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "pair_tk_9f82d1c6e4b8"
+	PinCode        string     `gorm:"index;size:16;not null" json:"pin_code"`     // e.g. "749210"
+	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
+	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
+	WebToken       string     `gorm:"size:128" json:"-"`                         // 首次装帧伴生 Web 设备 Token (单次读取 BE-19)
+	ExpiresAt      time.Time  `gorm:"index;not null" json:"expires_at"`
+	Used           bool       `gorm:"index;default:false" json:"used"`
+	UsedAt         *time.Time `json:"used_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 // Wish 三维心愿单表 (好物 item | 旅程 travel | 阶段里程碑 milestone)

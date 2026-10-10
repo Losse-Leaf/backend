@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -19,12 +18,9 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
-	// 设置测试管理员密钥
-	testMasterKey := "test-secret-key-123"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	// 注册测试受信任设备凭证 (BE-18)
+	testMasterKey := "lldt_test_device_token_123"
+	seedTestAdminDevice(testMasterKey)
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")

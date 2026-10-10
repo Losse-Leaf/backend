@@ -14,7 +14,7 @@
 - **语言与框架**：Go 1.24+ / Gin Web Framework / GORM
 - **核心数据库**：SQLite3（开启 WAL 预写日志与读写并发优化）
 - **对象存储**：Cloudflare R2（S3 兼容协议，零出口流量费）与本地磁盘直存双轨支持
-- **安全鉴权**：`ADMIN_API_KEY` 与受信任设备配对组 Bearer 鉴权保护写操作
+- **安全鉴权**：SQLite 管理员母密钥（`site_configs.master_passcode` SHA-256 哈希）与受信任设备子钥匙配对组（`devices` 表 Bearer / `X-Device-Token`）保护写操作与私密财务数据，无需配置 `.env` 密钥环境变量
 
 ---
 
@@ -23,27 +23,32 @@
 | 模块 | 方法 | 端点 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **健康探针** | `GET` | `/api/health` | 检查运行时状态与存储连通性 |
+| **系统装帧** | `GET` | `/api/v1/system/status` | 系统初始化与管理员密钥设置状态探针 |
+| | `POST` | `/api/v1/system/bootstrap` | 首次装帧双次设密并签发首台设备配对码 |
+| **设备配对** | `POST` | `/api/v1/auth/pair/confirm` | 新设备握手确认并激活系统初始化状态 |
+| | `GET` | `/api/v1/auth/pair/status` | 轮询配对工单与装帧激活状态 (`?ticket=...`) |
+| | `POST` | `/api/v1/auth/verify` | 日常欢迎扉页输入管理员密钥登录并签发设备凭证 |
 | **生活档案** | `GET` | `/api/v1/entries` | 分页时间流列表 (支持类型/年份/增量游标/ETag) |
 | | `POST` | `/api/v1/entries` | 新建生活记录 (需鉴权) |
 | | `PUT` | `/api/v1/entries/:id` | 修改生活记录 (需鉴权) |
 | | `DELETE` | `/api/v1/entries/:id` | 删除记录 (需鉴权，支持软删除与物理清理) |
-| **独立记账** | `GET` | `/api/v1/transactions` | 月度记账明细列表 |
-| | `GET` | `/api/v1/transactions/summary` | 月度收支概览与类目光谱数据 |
+| **独立记账** | `GET` | `/api/v1/transactions` | 月度记账明细列表 (需鉴权) |
+| | `GET` | `/api/v1/transactions/summary` | 月度收支概览与类目光谱数据 (需鉴权) |
 | | `POST` | `/api/v1/transactions` | 记一笔账 (需鉴权) |
 | **项目经历** | `GET` | `/api/v1/projects` | 造物经历列表 |
 | **旅游足迹** | `GET` | `/api/v1/footprints/atlas` | 中国市级点亮地图聚合数据 |
-| | `GET` | `/api/v1/footprints/cities/:city_code/drawer` | 城市回忆抽屉四重聚合数据 |
-| **三维心愿** | `GET` | `/api/v1/wishes` | 心愿单列表 (`item` / `travel` / `milestone`) |
+| | `GET` | `/api/v1/footprints/cities/:city_code/drawer` | 城市回忆抽屉四重聚合数据 (访客自动脱敏账单) |
+| **三维心愿** | `GET` | `/api/v1/wishes` | 心愿单列表 (`item` / `travel` / `milestone`，访客自动脱敏实付金额) |
 | | `POST` | `/api/v1/wishes/:id/resolve` | 心愿圆满归册事务接口 (联动记账/时间流/足迹) |
-| **生活年鉴** | `GET` | `/api/v1/almanac/summary` | 年度生活年鉴五幕聚合数据 |
-| **媒体上传** | `POST` | `/api/v1/files/upload` | 统一文件上传与对象存储引擎 |
+| **生活年鉴** | `GET` | `/api/v1/almanac/summary` | 年度生活年鉴五幕聚合数据 (访客自动脱敏收支) |
+| **媒体上传** | `POST` | `/api/v1/files/upload` | 统一文件上传与对象存储引擎 (需鉴权) |
 
 ---
 
 ## 本地开发与启动
 
 ```bash
-# 1. 复制环境变量
+# 1. 复制环境变量 (可选，仅需配置 R2 存储时填写，无需配置任何密钥)
 cp .env.example .env
 
 # 2. 运行测试
@@ -52,6 +57,17 @@ go test -v ./...
 # 3. 本地启动服务 (默认端口 8088)
 go run main.go
 ```
+
+### 忘记管理员密钥的 SQLite 重置指南
+
+若主理人遗忘在首次装帧时设定的管理员密钥，只需在服务器或本地终端执行以下 SQLite 指令重置初始化状态与口令哈希（**所有手账、账单、心愿单、足迹等业务数据 100% 完好无损**）：
+
+```bash
+sqlite3 data/looseleaf.db "UPDATE site_configs SET initialized = 0, master_passcode = '';"
+```
+
+执行后刷新浏览器即可重新进入「首次装帧」向导设定新密钥并绑定设备。
+
 
 ## 生产编译与单二进制部署
 

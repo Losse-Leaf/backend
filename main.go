@@ -33,11 +33,7 @@ func main() {
 		log.Println("Notice: Cloudflare R2 storage credentials not configured. Text entries & transactions will work normally.")
 	}
 
-	if cfg.AdminAPIKey != "" {
-		log.Println("Admin write protection enabled (ADMIN_API_KEY configured).")
-	} else {
-		log.Println("Notice: ADMIN_API_KEY not set. Write endpoints are open (suitable for local dev). Set ADMIN_API_KEY in .env for production.")
-	}
+	log.Println("SQLite Master Passcode & Trusted Device Group authentication active.")
 
 	// 2. 初始化 SQLite 数据库 (已启用 WAL 模式与连接池优化)
 	_, err := db.InitDB(cfg.DBPath)
@@ -83,17 +79,14 @@ func main() {
 		v1.GET("/config", handlers.GetConfigV1)
 		v1.GET("/profile", handlers.GetCuratorProfile)
 
-		// 系统生命周期与初次装帧冷启动
+		// 系统生命周期与初次装帧冷启动 (BE-18, BE-19)
 		v1.GET("/system/status", handlers.GetSystemStatus)
 		v1.POST("/system/bootstrap", handlers.BootstrapSystem)
 
-		// 网页端反向扫码登录与口令验证
-		v1.POST("/auth/qr/create", handlers.CreateQRSession)
-		v1.GET("/auth/qr/poll/:session_id", handlers.PollQRSession)
+		// 欢迎扉页管理员密钥登录与设备配对握手/轮询 (公开接口 BE-18, BE-19)
 		v1.POST("/auth/verify", handlers.VerifyPasscode)
-
-		// 设备免密配对 (公开握手接口)
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
+		v1.GET("/auth/pair/status", handlers.PollPairingStatus)
 
 		// 统一文件临时签名接口 (公开只读，供各端获取动态有效访问 URL)
 		v1.GET("/files/sign", handlers.SignFileURL)
@@ -168,9 +161,6 @@ func main() {
 			// 站点全局配置与主理人档案维护
 			write.PUT("/config", handlers.UpdateConfig)
 			write.PUT("/profile", handlers.UpdateCuratorProfile)
-
-			// 手机 App 确认授权网页扫码登录
-			write.POST("/auth/qr/authorize", handlers.AuthorizeQRSession)
 
 			// Device Pairing & Management (受信任设备管理)
 			write.POST("/auth/pair/init", handlers.InitPairing)

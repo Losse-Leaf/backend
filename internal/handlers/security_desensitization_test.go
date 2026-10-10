@@ -10,14 +10,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 )
 
-// TestBE13_AuthenticationBypassPrevention 测试致命级安全鉴权穿透修复 (BE-13)
-// 当系统已初始化但 ADMIN_API_KEY 为空时，绝不能降级为 dev_open，必须严格返回 401
+// TestBE13_AuthenticationBypassPrevention 测试致命级安全鉴权穿透修复 (BE-13, BE-18)
+// 任何未携带有效 active 设备令牌的请求访问受保护接口，必须严格返回 401
 func TestBE13_AuthenticationBypassPrevention(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
@@ -26,11 +25,8 @@ func TestBE13_AuthenticationBypassPrevention(t *testing.T) {
 	var cfg models.SiteConfig
 	db.DB.FirstOrCreate(&cfg)
 	cfg.Initialized = true
-	cfg.MasterPasscode = "$2a$10$abcdefghijklmnopqrstuvwxyz123456" // 已设主理人口令
+	cfg.MasterPasscode = HashToken("my-secret-passcode")
 	db.DB.Save(&cfg)
-
-	// 模拟环境变量 ADMIN_API_KEY 未设置 ("")
-	config.AppConfig.AdminAPIKey = ""
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")
@@ -69,11 +65,8 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
-	testMasterKey := "test-admin-secret-999"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	testMasterKey := "lldt_admin_secret_999"
+	seedTestAdminDevice(testMasterKey)
 
 	// 标记系统已初始化
 	var cfg models.SiteConfig
@@ -335,11 +328,8 @@ func TestBE15_InitialLiquidBalanceAndAssetsOverview(t *testing.T) {
 	// 创建主理人档案
 	db.DB.Create(&models.CuratorProfile{Name: "测试主理人"})
 
-	testMasterKey := "test-secret-be15"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	testMasterKey := "lldt_secret_be15"
+	seedTestAdminDevice(testMasterKey)
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")
@@ -421,11 +411,8 @@ func TestBE16_PublicConfigDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
-	testMasterKey := "test-secret-be16"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	testMasterKey := "lldt_secret_be16"
+	seedTestAdminDevice(testMasterKey)
 
 	var cfg models.SiteConfig
 	db.DB.FirstOrCreate(&cfg)
@@ -474,11 +461,8 @@ func TestBE17_ETagRoleCacheIsolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
-	testMasterKey := "test-secret-be17"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	testMasterKey := "lldt_secret_be17"
+	seedTestAdminDevice(testMasterKey)
 
 	var cfg models.SiteConfig
 	db.DB.FirstOrCreate(&cfg)
@@ -561,11 +545,8 @@ func TestRG19_GearStatusAndPriceCompatibility(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
-	testMasterKey := "test-secret-rg19"
-	config.AppConfig.AdminAPIKey = testMasterKey
-	defer func() {
-		config.AppConfig.AdminAPIKey = ""
-	}()
+	testMasterKey := "lldt_secret_rg19"
+	seedTestAdminDevice(testMasterKey)
 
 	// 模拟前端写入了 status: "已出二手" 和 sold_price (而非 sold_price_cents)
 	rawGearJSON := `[

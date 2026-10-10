@@ -2,17 +2,20 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
-	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
@@ -26,7 +29,6 @@ func setupTestFullDB(t *testing.T) {
 		&models.CuratorProfile{},
 		&models.Device{},
 		&models.PairTicket{},
-		&models.QRSession{},
 		&models.Attachment{},
 		&models.LifeEntry{},
 		&models.Transaction{},
@@ -50,6 +52,20 @@ func setupTestFullDB(t *testing.T) {
 		Color:        "var(--accent-vermilion)",
 	})
 	db.DB = database
+}
+
+// seedTestAdminDevice 在测试数据库中注册一枚处于 active 状态的受信任设备子钥匙 (BE-18)
+func seedTestAdminDevice(rawToken string) {
+	now := time.Now()
+	db.DB.Create(&models.Device{
+		DeviceID:     "dev_web_test_" + generateRandomHex(2),
+		Name:         "测试管理员设备",
+		Platform:     "web",
+		TokenHash:    HashToken(rawToken),
+		Status:       "active",
+		PairedAt:     now,
+		LastActiveAt: now,
+	})
 }
 
 func TestProfileAndConfig(t *testing.T) {
@@ -97,7 +113,6 @@ func TestProfileAndConfig(t *testing.T) {
 
 	// 2. 初始化并获取 Profile (含 RG-09 email / github 保存与平铺校验)
 	t.Run("Get and update curator profile", func(t *testing.T) {
-		// 先初始化一个基础 profile
 		initialProfile := models.CuratorProfile{
 			Name:        "测试主理人",
 			Title:       "数字手艺人",
@@ -144,19 +159,21 @@ func TestProfileAndConfig(t *testing.T) {
 	})
 }
 
-func TestSystemLifecycleAndQRAuth(t *testing.T) {
+// TestSystemBootstrapPairingAndVerifyLifecycle 测试两步装帧、配对激活闭环、散页纸墨风二维码与密钥登录 (BE-18, BE-19, BE-20)
+func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
 	r := gin.New()
 	r.GET("/api/v1/system/status", GetSystemStatus)
 	r.POST("/api/v1/system/bootstrap", BootstrapSystem)
-	r.POST("/api/v1/auth/qr/create", CreateQRSession)
-	r.POST("/api/v1/auth/qr/authorize", AuthorizeQRSession)
-	r.GET("/api/v1/auth/qr/poll/:session_id", PollQRSession)
+	r.POST("/api/v1/auth/pair/confirm", ConfirmPairing)
+	r.GET("/api/v1/auth/pair/status", PollPairingStatus)
 	r.POST("/api/v1/auth/verify", VerifyPasscode)
 
-	t.Run("1. Initial system status probe", func(t *testing.T) {
+	var bootstrapTicket string
+
+	t.Run("1. Initial system status probe is uninitialized", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/system/status", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -164,14 +181,43 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
+		var res struct {
+			Data struct {
+				Initialized    bool `json:"initialized"`
+				HasPasscodeSet bool `json:"has_passcode_set"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &res)
+		if res.Data.Initialized || res.Data.HasPasscodeSet {
+			t.Fatalf("expected uninitialized and no passcode set, got %+v", res.Data)
+		}
 	})
 
-	t.Run("2. Bootstrap system successfully", func(t *testing.T) {
-		config.AppConfig.AdminAPIKey = ""
+	t.Run("2. Bootstrap rejects empty or mismatched confirm_passcode (BE-19)", func(t *testing.T) {
+		badReq := BootstrapRequest{
+			CuratorName:     "测试主理人",
+			Location:        "中国 · 杭州",
+			MasterPasscode:  "my-secret-passcode",
+			ConfirmPasscode: "different-passcode",
+		}
+		body, _ := json.Marshal(badReq)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/system/bootstrap", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for mismatched confirm_passcode, got %d", w.Code)
+		}
+	})
+
+	t.Run("3. Bootstrap Step 1 saves passcode hash, keeps initialized=false, and returns paper-ink QR ticket (BE-19, BE-20)", func(t *testing.T) {
 		reqBody := BootstrapRequest{
-			CuratorName:    "测试主理人",
-			Location:       "中国 · 杭州",
-			MasterPasscode: "my-secret-passcode",
+			CuratorName:     "测试主理人",
+			Location:        "中国 · 杭州",
+			MasterPasscode:  "my-secret-passcode",
+			ConfirmPasscode: "my-secret-passcode",
+			HubURL:          "http://192.168.1.10:5174",
 		}
 		body, _ := json.Marshal(reqBody)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/system/bootstrap", bytes.NewReader(body))
@@ -185,19 +231,133 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 
 		var res struct {
 			Data struct {
-				Token       string `json:"token"`
-				CuratorName string `json:"curator_name"`
+				CuratorName   string `json:"curator_name"`
+				Location      string `json:"location"`
+				Ticket        string `json:"ticket"`
+				PinCode       string `json:"pin_code"`
+				HubURL        string `json:"hub_url"`
+				QRPayload     string `json:"qr_payload"`
+				QRCodeDataURL string `json:"qr_code_data_url"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.Token == "" || res.Data.CuratorName != "测试主理人" {
+		if res.Data.Ticket == "" || res.Data.PinCode == "" || res.Data.CuratorName != "测试主理人" {
 			t.Fatalf("unexpected bootstrap response: %+v", res.Data)
+		}
+		bootstrapTicket = res.Data.Ticket
+
+		// 验证此时 SiteConfig.Initialized 仍为 false (等待首台设备握手后才激活 BE-19)
+		var cfg models.SiteConfig
+		db.DB.First(&cfg)
+		if cfg.Initialized {
+			t.Fatalf("BE-19 violation: SiteConfig.Initialized must remain false before device pairing confirmation")
+		}
+		if cfg.MasterPasscode != HashToken("my-secret-passcode") {
+			t.Fatalf("expected SHA-256 hashed master_passcode in DB")
+		}
+
+		// 验证 BE-20 散页纸墨风二维码配色 (#181716 墨色与 #F9F8F5 暖纸背景)
+		b64 := strings.TrimPrefix(res.Data.QRCodeDataURL, "data:image/png;base64,")
+		pngBytes, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			t.Fatalf("failed to decode QR base64: %v", err)
+		}
+		img, err := png.Decode(bytes.NewReader(pngBytes))
+		if err != nil {
+			t.Fatalf("failed to decode QR PNG: %v", err)
+		}
+		// 左上角 (0, 0) 为二维码静区背景色，应为 #F9F8F5 (249, 248, 245)
+		r0, g0, b0, _ := img.At(0, 0).RGBA()
+		if uint8(r0>>8) != 249 || uint8(g0>>8) != 248 || uint8(b0>>8) != 245 {
+			t.Fatalf("BE-20 QR background color mismatch: got RGB(%d,%d,%d), expected RGB(249,248,245)", r0>>8, g0>>8, b0>>8)
 		}
 	})
 
-	t.Run("3. Second bootstrap is forbidden (sealed)", func(t *testing.T) {
+	t.Run("4. Poll pairing status before confirmation returns pending and initialized=false (BE-19)", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/pair/status?ticket="+bootstrapTicket, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var res struct {
+			Data struct {
+				Status      string `json:"status"`
+				Initialized bool   `json:"initialized"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &res)
+		if res.Data.Status != "pending" || res.Data.Initialized {
+			t.Fatalf("expected pending and initialized=false, got %+v", res.Data)
+		}
+	})
+
+	t.Run("5. Confirm pairing activates initialized=true and PollPairingStatus returns companion web_token once (BE-19)", func(t *testing.T) {
+		confirmPayload := ConfirmPairingRequest{
+			Ticket:     bootstrapTicket,
+			DeviceName: "iPhone 16 Pro",
+			Platform:   "ios",
+		}
+		body, _ := json.Marshal(confirmPayload)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 on pair confirm, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var confirmRes struct {
+			Data struct {
+				DeviceID    string `json:"device_id"`
+				DeviceToken string `json:"device_token"`
+				Initialized bool   `json:"initialized"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &confirmRes)
+		if !confirmRes.Data.Initialized || !strings.HasPrefix(confirmRes.Data.DeviceID, "dev_ios_") || !strings.HasPrefix(confirmRes.Data.DeviceToken, "lldt_") {
+			t.Fatalf("unexpected confirm pairing response: %+v", confirmRes.Data)
+		}
+
+		// 轮询状态：应返回 status="paired", initialized=true 以及伴生 web_token
+		pollReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/pair/status?ticket="+bootstrapTicket, nil)
+		pollW := httptest.NewRecorder()
+		r.ServeHTTP(pollW, pollReq)
+
+		var pollRes struct {
+			Data struct {
+				Status      string `json:"status"`
+				Initialized bool   `json:"initialized"`
+				WebToken    string `json:"web_token"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(pollW.Body.Bytes(), &pollRes)
+		if pollRes.Data.Status != "paired" || !pollRes.Data.Initialized || !strings.HasPrefix(pollRes.Data.WebToken, "lldt_") {
+			t.Fatalf("expected paired status with companion web_token, got %+v", pollRes.Data)
+		}
+
+		// 二次轮询：web_token 已单次销毁，不再返回明文
+		pollReq2 := httptest.NewRequest(http.MethodGet, "/api/v1/auth/pair/status?ticket="+bootstrapTicket, nil)
+		pollW2 := httptest.NewRecorder()
+		r.ServeHTTP(pollW2, pollReq2)
+		var pollRes2 struct {
+			Data struct {
+				WebToken string `json:"web_token"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(pollW2.Body.Bytes(), &pollRes2)
+		if pollRes2.Data.WebToken != "" {
+			t.Fatalf("expected web_token to be cleared after first read, got %q", pollRes2.Data.WebToken)
+		}
+	})
+
+	t.Run("6. Second bootstrap after activation is forbidden (403 sealed)", func(t *testing.T) {
 		reqBody := BootstrapRequest{
-			CuratorName: "Attacker",
+			CuratorName:     "Attacker",
+			MasterPasscode:  "hack",
+			ConfirmPasscode: "hack",
 		}
 		body, _ := json.Marshal(reqBody)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/system/bootstrap", bytes.NewReader(body))
@@ -206,83 +366,25 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403 Forbidden for second bootstrap, got %d", w.Code)
+			t.Fatalf("expected 403 Forbidden for second bootstrap after activation, got %d", w.Code)
 		}
 	})
 
-	var sessID string
-
-	t.Run("4. Create and poll QR session", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/qr/create", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
+	t.Run("7. Verify passcode login issues structured device_id and lldt_ token (BE-18)", func(t *testing.T) {
+		// 错误密钥返回 401
+		wrongBody, _ := json.Marshal(VerifyPasscodeRequest{Passcode: "wrong-pass"})
+		wrongReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/verify", bytes.NewReader(wrongBody))
+		wrongReq.Header.Set("Content-Type", "application/json")
+		wrongW := httptest.NewRecorder()
+		r.ServeHTTP(wrongW, wrongReq)
+		if wrongW.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for wrong passcode, got %d", wrongW.Code)
 		}
 
-		var res struct {
-			Data struct {
-				SessionID string `json:"session_id"`
-				QRPayload string `json:"qr_payload"`
-			} `json:"data"`
-		}
-		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.SessionID == "" {
-			t.Fatalf("expected session_id, got empty")
-		}
-		sessID = res.Data.SessionID
-
-		// Poll before authorization -> pending
-		pollReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/qr/poll/"+sessID, nil)
-		pollW := httptest.NewRecorder()
-		r.ServeHTTP(pollW, pollReq)
-
-		var pollRes struct {
-			Data struct {
-				Status string `json:"status"`
-			} `json:"data"`
-		}
-		_ = json.Unmarshal(pollW.Body.Bytes(), &pollRes)
-		if pollRes.Data.Status != "pending" {
-			t.Fatalf("expected pending status, got %s", pollRes.Data.Status)
-		}
-	})
-
-	t.Run("5. Authorize QR session and poll token", func(t *testing.T) {
-		authBody := AuthorizeQRRequest{
-			SessionID: sessID,
-		}
-		b, _ := json.Marshal(authBody)
-		authReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/qr/authorize", bytes.NewReader(b))
-		authReq.Header.Set("Content-Type", "application/json")
-		authW := httptest.NewRecorder()
-		r.ServeHTTP(authW, authReq)
-
-		if authW.Code != http.StatusOK {
-			t.Fatalf("expected 200 for qr authorize, got %d", authW.Code)
-		}
-
-		// Poll after authorization -> authorized with token
-		pollReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/qr/poll/"+sessID, nil)
-		pollW := httptest.NewRecorder()
-		r.ServeHTTP(pollW, pollReq)
-
-		var pollRes struct {
-			Data struct {
-				Status string `json:"status"`
-				Token  string `json:"token"`
-			} `json:"data"`
-		}
-		_ = json.Unmarshal(pollW.Body.Bytes(), &pollRes)
-		if pollRes.Data.Status != "authorized" || pollRes.Data.Token == "" {
-			t.Fatalf("expected authorized status with token, got %+v", pollRes.Data)
-		}
-	})
-
-	t.Run("6. Verify passcode login", func(t *testing.T) {
+		// 正确密钥返回 200 及 token, device_id, device_name
 		passReq := VerifyPasscodeRequest{
-			Passcode: "my-secret-passcode",
+			Passcode:   "my-secret-passcode",
+			DeviceName: "Safari · macOS",
 		}
 		b, _ := json.Marshal(passReq)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/verify", bytes.NewReader(b))
@@ -296,12 +398,14 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 
 		var res struct {
 			Data struct {
-				Token string `json:"token"`
+				Token      string `json:"token"`
+				DeviceID   string `json:"device_id"`
+				DeviceName string `json:"device_name"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.Token == "" {
-			t.Fatalf("expected login token, got empty")
+		if !strings.HasPrefix(res.Data.Token, "lldt_") || !strings.HasPrefix(res.Data.DeviceID, "dev_web_") || res.Data.DeviceName != "Safari · macOS" {
+			t.Fatalf("unexpected verify response: %+v", res.Data)
 		}
 	})
 }

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -28,26 +27,37 @@ func TestAdminAuthRequired(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
 
-	t.Run("Passes when ADMIN_API_KEY is empty and system is uninitialized", func(t *testing.T) {
-		config.AppConfig.AdminAPIKey = ""
+	t.Run("Rejects regular write routes even when system is uninitialized (BE-18)", func(t *testing.T) {
 		db.DB.Exec("DELETE FROM site_configs")
+		db.DB.Exec("DELETE FROM devices")
+
 		r := gin.New()
 		r.Use(AdminAuthRequired())
-		r.POST("/test", func(c *gin.Context) {
+		r.POST("/api/v1/entries", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
+		r.POST("/api/v1/auth/pair/init", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "bootstrap_pair_ok"})
+		})
 
-		req := httptest.NewRequest(http.MethodPost, "/test", nil)
+		// 1. 常规写接口在未初始化时绝不免密放行，必须返回 401
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/entries", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 on regular write route when uninitialized, got %d", w.Code)
+		}
 
-		if w.Code != http.StatusOK {
-			t.Errorf("expected 200, got %d", w.Code)
+		// 2. 冷启动必需配对接口在未初始化时允许通行
+		reqPair := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
+		wPair := httptest.NewRecorder()
+		r.ServeHTTP(wPair, reqPair)
+		if wPair.Code != http.StatusOK {
+			t.Errorf("expected 200 on /api/v1/auth/pair/init when uninitialized, got %d", wPair.Code)
 		}
 	})
 
-	t.Run("Rejects unauthorized request when ADMIN_API_KEY is empty but system is initialized (BE-13)", func(t *testing.T) {
-		config.AppConfig.AdminAPIKey = ""
+	t.Run("Rejects unauthorized request when system is initialized (BE-13, BE-18)", func(t *testing.T) {
 		db.DB.Create(&models.SiteConfig{Initialized: true, MasterPasscode: "hashedpass"})
 		defer func() {
 			db.DB.Exec("DELETE FROM site_configs")
@@ -55,11 +65,11 @@ func TestAdminAuthRequired(t *testing.T) {
 
 		r := gin.New()
 		r.Use(AdminAuthRequired())
-		r.POST("/test", func(c *gin.Context) {
+		r.POST("/api/v1/auth/pair/init", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
 
-		req := httptest.NewRequest(http.MethodPost, "/test", nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
@@ -68,58 +78,13 @@ func TestAdminAuthRequired(t *testing.T) {
 		}
 	})
 
-	t.Run("Rejects unauthorized request when ADMIN_API_KEY is configured", func(t *testing.T) {
-		config.AppConfig.AdminAPIKey = "secret-test-token"
-		r := gin.New()
-		r.Use(AdminAuthRequired())
-		r.POST("/test", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		})
-
-		// 1. 无 header
-		req := httptest.NewRequest(http.MethodPost, "/test", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401, got %d", w.Code)
-		}
-
-		// 2. 错误 token
-		reqErr := httptest.NewRequest(http.MethodPost, "/test", nil)
-		reqErr.Header.Set("Authorization", "Bearer wrong-token")
-		wErr := httptest.NewRecorder()
-		r.ServeHTTP(wErr, reqErr)
-		if wErr.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 for wrong token, got %d", wErr.Code)
-		}
-
-		// 3. 正确 token (Bearer)
-		reqOk := httptest.NewRequest(http.MethodPost, "/test", nil)
-		reqOk.Header.Set("Authorization", "Bearer secret-test-token")
-		wOk := httptest.NewRecorder()
-		r.ServeHTTP(wOk, reqOk)
-		if wOk.Code != http.StatusOK {
-			t.Errorf("expected 200 for correct token, got %d", wOk.Code)
-		}
-
-		// 4. 正确 token (X-Device-Token)
-		reqDev := httptest.NewRequest(http.MethodPost, "/test", nil)
-		reqDev.Header.Set("X-Device-Token", "secret-test-token")
-		wDev := httptest.NewRecorder()
-		r.ServeHTTP(wDev, reqDev)
-		if wDev.Code != http.StatusOK {
-			t.Errorf("expected 200 for X-Device-Token, got %d", wDev.Code)
-		}
-	})
-
-	t.Run("Accepts valid paired Device Token", func(t *testing.T) {
-		config.AppConfig.AdminAPIKey = "master-super-secret"
-		rawDeviceToken := "lldt_live_test_device_token_12345"
-		tokenHash := hashToken(rawDeviceToken)
+	t.Run("Accepts valid paired Device Token via Bearer or X-Device-Token and rejects when revoked (BE-18)", func(t *testing.T) {
+		rawDeviceToken := "lldt_8390abff0192eac881273948bdf12901"
+		tokenHash := HashToken(rawDeviceToken)
 
 		device := models.Device{
-			DeviceID:     "dev_ios_test1",
-			Name:         "iPhone Test",
+			DeviceID:     "dev_ios_20261010_48b1",
+			Name:         "iPhone 16 Pro",
 			Platform:     "ios",
 			TokenHash:    tokenHash,
 			Status:       "active",
@@ -136,20 +101,38 @@ func TestAdminAuthRequired(t *testing.T) {
 			c.JSON(http.StatusOK, gin.H{
 				"auth_type": authType,
 				"device_id": devID,
+				"is_admin":  IsAdmin(c),
 			})
 		})
 
-		// 1. 使用该设备的 device token
+		// 1. Authorization: Bearer <token>
 		req := httptest.NewRequest(http.MethodPost, "/test", nil)
 		req.Header.Set("Authorization", "Bearer "+rawDeviceToken)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-
 		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 for paired device token, got %d", w.Code)
+			t.Fatalf("expected 200 for Bearer device token, got %d", w.Code)
 		}
 
-		// 2. 吊销设备后再次请求应被拦截
+		// 2. X-Device-Token: <token>
+		reqDev := httptest.NewRequest(http.MethodPost, "/test", nil)
+		reqDev.Header.Set("X-Device-Token", rawDeviceToken)
+		wDev := httptest.NewRecorder()
+		r.ServeHTTP(wDev, reqDev)
+		if wDev.Code != http.StatusOK {
+			t.Fatalf("expected 200 for X-Device-Token, got %d", wDev.Code)
+		}
+
+		// 3. 错误 token 返回 401
+		reqWrong := httptest.NewRequest(http.MethodPost, "/test", nil)
+		reqWrong.Header.Set("Authorization", "Bearer wrong_token")
+		wWrong := httptest.NewRecorder()
+		r.ServeHTTP(wWrong, reqWrong)
+		if wWrong.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for wrong token, got %d", wWrong.Code)
+		}
+
+		// 4. 吊销设备后再次请求应被拦截
 		db.DB.Model(&device).Update("status", "revoked")
 		reqRevoked := httptest.NewRequest(http.MethodPost, "/test", nil)
 		reqRevoked.Header.Set("Authorization", "Bearer "+rawDeviceToken)

@@ -54,6 +54,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.Attachment{},
 		&models.Project{},
 		&models.Transaction{},
+		&models.CreditChannel{},
 		&models.SiteConfig{},
 		&models.Device{},
 		&models.PairTicket{},
@@ -71,7 +72,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	return database, nil
 }
 
-// seedData 初始化站点全局配置与主理人初始档案 (空态冷启动 RG-05, RC-50, RC-52)
+// seedData 初始化站点全局配置与主理人初始档案 (空态冷启动 RG-05, RC-50, RC-52, RC-53)
 func seedData(database *gorm.DB) {
 	// 1. 站点全局配置 (全新部署置未初始化与纯净空态 RG-01, RC-50, RC-52)
 	var cfgCount int64
@@ -108,6 +109,31 @@ func seedData(database *gorm.DB) {
 			EDCGear:     `[]`,
 		}
 		database.Create(&profile)
+	}
+
+	// 3. 初始化默认内置信贷分期渠道 (花呗 10 号、京东白条 20 号 RC-53)
+	var channelCount int64
+	database.Model(&models.CreditChannel{}).Count(&channelCount)
+	if channelCount == 0 {
+		channels := []models.CreditChannel{
+			{
+				Code:         "huabei",
+				Name:         "花呗",
+				RepaymentDay: 10,
+				IsBuiltin:    true,
+				Color:        "var(--accent-warm)",
+			},
+			{
+				Code:         "baitiao",
+				Name:         "京东白条",
+				RepaymentDay: 20,
+				IsBuiltin:    true,
+				Color:        "var(--accent-vermilion)",
+			},
+		}
+		for _, ch := range channels {
+			database.Create(&ch)
+		}
 	}
 
 	log.Println("Database schema and core configurations ready.")

@@ -531,18 +531,30 @@ func GetStorageStatus(c *gin.Context) {
 // ==========================================
 
 type TransactionRequest struct {
-	Amount        int64  `json:"amount" binding:"required"` // 分
-	Type          string `json:"type" binding:"required"`   // income, expense
-	Category      string `json:"category" binding:"required"`
-	Title         string `json:"title"`
-	Note          string `json:"note"`
-	PaymentMethod string `json:"payment_method"`
-	WishID        *uint  `json:"wish_id"`
-	CityCode      string `json:"city_code"`
-	OccurredAt    string `json:"occurred_at"`
+	Amount                  int64  `json:"amount" binding:"required"` // 分
+	Type                    string `json:"type" binding:"required"`   // income, expense
+	Category                string `json:"category" binding:"required"`
+	Title                   string `json:"title"`
+	Note                    string `json:"note"`
+	PaymentMethod           string `json:"payment_method"`
+	WishID                  *uint  `json:"wish_id"`
+	CityCode                string `json:"city_code"`
+	OccurredAt              string `json:"occurred_at"`
+	// 分期付款核心字段 (RC-53)
+	IsInstallment           bool   `json:"is_installment"`
+	InstallmentChannelCode  string `json:"installment_channel_code"`
+	InstallmentTotalAmount  int64  `json:"installment_total_amount"`
+	InstallmentMonths       int    `json:"installment_months"`
+	InstallmentMonthlyPay   int64  `json:"installment_monthly_pay"`
+	InstallmentRemainMonths int    `json:"installment_remain_months"`
+	RepaymentDay            int    `json:"repayment_day"`
+	// 双向联动：记账大件同步收录至随身设备库 (RC-53)
+	LinkGearAsset           bool   `json:"link_gear_asset"`
+	GearCategory            string `json:"gear_category"`
+	GearSpec                string `json:"gear_spec"`
 }
 
-// CreateTransaction 记一笔
+// CreateTransaction 记一笔 (支持分期付款与随身设备库双向绑定 RC-53)
 func CreateTransaction(c *gin.Context) {
 	var req TransactionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -564,9 +576,89 @@ func CreateTransaction(c *gin.Context) {
 		OccurredAt:    occurred,
 	}
 
+	if req.IsInstallment {
+		tx.IsInstallment = true
+		tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
+		if tx.InstallmentChannelCode == "" {
+			tx.InstallmentChannelCode = "huabei"
+		}
+		total := req.InstallmentTotalAmount
+		if total <= 0 {
+			total = req.Amount
+		}
+		tx.InstallmentTotalAmount = total
+		months := req.InstallmentMonths
+		if months <= 0 {
+			months = 12
+		}
+		tx.InstallmentMonths = months
+		monthlyPay := req.InstallmentMonthlyPay
+		if monthlyPay <= 0 {
+			monthlyPay = total / int64(months)
+		}
+		tx.InstallmentMonthlyPay = monthlyPay
+		remainMonths := req.InstallmentRemainMonths
+		if remainMonths <= 0 {
+			remainMonths = months
+		}
+		tx.InstallmentRemainMonths = remainMonths
+
+		rDay := req.RepaymentDay
+		if rDay <= 0 {
+			var ch models.CreditChannel
+			if err := db.DB.Where("code = ?", tx.InstallmentChannelCode).First(&ch).Error; err == nil {
+				rDay = ch.RepaymentDay
+			} else {
+				rDay = 10
+			}
+		}
+		tx.RepaymentDay = rDay
+	}
+
 	if err := db.DB.Create(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "记账失败: "+err.Error())
 		return
+	}
+
+	// 路径 B：记账大件同步收录至随身设备库 (RC-53)
+	if req.LinkGearAsset {
+		var profile models.CuratorProfile
+		if err := db.DB.First(&profile).Error; err == nil {
+			gearCategory := strings.TrimSpace(req.GearCategory)
+			if gearCategory == "" {
+				gearCategory = tx.Category
+			}
+			newGear := models.GearItem{
+				ID:           fmt.Sprintf("gear_%d", time.Now().UnixNano()),
+				Name:         tx.Title,
+				Spec:         strings.TrimSpace(req.GearSpec),
+				Category:     gearCategory,
+				Status:       "active",
+				PriceCents:   tx.Amount,
+				PurchaseDate: tx.OccurredAt.Format("2006-01-02"),
+				Note:         tx.Note,
+			}
+			list := loadProfileGear(&profile)
+			list = append(list, newGear)
+			_ = saveProfileGear(&profile, list)
+		}
+	}
+
+	// 关联心愿单时同步闭环流转归册 (RG-14)
+	if req.WishID != nil && *req.WishID > 0 {
+		var wish models.Wish
+		if err := db.DB.First(&wish, *req.WishID).Error; err == nil {
+			if wish.Status == "wanting" {
+				wish.Status = "fulfilled"
+				occ := tx.OccurredAt
+				wish.FulfilledAt = &occ
+				wish.TransactionID = &tx.ID
+				if wish.ActualCost == 0 {
+					wish.ActualCost = tx.Amount
+				}
+				_ = db.DB.Save(&wish).Error
+			}
+		}
 	}
 
 	Success(c, tx)
@@ -721,6 +813,28 @@ func UpdateTransaction(c *gin.Context) {
 	if req.OccurredAt != "" {
 		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
 			tx.OccurredAt = t
+		}
+	}
+
+	if req.IsInstallment {
+		tx.IsInstallment = true
+		if req.InstallmentChannelCode != "" {
+			tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
+		}
+		if req.InstallmentTotalAmount > 0 {
+			tx.InstallmentTotalAmount = req.InstallmentTotalAmount
+		}
+		if req.InstallmentMonths > 0 {
+			tx.InstallmentMonths = req.InstallmentMonths
+		}
+		if req.InstallmentMonthlyPay > 0 {
+			tx.InstallmentMonthlyPay = req.InstallmentMonthlyPay
+		}
+		if req.InstallmentRemainMonths >= 0 {
+			tx.InstallmentRemainMonths = req.InstallmentRemainMonths
+		}
+		if req.RepaymentDay >= 1 && req.RepaymentDay <= 31 {
+			tx.RepaymentDay = req.RepaymentDay
 		}
 	}
 

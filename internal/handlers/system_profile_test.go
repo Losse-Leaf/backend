@@ -33,7 +33,22 @@ func setupTestFullDB(t *testing.T) {
 		&models.Project{},
 		&models.Wish{},
 		&models.Footprint{},
+		&models.CreditChannel{},
 	)
+	database.Create(&models.CreditChannel{
+		Code:         "huabei",
+		Name:         "花呗",
+		RepaymentDay: 10,
+		IsBuiltin:    true,
+		Color:        "var(--accent-warm)",
+	})
+	database.Create(&models.CreditChannel{
+		Code:         "baitiao",
+		Name:         "京东白条",
+		RepaymentDay: 20,
+		IsBuiltin:    true,
+		Color:        "var(--accent-vermilion)",
+	})
 	db.DB = database
 }
 

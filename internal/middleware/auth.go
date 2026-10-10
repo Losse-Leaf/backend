@@ -15,10 +15,61 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// hashToken 计算 Token 的 SHA-256 哈希
-func hashToken(token string) string {
+// HashToken 计算 Token 的 SHA-256 哈希
+func HashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func hashToken(token string) string {
+	return HashToken(token)
+}
+
+// ExtractToken 提取客户端携带的 Token (按优先级检索各标准头)
+func ExtractToken(c *gin.Context) string {
+	authHeader := c.GetHeader("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	}
+	if t := strings.TrimSpace(c.GetHeader("X-Device-Token")); t != "" {
+		return t
+	}
+	if t := strings.TrimSpace(c.GetHeader("X-Admin-Key")); t != "" {
+		return t
+	}
+	return strings.TrimSpace(c.Query("admin_key"))
+}
+
+// IsAdmin 判定当前请求是否具备管理员权限 (母密钥或有效激活设备)
+func IsAdmin(c *gin.Context) bool {
+	if authType, exists := c.Get("auth_type"); exists && authType != "" {
+		return true
+	}
+
+	token := ExtractToken(c)
+	if token == "" {
+		return false
+	}
+
+	expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
+	if expectedMasterKey != "" {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedMasterKey)) == 1 {
+			return true
+		}
+	} else {
+		// 本地开发未配置 master key 模式下，携带任意凭据即视为主理人请求
+		return true
+	}
+
+	if db.DB != nil {
+		tHash := HashToken(token)
+		var count int64
+		if err := db.DB.Model(&models.Device{}).Where("token_hash = ? AND status = 'active'", tHash).Count(&count).Error; err == nil && count > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // AdminAuthRequired 管理员操作鉴权中间件 (支持母密钥与已配对设备双轨鉴权)
@@ -29,28 +80,7 @@ func AdminAuthRequired() gin.HandlerFunc {
 		expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
 
 		// 1. 提取客户端携带的 Token (按优先级检索各标准头)
-		token := ""
-
-		// (1) Authorization: Bearer <token>
-		authHeader := c.GetHeader("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-		}
-
-		// (2) X-Device-Token: <token>
-		if token == "" {
-			token = strings.TrimSpace(c.GetHeader("X-Device-Token"))
-		}
-
-		// (3) X-Admin-Key: <token>
-		if token == "" {
-			token = strings.TrimSpace(c.GetHeader("X-Admin-Key"))
-		}
-
-		// (4) Query 参数备用
-		if token == "" {
-			token = strings.TrimSpace(c.Query("admin_key"))
-		}
+		token := ExtractToken(c)
 
 		// 2. 轨一校验：比对母密钥 (Master Key) - 采用常数时间比较防范侧信道攻击
 		if token != "" && expectedMasterKey != "" {

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -48,15 +49,23 @@ type UpdateWishRequest struct {
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
-// ResolveWishRequest 归册仪式请求 (方案 B 多模块联动)
+// ResolveWishRequest 归册仪式请求 (4种归册情景与多模块联动 RC-53)
 type ResolveWishRequest struct {
-	FulfilledAt       string `json:"fulfilled_at"` // 默认当前，支持历史补录，强制 <= now
-	ActualCost        int64  `json:"actual_cost"`  // 单位：分
-	CreateTransaction bool   `json:"create_transaction"`
-	CreateLifeEntry   bool   `json:"create_life_entry"`
-	CreateFootprint   bool   `json:"create_footprint"`
-	EntryContent      string `json:"entry_content"`
-	AttachmentIDs     []uint `json:"attachment_ids"`
+	FulfilledAt            string `json:"fulfilled_at"` // 默认当前，支持历史补录，强制 <= now
+	ActualCost             int64  `json:"actual_cost"`  // 单位：分
+	ResolutionType         string `json:"resolution_type"` // exact(原配原价) | altered(改选替代) | relinquished(理性拔草)
+	ActualTitle            string `json:"actual_title"` // 实际购买物品名 (altered 专用)
+	CreateTransaction      bool   `json:"create_transaction"`
+	CreateGearAsset        bool   `json:"create_gear_asset"` // item 专属一键建入随身设备库
+	CreateLifeEntry        bool   `json:"create_life_entry"`
+	CreateFootprint        bool   `json:"create_footprint"`
+	EntryContent           string `json:"entry_content"`
+	AttachmentIDs          []uint `json:"attachment_ids"`
+	// 分期付款支持 (RC-53)
+	IsInstallment          bool   `json:"is_installment"`
+	InstallmentChannelCode string `json:"installment_channel_code"`
+	InstallmentMonths      int    `json:"installment_months"`
+	RepaymentDay           int    `json:"repayment_day"`
 }
 
 // GetWishes 列表查询心愿 (支持 kind, status, since, 分页与 ETag)
@@ -286,39 +295,152 @@ func ResolveWish(c *gin.Context) {
 		return
 	}
 
-	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		wish.Status = "fulfilled"
-		wish.FulfilledAt = &fulfilledAt
-		wish.ActualCost = req.ActualCost
+	resType := strings.TrimSpace(req.ResolutionType)
+	if resType == "" {
+		resType = "exact"
+	}
+	if resType != "exact" && resType != "altered" && resType != "relinquished" {
+		resType = "exact"
+	}
 
-		// 联动 1: 账本支出流水
+	actualTitle := strings.TrimSpace(req.ActualTitle)
+	if actualTitle == "" {
+		actualTitle = wish.Title
+	}
+
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		wish.ResolutionType = resType
+		wish.FulfilledAt = &fulfilledAt
+
+		// 情景 3: 理性拔草 / 释怀放弃 (Relinquished with Peace RC-53)
+		if resType == "relinquished" {
+			wish.Status = "relinquished"
+			wish.ActualCost = 0
+			// 不生成支出流水，不增加设备库，不产生任何负债
+			if req.CreateLifeEntry {
+				content := strings.TrimSpace(req.EntryContent)
+				if content == "" {
+					content = fmt.Sprintf("理性拔草 · 释怀放下心愿「%s」", wish.Title)
+				}
+				entry := models.LifeEntry{
+					Type:       "reflection",
+					Title:      "理性拔草 · " + wish.Title,
+					Content:    content,
+					OccurredAt: fulfilledAt,
+					Tags:       "#心愿释怀",
+					CityCode:   wish.CityCode,
+					CityName:   wish.CityName,
+				}
+				if err := tx.Create(&entry).Error; err != nil {
+					return err
+				}
+				wish.LifeEntryID = &entry.ID
+				if len(req.AttachmentIDs) > 0 {
+					tx.Model(&models.Attachment{}).
+						Where("id IN ?", req.AttachmentIDs).
+						Update("entry_id", entry.ID)
+				}
+			}
+			return tx.Save(&wish).Error
+		}
+
+		// 情景 1 & 2: 原配原价 (exact) 或 改选替代方案 (altered)
+		wish.Status = "fulfilled"
+		wish.ActualCost = req.ActualCost
+		if resType == "altered" {
+			wish.ActualTitle = actualTitle
+		}
+
+		// 联动 1: 账本支出流水 (支持分期信贷联动 RC-53)
 		if req.CreateTransaction && req.ActualCost > 0 {
 			category := "好物购置"
 			if wish.Kind == "travel" {
 				category = "旅行度假"
 			}
+			displayTitle := "心愿达成: " + wish.Title
+			if resType == "altered" && actualTitle != "" {
+				displayTitle = fmt.Sprintf("心愿替代达成: %s (原: %s)", actualTitle, wish.Title)
+			}
 			newTx := models.Transaction{
 				Amount:        req.ActualCost,
 				Type:          "expense",
 				Category:      category,
-				Title:         "心愿达成: " + wish.Title,
-				Note:          fmt.Sprintf("三维心愿归册支出 (类别: %s)", wish.Kind),
+				Title:         displayTitle,
+				Note:          fmt.Sprintf("三维心愿归册支出 (类别: %s, 方案: %s)", wish.Kind, resType),
 				PaymentMethod: "心愿支出",
 				WishID:        &wish.ID,
 				CityCode:      wish.CityCode,
 				OccurredAt:    fulfilledAt,
 			}
+
+			if req.IsInstallment {
+				newTx.IsInstallment = true
+				newTx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
+				if newTx.InstallmentChannelCode == "" {
+					newTx.InstallmentChannelCode = "huabei"
+				}
+				newTx.InstallmentTotalAmount = req.ActualCost
+				months := req.InstallmentMonths
+				if months <= 0 {
+					months = 12
+				}
+				newTx.InstallmentMonths = months
+				newTx.InstallmentMonthlyPay = req.ActualCost / int64(months)
+				newTx.InstallmentRemainMonths = months
+
+				rDay := req.RepaymentDay
+				if rDay <= 0 {
+					var ch models.CreditChannel
+					if err := tx.Where("code = ?", newTx.InstallmentChannelCode).First(&ch).Error; err == nil {
+						rDay = ch.RepaymentDay
+					} else {
+						rDay = 10
+					}
+				}
+				newTx.RepaymentDay = rDay
+			}
+
 			if err := tx.Create(&newTx).Error; err != nil {
 				return err
 			}
 			wish.TransactionID = &newTx.ID
 		}
 
-		// 联动 2: 时间流散页随笔
+		// 联动 2: 固定资产设备入库 (item 专属，双向联动 RC-53)
+		if req.CreateGearAsset && wish.Kind == "item" {
+			gearName := actualTitle
+			if gearName == "" {
+				gearName = wish.Title
+			}
+			gearID := fmt.Sprintf("gear_%d", time.Now().UnixNano())
+			wish.GearID = &gearID
+
+			var profile models.CuratorProfile
+			if err := tx.First(&profile).Error; err == nil {
+				newGear := models.GearItem{
+					ID:           gearID,
+					Name:         gearName,
+					Spec:         wish.Spec,
+					Category:     "数码器材",
+					Status:       "active",
+					PriceCents:   req.ActualCost,
+					PurchaseDate: fulfilledAt.Format("2006-01-02"),
+					Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
+				}
+				list := loadProfileGear(&profile)
+				list = append(list, newGear)
+				bytes, _ := json.Marshal(list)
+				profile.EDCGear = string(bytes)
+				profile.UpdatedAt = time.Now()
+				_ = tx.Save(&profile).Error
+			}
+		}
+
+		// 联动 3: 时间流散页随笔
 		if req.CreateLifeEntry {
 			content := strings.TrimSpace(req.EntryContent)
 			if content == "" {
-				content = fmt.Sprintf("圆满达成心愿「%s」", wish.Title)
+				content = fmt.Sprintf("圆满达成心愿「%s」", actualTitle)
 			}
 			entryType := "collection"
 			if wish.Kind == "travel" {
@@ -326,7 +448,7 @@ func ResolveWish(c *gin.Context) {
 			}
 			entry := models.LifeEntry{
 				Type:       entryType,
-				Title:      "心愿达成 · " + wish.Title,
+				Title:      "心愿达成 · " + actualTitle,
 				Content:    content,
 				OccurredAt: fulfilledAt,
 				Tags:       "#心愿达成",
@@ -345,7 +467,7 @@ func ResolveWish(c *gin.Context) {
 			}
 		}
 
-		// 联动 3: 足迹打卡 (travel 专属)
+		// 联动 4: 足迹打卡 (travel 专属)
 		if req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "" {
 			cityName := wish.CityName
 			if cityName == "" {

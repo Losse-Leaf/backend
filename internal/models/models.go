@@ -67,19 +67,54 @@ type Project struct {
 
 // Transaction 独立记账记录 (单位：分，避免浮点数精度误差，如 1250 表示 12.50 元)
 type Transaction struct {
-	ID            uint           `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
-	Amount        int64          `gorm:"not null" json:"amount"` // 分
-	Type          string         `gorm:"index;not null" json:"type"` // "income" 或 "expense"
-	Category      string         `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
-	Title         string         `json:"title"`
-	Note          string         `json:"note"`
-	PaymentMethod string         `json:"payment_method"`
-	WishID        *uint          `gorm:"index" json:"wish_id,omitempty"`
-	CityCode      string         `gorm:"size:12;index" json:"city_code,omitempty"`
-	OccurredAt    time.Time      `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	DeletedAt     gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+	ID                      uint           `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
+	Amount                  int64          `gorm:"not null" json:"amount"` // 分
+	Type                    string         `gorm:"index;not null" json:"type"` // "income" 或 "expense"
+	Category                string         `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
+	Title                   string         `json:"title"`
+	Note                    string         `json:"note"`
+	PaymentMethod           string         `json:"payment_method"`
+	WishID                  *uint          `gorm:"index" json:"wish_id,omitempty"`
+	CityCode                string         `gorm:"size:12;index" json:"city_code,omitempty"`
+	OccurredAt              time.Time      `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
+	// 分期付款核心字段 (RC-53)
+	IsInstallment           bool           `gorm:"default:false;index" json:"is_installment"`
+	InstallmentChannelCode  string         `gorm:"size:32;index" json:"installment_channel_code,omitempty"` // huabei, baitiao, etc.
+	InstallmentTotalAmount  int64          `gorm:"default:0" json:"installment_total_amount"` // 分期总额（分）
+	InstallmentMonths       int            `gorm:"default:0" json:"installment_months"`       // 总期数 (3/6/12/24)
+	InstallmentMonthlyPay   int64          `gorm:"default:0" json:"installment_monthly_pay"`  // 每期还款额（分）
+	InstallmentRemainMonths int            `gorm:"default:0" json:"installment_remain_months"` // 剩余期数
+	RepaymentDay            int            `gorm:"default:10" json:"repayment_day"`           // 绑定渠道的每月独立还款日 (1~31)
+	CreatedAt               time.Time      `json:"created_at"`
+	UpdatedAt               time.Time      `json:"updated_at"`
+	DeletedAt               gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+}
+
+// CreditChannel 信贷与分期方式配置表 (RC-53)
+type CreditChannel struct {
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	Code         string    `gorm:"uniqueIndex;size:32;not null" json:"code"` // huabei, baitiao, custom_xxx
+	Name         string    `gorm:"size:64;not null" json:"name"`             // "花呗", "京东白条", "招行信用卡"
+	RepaymentDay int       `gorm:"not null" json:"repayment_day"`            // 每月独立还款日 (1~31)
+	IsBuiltin    bool      `gorm:"default:false" json:"is_builtin"`          // 是否系统内置 (花呗/白条为 true)
+	Color        string    `gorm:"size:32" json:"color,omitempty"`           // 标签色彩胶囊 (纸墨/朱砂/靛蓝)
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// GearItem 随身设备与固定资产模型 (RC-53)
+type GearItem struct {
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Spec           string `json:"spec,omitempty"`
+	Category       string `json:"category"`
+	Status         string `json:"status,omitempty"` // active | sold
+	PriceCents     int64  `json:"price_cents,omitempty"`
+	PurchaseDate   string `json:"purchase_date,omitempty"`
+	SoldPriceCents int64  `json:"sold_price_cents,omitempty"`
+	SoldDate       string `json:"sold_date,omitempty"`
+	Note           string `json:"note,omitempty"`
+	Link           string `json:"link,omitempty"`
 }
 
 // SiteConfig 站点全局与备案合规配置
@@ -161,25 +196,28 @@ type QRSession struct {
 
 // Wish 三维心愿单表 (好物 item | 旅程 travel | 阶段里程碑 milestone)
 type Wish struct {
-	ID            uint           `gorm:"primaryKey" json:"id"`
-	Title         string         `gorm:"size:255;not null" json:"title"`
-	Kind          string         `gorm:"size:32;index;not null" json:"kind"` // item | travel | milestone
-	Note          string         `gorm:"type:text" json:"note"`
-	Spec          string         `gorm:"size:255" json:"spec,omitempty"`
-	CityCode      string         `gorm:"size:12;index" json:"city_code,omitempty"`
-	CityName      string         `gorm:"size:64" json:"city_name,omitempty"`
-	Budget        int64          `gorm:"default:0" json:"budget"`      // 单位：分
-	ActualCost    int64          `gorm:"default:0" json:"actual_cost"` // 单位：分
-	TargetDate    *time.Time     `json:"target_date,omitempty"`
-	Status        string         `gorm:"size:32;index;default:wanting" json:"status"` // wanting | fulfilled | shelved
-	FulfilledAt   *time.Time     `json:"fulfilled_at,omitempty"`
-	TransactionID *uint          `gorm:"index" json:"transaction_id,omitempty"`
-	LifeEntryID   *uint          `gorm:"index" json:"life_entry_id,omitempty"`
-	FootprintID   *uint          `gorm:"index" json:"footprint_id,omitempty"`
-	Attachments   []Attachment   `gorm:"foreignKey:WishID" json:"attachments"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	DeletedAt     gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+	ID             uint           `gorm:"primaryKey" json:"id"`
+	Title          string         `gorm:"size:255;not null" json:"title"`
+	Kind           string         `gorm:"size:32;index;not null" json:"kind"` // item | travel | milestone
+	Note           string         `gorm:"type:text" json:"note"`
+	Spec           string         `gorm:"size:255" json:"spec,omitempty"`
+	CityCode       string         `gorm:"size:12;index" json:"city_code,omitempty"`
+	CityName       string         `gorm:"size:64" json:"city_name,omitempty"`
+	Budget         int64          `gorm:"default:0" json:"budget"`      // 单位：分
+	ActualCost     int64          `gorm:"default:0" json:"actual_cost"` // 单位：分
+	ResolutionType string         `gorm:"size:32;default:exact" json:"resolution_type"` // exact | altered | relinquished
+	ActualTitle    string         `gorm:"size:255" json:"actual_title,omitempty"`
+	TargetDate     *time.Time     `json:"target_date,omitempty"`
+	Status         string         `gorm:"size:32;index;default:wanting" json:"status"` // wanting | fulfilled | relinquished | shelved
+	FulfilledAt    *time.Time     `json:"fulfilled_at,omitempty"`
+	TransactionID  *uint          `gorm:"index" json:"transaction_id,omitempty"`
+	LifeEntryID    *uint          `gorm:"index" json:"life_entry_id,omitempty"`
+	FootprintID    *uint          `gorm:"index" json:"footprint_id,omitempty"`
+	GearID         *string        `gorm:"size:64" json:"gear_id,omitempty"`
+	Attachments    []Attachment   `gorm:"foreignKey:WishID" json:"attachments"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	DeletedAt      gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // Footprint 城市旅游足迹打卡表

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
@@ -25,6 +26,33 @@ func parseJSONOrRaw(raw string) any {
 	return raw
 }
 
+func sanitizeEDCGear(raw string, isAdmin bool) any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []any{}
+	}
+	var list []map[string]any
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return parseJSONOrRaw(raw)
+	}
+	if isAdmin {
+		return list
+	}
+	sanitized := make([]map[string]any, 0, len(list))
+	for _, item := range list {
+		clean := make(map[string]any)
+		for k, v := range item {
+			// 严格脱敏财务字段 (RC-53)
+			if k == "price_cents" || k == "sold_price_cents" || k == "price" || k == "sold_price" {
+				continue
+			}
+			clean[k] = v
+		}
+		sanitized = append(sanitized, clean)
+	}
+	return sanitized
+}
+
 func parseSocialMap(raw string) map[string]any {
 	result := make(map[string]any)
 	raw = strings.TrimSpace(raw)
@@ -35,7 +63,7 @@ func parseSocialMap(raw string) map[string]any {
 	return result
 }
 
-func populateProfileData(p *models.CuratorProfile) {
+func populateProfileData(p *models.CuratorProfile, isAdmin bool) {
 	socialMap := parseSocialMap(p.SocialLinks)
 	if emailVal, ok := socialMap["email"].(string); ok {
 		p.Email = strings.TrimSpace(emailVal)
@@ -47,12 +75,7 @@ func populateProfileData(p *models.CuratorProfile) {
 	socialMap["github"] = p.Github
 	p.SocialData = socialMap
 
-	edcData := parseJSONOrRaw(p.EDCGear)
-	if edcData == nil {
-		p.EDCGearData = []any{}
-	} else {
-		p.EDCGearData = edcData
-	}
+	p.EDCGearData = sanitizeEDCGear(p.EDCGear, isAdmin)
 
 	if p.AvatarURL != "" {
 		p.AvatarKey = storage.ExtractObjectKey(p.AvatarURL)
@@ -60,14 +83,15 @@ func populateProfileData(p *models.CuratorProfile) {
 	}
 }
 
-// GetCuratorProfile 获取主理人完整档案 (全端动态获取，禁止前端硬编码)
+// GetCuratorProfile 获取主理人完整档案 (全端动态获取，访客模式脱敏 EDC 财务信息 RC-53)
 func GetCuratorProfile(c *gin.Context) {
 	var profile models.CuratorProfile
 	if err := db.DB.First(&profile).Error; err != nil {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")
 		return
 	}
-	populateProfileData(&profile)
+	isAdmin := middleware.IsAdmin(c)
+	populateProfileData(&profile, isAdmin)
 	Success(c, profile)
 }
 
@@ -196,6 +220,6 @@ func UpdateCuratorProfile(c *gin.Context) {
 		return
 	}
 
-	populateProfileData(&profile)
+	populateProfileData(&profile, true)
 	Success(c, profile)
 }

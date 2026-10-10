@@ -81,7 +81,7 @@ func TestProfileAndConfig(t *testing.T) {
 		// 先初始化一个基础 profile
 		initialProfile := models.CuratorProfile{
 			Name:        "迟暮",
-			EnglishName: "ChiMu",
+			EnglishName: "",
 			Title:       "数字手艺人",
 			Location:    "杭州",
 			SocialLinks: `{"github":"https://github.com/YN1753"}`,
@@ -147,7 +147,6 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 		config.AppConfig.AdminAPIKey = ""
 		reqBody := BootstrapRequest{
 			CuratorName:    "迟暮",
-			CuratorEn:      "ChiMu",
 			Location:       "中国 · 杭州",
 			MasterPasscode: "my-secret-passcode",
 		}

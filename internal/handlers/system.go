@@ -63,10 +63,6 @@ func BootstrapSystem(c *gin.Context) {
 	}
 
 	curatorName := strings.TrimSpace(req.CuratorName)
-	curatorEn := strings.TrimSpace(req.CuratorEn)
-	if curatorEn == "" {
-		curatorEn = curatorName
-	}
 	location := strings.TrimSpace(req.Location)
 	if location == "" {
 		location = "中国 · 杭州"
@@ -74,7 +70,7 @@ func BootstrapSystem(c *gin.Context) {
 
 	// 1. 初始化 SiteConfig
 	cfg.CuratorName = curatorName
-	cfg.CuratorEn = curatorEn
+	cfg.CuratorEn = ""
 	cfg.DefaultLocation = location
 	cfg.Initialized = true
 	if req.MasterPasscode != "" {
@@ -86,11 +82,11 @@ func BootstrapSystem(c *gin.Context) {
 	var profile models.CuratorProfile
 	db.DB.FirstOrCreate(&profile)
 	profile.Name = curatorName
-	profile.EnglishName = curatorEn
+	profile.EnglishName = ""
 	profile.Location = location
 	profile.CurrentCity = location
 	if profile.Title == "" {
-		profile.Title = "数字手艺人 · 生活档案馆主理人"
+		profile.Title = "独立开发者 · 胶片摄影与手冲咖啡学徒"
 	}
 	if profile.Bio == "" {
 		profile.Bio = "在数字洪流中筑造一座安静的纸质庇护所，记录具体而微的真实生活。"

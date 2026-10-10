@@ -185,7 +185,7 @@ func seedData(database *gorm.DB) {
 			Story:       "清晨的第一杯手冲是我开启一天的仪式。为了稳定复现柑橘与茉莉花香，用温度计和秒表记录了上百次注水数据，整理出这套自用的阶梯水温冲煮参数。",
 			Category:    "生活手艺",
 			Tags:        "手冲咖啡,V60,风味探索,生活手艺",
-			GithubURL:   "https://github.com/YN1753/ChiMu-Lab",
+			GithubURL:   "https://github.com/YN1753/Loose-Leaf",
 			Status:      "Active",
 			Featured:    true,
 			Order:       8,
@@ -197,7 +197,7 @@ func seedData(database *gorm.DB) {
 			Story:       "写代码卡住或心浮气躁的夜晚，骑上公路车钻进杨公堤和茅家埠的树影里。风把杂念吹散，呼吸找回节奏。这是我在这座城市里最隐秘的充能时刻。",
 			Category:    "路线探索",
 			Tags:        "公路车,夜骑,西湖路书,路线探索",
-			GithubURL:   "https://github.com/YN1753/ChiMu-Lab",
+			GithubURL:   "https://github.com/YN1753/Loose-Leaf",
 			Status:      "Active",
 			Featured:    true,
 			Order:       9,
@@ -557,12 +557,12 @@ func seedData(database *gorm.DB) {
 	database.Model(&models.SiteConfig{}).Count(&cfgCount)
 	if cfgCount == 0 {
 		config := models.SiteConfig{
-			SiteName:        "散页 · Living Archive",
-			SiteSubtitle:    "迟暮的生活数字档案馆",
+			SiteName:        "散页 · 时光手账与生活档案",
+			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
 			CuratorName:     "迟暮",
-			CuratorEn:       "ChiMu",
+			CuratorEn:       "",
 			DefaultLocation: "中国 · 杭州",
-			SiteDesc:        "A personal archive of things I've done, seen, thought about, and don't want to forget.",
+			SiteDesc:        "生活档案与时光手账，记录真实可感的日子。",
 			Domain:          "codeactivityhub.top",
 			ICPNumber:       "浙ICP备2026081664号",
 			ICPLink:         "https://beian.miit.gov.cn",
@@ -570,18 +570,21 @@ func seedData(database *gorm.DB) {
 		}
 		database.Create(&config)
 	} else {
-		// 平滑迁移旧配置字段
+		// 平滑迁移旧配置字段：彻底净化 ChiMu 与生硬的拼凑字样
 		var existingCfg models.SiteConfig
 		if err := database.First(&existingCfg).Error; err == nil {
 			updates := map[string]interface{}{}
-			if existingCfg.SiteSubtitle == "" {
-				updates["site_subtitle"] = "迟暮的生活数字档案馆"
+			if existingCfg.SiteSubtitle == "" || strings.Contains(existingCfg.SiteSubtitle, "档案馆") || strings.Contains(existingCfg.SiteSubtitle, "ChiMu") {
+				updates["site_subtitle"] = "时光手账与生活档案 · 记录真实可感的日子"
+			}
+			if strings.Contains(existingCfg.SiteName, "ChiMu") || strings.Contains(existingCfg.SiteName, "档案馆") {
+				updates["site_name"] = "散页 · 时光手账与生活档案"
 			}
 			if existingCfg.CuratorName == "" {
 				updates["curator_name"] = "迟暮"
 			}
-			if existingCfg.CuratorEn == "" {
-				updates["curator_en"] = "ChiMu"
+			if existingCfg.CuratorEn != "" {
+				updates["curator_en"] = ""
 			}
 			if existingCfg.DefaultLocation == "" {
 				updates["default_location"] = "中国 · 杭州"
@@ -601,8 +604,8 @@ func seedData(database *gorm.DB) {
 	if profileCount == 0 {
 		profile := models.CuratorProfile{
 			Name:        "迟暮",
-			EnglishName: "ChiMu",
-			Title:       "数字手艺人 · 旁轴胶片爱好者",
+			EnglishName: "",
+			Title:       "独立开发者 · 胶片摄影与手冲咖啡学徒",
 			Bio:         "在数字洪流中筑造一座安静的纸质庇护所，记录具体而微的真实生活。",
 			Location:    "中国 · 杭州",
 			CurrentCity: "杭州",
@@ -613,6 +616,13 @@ func seedData(database *gorm.DB) {
 			EDCGear:     `[{"name":"Contax T2","category":"影像器材","spec":"Carl Zeiss Sonnar 38mm F2.8","note":"极简旁轴机械手感，锐利且通透的德系发色，记录四季街头。"},{"name":"MacBook Pro 14 (M3 Max)","category":"工作台算力","spec":"Space Black · 36GB Unified Memory","note":"随身代码与文字创作工坊，安静而深邃的算力中枢。"}]`,
 		}
 		database.Create(&profile)
+	} else {
+		var existingProfile models.CuratorProfile
+		if err := database.First(&existingProfile).Error; err == nil {
+			if existingProfile.EnglishName != "" {
+				database.Model(&existingProfile).Update("english_name", "")
+			}
+		}
 	}
 
 	log.Println("Database initialized with life stream entries, craft projects, and transactions.")

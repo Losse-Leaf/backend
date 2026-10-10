@@ -954,10 +954,10 @@ func GetConfig(c *gin.Context) {
 	var config models.SiteConfig
 	if err := db.DB.First(&config).Error; err != nil {
 		c.JSON(http.StatusOK, models.SiteConfig{
-			SiteName:        "散页 · Living Archive",
-			SiteSubtitle:    "迟暮的生活数字档案馆",
+			SiteName:        "散页 · 时光手账与生活档案",
+			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
 			CuratorName:     "迟暮",
-			CuratorEn:       "ChiMu",
+			CuratorEn:       "",
 			DefaultLocation: "中国 · 杭州",
 			Domain:          "codeactivityhub.top",
 			ICPNumber:       "浙ICP备2026081664号",
@@ -972,10 +972,10 @@ func GetConfigV1(c *gin.Context) {
 	var config models.SiteConfig
 	if err := db.DB.First(&config).Error; err != nil {
 		config = models.SiteConfig{
-			SiteName:        "散页 · Living Archive",
-			SiteSubtitle:    "迟暮的生活数字档案馆",
+			SiteName:        "散页 · 时光手账与生活档案",
+			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
 			CuratorName:     "迟暮",
-			CuratorEn:       "ChiMu",
+			CuratorEn:       "",
 			DefaultLocation: "中国 · 杭州",
 			Domain:          "codeactivityhub.top",
 			ICPNumber:       "浙ICP备2026081664号",
@@ -1040,7 +1040,7 @@ func UpdateConfig(c *gin.Context) {
 func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":     "operational",
-		"service":    "ChiMu Life Archive Core",
+		"service":    "Loose-Leaf Life Archive Core",
 		"runtime":    runtime.Version(),
 		"storage_r2": storage.IsConfigured(),
 		"time":       time.Now().Unix(),

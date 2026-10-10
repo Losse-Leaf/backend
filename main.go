@@ -128,25 +128,10 @@ func main() {
 			write.POST("/auth/pair/init", handlers.InitPairing)
 			write.GET("/auth/devices", handlers.GetTrustedDevices)
 			write.DELETE("/auth/devices/:id", handlers.RevokeDevice)
-
-			// Now Status (此刻的我状态更新)
-			write.PUT("/now", handlers.UpdateNowStatus)
 		}
-	}
 
-	// 6. 兼容原有旧版只读与更新路由
-	api := r.Group("/api")
-	{
-		api.GET("/health", handlers.HealthCheck)
-		api.GET("/entries", handlers.GetLifeEntries)
-		api.GET("/now", handlers.GetNowStatus)
-		api.PUT("/now", middleware.AdminAuthRequired(), handlers.UpdateNowStatus)
-		api.GET("/projects", handlers.GetProjects)
-		api.GET("/archive", handlers.GetArchiveStats)
-		api.GET("/config", handlers.GetConfig)
-		api.PUT("/config", middleware.AdminAuthRequired(), handlers.UpdateConfig)
-		api.GET("/profile", handlers.GetCuratorProfile)
-		api.PUT("/profile", middleware.AdminAuthRequired(), handlers.UpdateCuratorProfile)
+		// Health Check
+		v1.GET("/health", handlers.HealthCheck)
 	}
 
 	// 7. 前端静态文件托管（支持从根目录或 backend 目录下直接启动）

@@ -145,6 +145,10 @@ func main() {
 		v1.GET("/health", handlers.HealthCheck)
 	}
 
+	// 探针路由 (对齐 docs/backend.md §5.1)
+	r.GET("/api/health", handlers.HealthCheck)
+	r.GET("/health", handlers.HealthCheck)
+
 	// 7. 本地媒体静态托管 (未配 R2 时服务 data/uploads/ 下的文件 RC-44)
 	uploadsDir := filepath.Join("data", "uploads")
 	_ = os.MkdirAll(uploadsDir, 0755)

@@ -123,11 +123,11 @@ func GeneratePresignedPutURL(filename, contentType string, size int64) (uploadID
 
 	now := time.Now()
 	cleanName := sanitizeFilename(filename)
-	uid := uuid.New().String()[:8]
+	uid := uuid.New().String()
 
 	// 设计规范：entries/{year}/{month}/{day}/{uuid}-{safe_filename}
 	objectKey = fmt.Sprintf("entries/%04d/%02d/%02d/%s-%s",
-		now.Year(), now.Month(), now.Day(), uid, cleanName)
+		now.Year(), now.Month(), now.Day(), uid[:8], cleanName)
 
 	expiresIn = 900 // 15 分钟
 	expiresDuration := time.Duration(expiresIn) * time.Second
@@ -144,8 +144,7 @@ func GeneratePresignedPutURL(filename, contentType string, size int64) (uploadID
 		return "", "", "", 0, fmt.Errorf("failed to presign PUT request: %w", err)
 	}
 
-	uploadID = uuid.New().String()
-	return uploadID, objectKey, presignedReq.URL, expiresIn, nil
+	return uid, objectKey, presignedReq.URL, expiresIn, nil
 }
 
 // VerifyObjectExists 确认对象已实际上传到 R2，并获取真实大小与类型
@@ -294,7 +293,10 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 		return "/assets/" + path.Clean(objectKey), expiresIn, nil
 	}
 
-	cleanKey := ExtractObjectKey(objectKey)
+	cleanKey := strings.TrimPrefix(path.Clean(objectKey), "/")
+	if strings.HasPrefix(objectKey, "http://") || strings.HasPrefix(objectKey, "https://") {
+		cleanKey = ExtractObjectKey(objectKey)
+	}
 	getInput := &s3.GetObjectInput{
 		Bucket: aws.String(r2Bucket),
 		Key:    aws.String(cleanKey),

@@ -49,7 +49,13 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	r := gin.Default()
+	var r *gin.Engine
+	if gin.Mode() == gin.ReleaseMode {
+		r = gin.New()
+		r.Use(gin.Recovery())
+	} else {
+		r = gin.Default()
+	}
 
 	// 4. CORS 跨域配置
 	corsConfig := cors.DefaultConfig()

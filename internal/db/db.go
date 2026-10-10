@@ -54,7 +54,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.Attachment{},
 		&models.Project{},
 		&models.Transaction{},
-		&models.NowStatus{},
 		&models.SiteConfig{},
 		&models.Device{},
 		&models.PairTicket{},
@@ -72,25 +71,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 
 // seedData 填充生活档案与造物项目
 func seedData(database *gorm.DB) {
-	// 1. 初始化「此刻的我」状态 (Now)
-	var nowCount int64
-	database.Model(&models.NowStatus{}).Count(&nowCount)
-	if nowCount == 0 {
-		now := models.NowStatus{
-			Building:    "生活自留地 · 真正记录生活的数字档案馆",
-			Learning:    "编译器机制、胶片摄影、手冲烘焙萃取",
-			Playing:     "黑神话：悟空、塞尔达传说、Steam 联机",
-			Listening:   "坂本龙一 - 《async》/《BTTB》",
-			Reading:     "罗伯特·波西格 - 《禅与摩托车维修艺术》",
-			Thinking:    "如何在快节奏的喧嚣中保持诚恳、安静且有确定性的生活",
-			Using:       "MacBook Pro 14, Contax T2, 纯白陶瓷滤杯, Midori MD 手账",
-			Location:    "中国 · 杭州 (西湖区 / 余杭)",
-			LastUpdated: "2026.10.09",
-		}
-		database.Create(&now)
-	}
-
-	// 2. 初始化项目（作为生活经历的一章：Things I Made）
+	// 1. 初始化项目（作为生活经历的一章：Things I Made）
 	var projCount int64
 	database.Model(&models.Project{}).Count(&projCount)
 	if projCount == 0 {

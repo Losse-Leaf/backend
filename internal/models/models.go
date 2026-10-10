@@ -78,20 +78,6 @@ type Transaction struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// NowStatus 「此刻的我」当前状态
-type NowStatus struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Building    string    `json:"building"`
-	Learning    string    `json:"learning"`
-	Playing     string    `json:"playing"`
-	Listening   string    `json:"listening"`
-	Reading     string    `json:"reading"`
-	Thinking    string    `json:"thinking"`
-	Using       string    `json:"using"`
-	Location    string    `json:"location"`
-	LastUpdated string    `json:"last_updated"`
-}
-
 // SiteConfig 站点全局与备案合规配置
 type SiteConfig struct {
 	ID              uint      `gorm:"primaryKey" json:"id"`

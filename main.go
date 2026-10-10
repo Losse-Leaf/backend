@@ -101,6 +101,19 @@ func main() {
 		v1.GET("/files/sign", handlers.SignFileURL)
 		v1.POST("/files/sign-batch", handlers.SignFilesBatch)
 
+		// 足迹图谱与城市回忆抽屉 (公开只读)
+		v1.GET("/footprints", handlers.GetFootprints)
+		v1.GET("/footprints/atlas", handlers.GetFootprintsAtlas)
+		v1.GET("/footprints/cities/:city_code/drawer", handlers.GetCityMemoryDrawer)
+		v1.GET("/footprints/:id", handlers.GetFootprintByID)
+
+		// 三维心愿单 (公开只读)
+		v1.GET("/wishes", handlers.GetWishes)
+		v1.GET("/wishes/:id", handlers.GetWishByID)
+
+		// 年度生活年鉴 (公开只读)
+		v1.GET("/almanac/summary", handlers.GetAnnualAlmanacSummary)
+
 		// === 管理员写权限受保护接口 ===
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
@@ -127,6 +140,17 @@ func main() {
 			write.POST("/projects", handlers.CreateProject)
 			write.PUT("/projects/:id", handlers.UpdateProject)
 			write.DELETE("/projects/:id", handlers.DeleteProject)
+
+			// Footprints (旅游足迹打卡)
+			write.POST("/footprints", handlers.CreateFootprint)
+			write.PUT("/footprints/:id", handlers.UpdateFootprint)
+			write.DELETE("/footprints/:id", handlers.DeleteFootprint)
+
+			// Wishes (三维心愿单与归册联动)
+			write.POST("/wishes", handlers.CreateWish)
+			write.PUT("/wishes/:id", handlers.UpdateWish)
+			write.POST("/wishes/:id/resolve", handlers.ResolveWish)
+			write.DELETE("/wishes/:id", handlers.DeleteWish)
 
 			// 站点全局配置与主理人档案维护
 			write.PUT("/config", handlers.UpdateConfig)

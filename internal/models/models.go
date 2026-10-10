@@ -19,10 +19,12 @@ type LifeEntry struct {
 	Project     *Project     `gorm:"foreignKey:ProjectID" json:"project,omitempty"`
 	Attachments []Attachment `gorm:"foreignKey:EntryID;constraint:OnDelete:CASCADE" json:"attachments"`
 
-	Meta           string `json:"meta,omitempty"`
-	Tags           string `json:"tags,omitempty"`
-	Link           string `json:"link,omitempty"`
-	Featured       bool   `json:"featured,omitempty"`
+	Meta     string `json:"meta,omitempty"`
+	Tags     string `json:"tags,omitempty"`
+	Link     string `json:"link,omitempty"`
+	Featured bool   `json:"featured,omitempty"`
+	CityCode string `gorm:"size:12;index" json:"city_code,omitempty"`
+	CityName string `gorm:"size:64" json:"city_name,omitempty"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `gorm:"index" json:"updated_at"`
@@ -32,7 +34,9 @@ type LifeEntry struct {
 // Attachment 附件与多媒体对象关联表
 type Attachment struct {
 	ID               uint      `gorm:"primaryKey" json:"id"`
-	EntryID          *uint     `gorm:"index" json:"entry_id"`
+	EntryID          *uint     `gorm:"index" json:"entry_id,omitempty"`
+	WishID           *uint     `gorm:"index" json:"wish_id,omitempty"`
+	FootprintID      *uint     `gorm:"index" json:"footprint_id,omitempty"`
 	ObjectKey        string    `gorm:"uniqueIndex" json:"object_key"`
 	OriginalFilename string    `json:"original_filename"`
 	MimeType         string    `json:"mime_type"`
@@ -70,6 +74,8 @@ type Transaction struct {
 	Title         string         `json:"title"`
 	Note          string         `json:"note"`
 	PaymentMethod string         `json:"payment_method"`
+	WishID        *uint          `gorm:"index" json:"wish_id,omitempty"`
+	CityCode      string         `gorm:"size:12;index" json:"city_code,omitempty"`
 	OccurredAt    time.Time      `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
 	CreatedAt     time.Time      `json:"created_at"`
 	UpdatedAt     time.Time      `json:"updated_at"`
@@ -150,4 +156,45 @@ type QRSession struct {
 	ExpiresAt time.Time `gorm:"index;not null" json:"expires_at"`
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// Wish 三维心愿单表 (好物 item | 旅程 travel | 阶段里程碑 milestone)
+type Wish struct {
+	ID            uint           `gorm:"primaryKey" json:"id"`
+	Title         string         `gorm:"size:255;not null" json:"title"`
+	Kind          string         `gorm:"size:32;index;not null" json:"kind"` // item | travel | milestone
+	Note          string         `gorm:"type:text" json:"note"`
+	Spec          string         `gorm:"size:255" json:"spec,omitempty"`
+	CityCode      string         `gorm:"size:12;index" json:"city_code,omitempty"`
+	CityName      string         `gorm:"size:64" json:"city_name,omitempty"`
+	Budget        int64          `gorm:"default:0" json:"budget"`      // 单位：分
+	ActualCost    int64          `gorm:"default:0" json:"actual_cost"` // 单位：分
+	TargetDate    *time.Time     `json:"target_date,omitempty"`
+	Status        string         `gorm:"size:32;index;default:wanting" json:"status"` // wanting | fulfilled | shelved
+	FulfilledAt   *time.Time     `json:"fulfilled_at,omitempty"`
+	TransactionID *uint          `gorm:"index" json:"transaction_id,omitempty"`
+	LifeEntryID   *uint          `gorm:"index" json:"life_entry_id,omitempty"`
+	FootprintID   *uint          `gorm:"index" json:"footprint_id,omitempty"`
+	Attachments   []Attachment   `gorm:"foreignKey:WishID" json:"attachments"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+}
+
+// Footprint 城市旅游足迹打卡表
+type Footprint struct {
+	ID          uint           `gorm:"primaryKey" json:"id"`
+	CityCode    string         `gorm:"size:12;index;not null" json:"city_code"` // 6 位行政区划代码，如杭州 330100
+	CityName    string         `gorm:"size:64;not null" json:"city_name"`       // 城市名称，如 "杭州市"
+	VisitedAt   time.Time      `gorm:"index;not null" json:"visited_at"`        // 到访日期
+	Note        string         `gorm:"type:text" json:"note"`                   // 足迹随笔或简注
+	LifeEntryID *uint          `gorm:"index" json:"life_entry_id,omitempty"`    // 可选关联时间流条目
+	WishID      *uint          `gorm:"index" json:"wish_id,omitempty"`          // 可选关联溯源心愿
+	Latitude    float64        `json:"latitude,omitempty"`                      // GCJ-02 纬度
+	Longitude   float64        `json:"longitude,omitempty"`                     // GCJ-02 经度
+	Attachments []Attachment   `gorm:"foreignKey:FootprintID" json:"attachments"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+}
+
 

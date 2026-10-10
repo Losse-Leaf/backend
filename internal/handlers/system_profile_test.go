@@ -31,6 +31,8 @@ func setupTestFullDB(t *testing.T) {
 		&models.LifeEntry{},
 		&models.Transaction{},
 		&models.Project{},
+		&models.Wish{},
+		&models.Footprint{},
 	)
 	db.DB = database
 }

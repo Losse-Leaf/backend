@@ -93,6 +93,8 @@ type CreateEntryRequest struct {
 	Meta          string `json:"meta"`
 	Link          string `json:"link"`
 	Featured      bool   `json:"featured"`
+	CityCode      string `json:"city_code"`
+	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
@@ -117,6 +119,8 @@ func CreateLifeEntry(c *gin.Context) {
 		Meta:       strings.TrimSpace(req.Meta),
 		Link:       strings.TrimSpace(req.Link),
 		Featured:   req.Featured,
+		CityCode:   strings.TrimSpace(req.CityCode),
+		CityName:   strings.TrimSpace(req.CityName),
 		ProjectID:  req.ProjectID,
 	}
 
@@ -272,6 +276,8 @@ type UpdateEntryRequest struct {
 	Meta          string `json:"meta"`
 	Link          string `json:"link"`
 	Featured      *bool  `json:"featured"`
+	CityCode      string `json:"city_code"`
+	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
@@ -314,6 +320,12 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 	if req.Featured != nil {
 		entry.Featured = *req.Featured
+	}
+	if req.CityCode != "" {
+		entry.CityCode = strings.TrimSpace(req.CityCode)
+	}
+	if req.CityName != "" {
+		entry.CityName = strings.TrimSpace(req.CityName)
 	}
 	entry.ProjectID = req.ProjectID
 
@@ -525,6 +537,8 @@ type TransactionRequest struct {
 	Title         string `json:"title"`
 	Note          string `json:"note"`
 	PaymentMethod string `json:"payment_method"`
+	WishID        *uint  `json:"wish_id"`
+	CityCode      string `json:"city_code"`
 	OccurredAt    string `json:"occurred_at"`
 }
 
@@ -545,6 +559,8 @@ func CreateTransaction(c *gin.Context) {
 		Title:         strings.TrimSpace(req.Title),
 		Note:          strings.TrimSpace(req.Note),
 		PaymentMethod: strings.TrimSpace(req.PaymentMethod),
+		WishID:        req.WishID,
+		CityCode:      strings.TrimSpace(req.CityCode),
 		OccurredAt:    occurred,
 	}
 
@@ -695,6 +711,12 @@ func UpdateTransaction(c *gin.Context) {
 	tx.Title = strings.TrimSpace(req.Title)
 	tx.Note = strings.TrimSpace(req.Note)
 	tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
+	if req.WishID != nil {
+		tx.WishID = req.WishID
+	}
+	if req.CityCode != "" {
+		tx.CityCode = strings.TrimSpace(req.CityCode)
+	}
 
 	if req.OccurredAt != "" {
 		if t, err := ParseFlexTime(req.OccurredAt); err == nil {

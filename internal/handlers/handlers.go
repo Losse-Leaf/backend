@@ -580,6 +580,14 @@ func GetTransactions(c *gin.Context) {
 		}
 	}
 
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if offset, err := strconv.Atoi(c.Query("offset")); err == nil && offset > 0 {
+		query = query.Offset(offset)
+	}
+
 	var txs []models.Transaction
 	if err := query.Find(&txs).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取记账列表失败")
@@ -739,7 +747,11 @@ func CreateProject(c *gin.Context) {
 
 func GetProjectsV1(c *gin.Context) {
 	var projects []models.Project
-	db.DB.Order("`order` ASC, id DESC").Find(&projects)
+	query := db.DB.Order("`order` ASC, id DESC")
+	if limit, err := strconv.Atoi(c.Query("limit")); err == nil && limit > 0 {
+		query = query.Limit(limit)
+	}
+	query.Find(&projects)
 	Success(c, projects)
 }
 

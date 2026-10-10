@@ -66,13 +66,15 @@ func AdminAuthRequired() gin.HandlerFunc {
 			tHash := hashToken(token)
 			var device models.Device
 			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).First(&device).Error; err == nil {
-				// 异步轻量更新设备的最近活跃时间
+				// 异步轻量更新设备的最近活跃时间 (带 60 秒节流防抖 BE-03)
 				now := time.Now()
-				go func(dID uint, activeTime time.Time) {
-					if db.DB != nil {
-						_ = db.DB.Model(&models.Device{}).Where("id = ?", dID).Update("last_active_at", activeTime).Error
-					}
-				}(device.ID, now)
+				if now.Sub(device.LastActiveAt) > time.Minute {
+					go func(dID uint, activeTime time.Time) {
+						if db.DB != nil {
+							_ = db.DB.Model(&models.Device{}).Where("id = ?", dID).Update("last_active_at", activeTime).Error
+						}
+					}(device.ID, now)
+				}
 
 				c.Set("auth_type", "device")
 				c.Set("device_id", device.DeviceID)

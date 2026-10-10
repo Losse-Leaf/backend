@@ -7,11 +7,11 @@ import (
 // LifeEntry 统一生活时间线档案条目 (Life Stream)
 // 支持 5 种核心生活形态：life(生活记录), thought(想法), photo(照片), project(项目), collection(收藏)
 type LifeEntry struct {
-	ID          uint         `gorm:"primaryKey" json:"id"`
+	ID          uint         `gorm:"primaryKey;index:idx_entry_occurred_id,priority:2" json:"id"`
 	Type        string       `gorm:"index" json:"type"` // life, thought, photo, project, collection (兼容原有子类型)
 	Title       string       `json:"title"`
 	Content     string       `gorm:"type:text" json:"content"`
-	OccurredAt  time.Time    `gorm:"index" json:"occurred_at"`
+	OccurredAt  time.Time    `gorm:"index:idx_entry_occurred_id,priority:1;index" json:"occurred_at"`
 	Location    string       `json:"location"`
 	ProjectID   *uint        `gorm:"index" json:"project_id"`
 	Project     *Project     `gorm:"foreignKey:ProjectID" json:"project,omitempty"`
@@ -66,14 +66,14 @@ type Project struct {
 
 // Transaction 独立记账记录 (单位：分，避免浮点数精度误差，如 1250 表示 12.50 元)
 type Transaction struct {
-	ID            uint      `gorm:"primaryKey" json:"id"`
+	ID            uint      `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
 	Amount        int64     `gorm:"not null" json:"amount"` // 分
 	Type          string    `gorm:"index;not null" json:"type"` // "income" 或 "expense"
 	Category      string    `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
 	Title         string    `json:"title"`
 	Note          string    `json:"note"`
 	PaymentMethod string    `json:"payment_method"`
-	OccurredAt    time.Time `gorm:"index;not null" json:"occurred_at"`
+	OccurredAt    time.Time `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

@@ -186,7 +186,7 @@ func ConfirmPairing(c *gin.Context) {
 // GetTrustedDevices 获取已配对信任的设备列表
 func GetTrustedDevices(c *gin.Context) {
 	var devices []models.Device
-	if err := db.DB.Order("CASE WHEN status = 'active' THEN 0 ELSE 1 END, last_active_at DESC, id DESC").Find(&devices).Error; err != nil {
+	if err := db.DB.Order("status ASC, last_active_at DESC, id DESC").Find(&devices).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取设备列表失败: "+err.Error())
 		return
 	}

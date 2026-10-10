@@ -18,6 +18,7 @@ import (
 	"chimu-lab/internal/storage"
 
 	"github.com/gin-contrib/cors"
+	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 )
 
@@ -63,6 +64,9 @@ func main() {
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization", "X-Admin-Key", "X-Device-Token"}
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	r.Use(cors.New(corsConfig))
+
+	// 5. Gzip 压缩支持 (BE-01: 压缩静态资源与响应体，显著降低传输体积)
+	r.Use(gzip.Gzip(gzip.DefaultCompression))
 
 	// 5. API v1 路由组 (标准结构化数据与持久化服务)
 	v1 := r.Group("/api/v1")

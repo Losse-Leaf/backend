@@ -30,9 +30,7 @@ func populateProfileData(p *models.CuratorProfile) {
 	p.EDCGearData = parseJSONOrRaw(p.EDCGear)
 	if p.AvatarURL != "" {
 		p.AvatarKey = storage.ExtractObjectKey(p.AvatarURL)
-		signed := storage.SignResourceURL(p.AvatarURL)
-		p.AvatarURL = signed
-		p.Avatar = signed
+		p.AvatarURL = storage.SignResourceURL(p.AvatarURL)
 	}
 }
 

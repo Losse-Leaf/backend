@@ -123,7 +123,6 @@ type CuratorProfile struct {
 	CurrentCity string    `json:"current_city"`
 	AvatarURL   string    `json:"avatar_url"`
 	AvatarKey   string    `gorm:"-" json:"avatar_key,omitempty"` // 原始存储对象 Key / 相对路径 (如 avatar/user.png)
-	Avatar      string    `gorm:"-" json:"avatar,omitempty"`     // 动态签名 URL 别名兼容前端字段
 	Motto       string    `json:"motto"`
 	Manifesto   string    `gorm:"type:text" json:"manifesto"`
 	SocialLinks string    `gorm:"type:text" json:"-"` // JSON 格式存储

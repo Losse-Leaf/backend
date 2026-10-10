@@ -17,13 +17,6 @@ type LifeEntry struct {
 	Project     *Project     `gorm:"foreignKey:ProjectID" json:"project,omitempty"`
 	Attachments []Attachment `gorm:"foreignKey:EntryID;constraint:OnDelete:CASCADE" json:"attachments"`
 
-	// 兼容原有旧字段，保证旧数据展示与格式平滑迁移
-	Date           string `json:"date,omitempty"` // e.g. "2026.10.09"
-	Year           string `json:"year,omitempty"` // e.g. "2026"
-	Month          string `json:"month,omitempty"`
-	Day            string `json:"day,omitempty"`
-	Time           string `json:"time,omitempty"`
-	Images         string `json:"images,omitempty"`
 	Meta           string `json:"meta,omitempty"`
 	Tags           string `json:"tags,omitempty"`
 	Link           string `json:"link,omitempty"`

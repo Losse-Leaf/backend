@@ -29,6 +29,8 @@ func setupTestFullDB(t *testing.T) {
 		&models.QRSession{},
 		&models.Attachment{},
 		&models.LifeEntry{},
+		&models.Transaction{},
+		&models.Project{},
 	)
 	db.DB = database
 }

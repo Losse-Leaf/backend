@@ -65,18 +65,6 @@ func ParseFlexTime(s string) (time.Time, error) {
 	return time.Now(), fmt.Errorf("unable to parse time string: %s", s)
 }
 
-// formatDatesFromTime 根据 OccurredAt 自动格式化旧版兼容字段
-func formatDatesFromTime(e *models.LifeEntry) {
-	if e.OccurredAt.IsZero() {
-		e.OccurredAt = time.Now()
-	}
-	e.Year = fmt.Sprintf("%04d", e.OccurredAt.Year())
-	e.Month = fmt.Sprintf("%02d", e.OccurredAt.Month())
-	e.Day = fmt.Sprintf("%02d", e.OccurredAt.Day())
-	e.Time = fmt.Sprintf("%02d:%02d", e.OccurredAt.Hour(), e.OccurredAt.Minute())
-	e.Date = fmt.Sprintf("%s.%s.%s", e.Year, e.Month, e.Day)
-}
-
 // populateAttachmentURLs 填充附件的动态临时预签名访问 URL (默认 30 分钟有效)
 func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	for i := range atts {
@@ -85,32 +73,9 @@ func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	return atts
 }
 
-// populateEntryURLs 填充条目附件与首图预览的预签名 URL，避免重复签名 (BE-02 / RC-13)
+// populateEntryURLs 填充条目附件的预签名 URL (RC-13)
 func populateEntryURLs(e *models.LifeEntry) {
 	e.Attachments = populateAttachmentURLs(e.Attachments)
-	if len(e.Attachments) > 0 {
-		e.Images = e.Attachments[0].URL
-	} else if e.Images != "" {
-		e.Images = signImagesString(e.Images)
-	}
-}
-
-// signImagesString 对逗号分割的图片相对路径或 URL 列表进行批量动态签名
-func signImagesString(imagesStr string) string {
-	imagesStr = strings.TrimSpace(imagesStr)
-	if imagesStr == "" {
-		return ""
-	}
-	parts := strings.Split(imagesStr, ",")
-	var signedParts []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		signedParts = append(signedParts, storage.SignResourceURL(p))
-	}
-	return strings.Join(signedParts, ",")
 }
 
 // ==========================================
@@ -154,7 +119,6 @@ func CreateLifeEntry(c *gin.Context) {
 		Featured:   req.Featured,
 		ProjectID:  req.ProjectID,
 	}
-	formatDatesFromTime(&entry)
 
 	// 保存主体
 	if err := db.DB.Create(&entry).Error; err != nil {
@@ -167,18 +131,6 @@ func CreateLifeEntry(c *gin.Context) {
 		db.DB.Model(&models.Attachment{}).
 			Where("id IN ?", req.AttachmentIDs).
 			Update("entry_id", entry.ID)
-
-		// 同步到旧版 images 字段以保证老组件兼容 (存相对路径 keys，查询时动态签名)
-		var atts []models.Attachment
-		db.DB.Where("id IN ?", req.AttachmentIDs).Find(&atts)
-		if len(atts) > 0 {
-			var keys []string
-			for _, a := range atts {
-				keys = append(keys, a.ObjectKey)
-			}
-			entry.Images = strings.Join(keys, ",")
-			db.DB.Model(&entry).Update("images", entry.Images)
-		}
 	}
 
 	// 重新预加载关联
@@ -212,7 +164,11 @@ func GetLifeEntriesV1(c *gin.Context) {
 		query = query.Where("type = ?", entryType)
 	}
 	if year != "" && year != "all" {
-		query = query.Where("year = ?", year)
+		if y, err := strconv.Atoi(year); err == nil && y > 1900 && y < 3000 {
+			startOfYear := time.Date(y, 1, 1, 0, 0, 0, 0, time.Local)
+			endOfYear := time.Date(y+1, 1, 1, 0, 0, 0, 0, time.Local)
+			query = query.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear)
+		}
 	}
 
 	// 核心视角动态映射
@@ -227,7 +183,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 		case "collection":
 			query = query.Where("type IN ('collection', 'music', 'book', 'game', 'purchase', 'gear', 'movie')")
 		case "photo":
-			query = query.Where("type = 'photo' OR images != ''")
+			query = query.Where("type = 'photo'")
 		case "transaction":
 			query = query.Where("type = 'transaction'")
 		}
@@ -329,7 +285,6 @@ func UpdateLifeEntry(c *gin.Context) {
 		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
 			entry.OccurredAt = t
 		}
-		formatDatesFromTime(&entry)
 	}
 
 	if err := db.DB.Save(&entry).Error; err != nil {
@@ -853,7 +808,7 @@ func GetGlobalStats(c *gin.Context) {
 	var totalPhotos int64
 	db.DB.Model(&models.Attachment{}).Count(&totalPhotos)
 	if totalPhotos == 0 {
-		db.DB.Model(&models.LifeEntry{}).Where("type = 'photo' OR images != ''").Count(&totalPhotos)
+		db.DB.Model(&models.LifeEntry{}).Where("type = 'photo'").Count(&totalPhotos)
 	}
 
 	var totalProjects int64

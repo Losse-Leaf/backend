@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // LifeEntry 统一生活时间线档案条目 (Life Stream)
@@ -22,8 +24,9 @@ type LifeEntry struct {
 	Link           string `json:"link,omitempty"`
 	Featured       bool   `json:"featured,omitempty"`
 
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `gorm:"index" json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // Attachment 附件与多媒体对象关联表

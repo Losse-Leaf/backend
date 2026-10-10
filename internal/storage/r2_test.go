@@ -73,4 +73,12 @@ func TestStorageHelpers(t *testing.T) {
 			t.Errorf("expected avatar/user.png in signed url, got %q", url)
 		}
 	})
+
+	t.Run("Presign cache idempotency and stability (BE-04)", func(t *testing.T) {
+		url1 := SignResourceURL("avatar/user.png")
+		url2 := SignResourceURL("avatar/user.png")
+		if url1 != url2 {
+			t.Errorf("expected consecutive SignResourceURL calls to return identical URL, got %q vs %q", url1, url2)
+		}
+	})
 }

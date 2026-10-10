@@ -177,3 +177,104 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 		t.Errorf("expected total_photos=1, got %v", statsData["total_photos"])
 	}
 }
+
+func TestIncrementalSyncAndETagCaching(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	r := gin.New()
+	r.POST("/api/v1/entries", CreateLifeEntry)
+	r.GET("/api/v1/entries", GetLifeEntriesV1)
+	r.DELETE("/api/v1/entries/:id", DeleteLifeEntry)
+
+	// 1. Create initial entry
+	req1 := CreateEntryRequest{
+		Type:       "thought",
+		Title:      "First Entry",
+		Content:    "Content 1",
+		OccurredAt: "2026-10-10T08:00:00Z",
+	}
+	bodyBytes, _ := json.Marshal(req1)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/entries", bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to create entry 1")
+	}
+
+	// 2. Query all entries and check ETag
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	etag := w.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("expected ETag header to be present")
+	}
+
+	// 3. Conditional request with matching If-None-Match returns 304 Not Modified
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries", nil)
+	req.Header.Set("If-None-Match", etag)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", w.Code)
+	}
+
+	// 4. Create second entry
+	req2 := CreateEntryRequest{
+		Type:       "thought",
+		Title:      "Second Entry",
+		Content:    "Content 2",
+		OccurredAt: "2026-10-10T09:00:00Z",
+	}
+	bodyBytes, _ = json.Marshal(req2)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/entries", bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	// 5. Test soft delete on entry 2
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/entries/2", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on soft delete, got %d", w.Code)
+	}
+
+	// 6. Normal query excludes soft-deleted entry 2
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries", nil)
+	r.ServeHTTP(w, req)
+	var listResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &listResp)
+	listData := listResp["data"].(map[string]interface{})
+	if int(listData["total"].(float64)) != 1 {
+		t.Fatalf("expected 1 active entry after soft delete, got %v", listData["total"])
+	}
+
+	// 7. Incremental sync with ?since= returns modified/deleted entries with deleted_at set
+	sinceQuery := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?since="+sinceQuery, nil)
+	r.ServeHTTP(w, req)
+	var syncResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &syncResp)
+	syncData := syncResp["data"].(map[string]interface{})
+	entries := syncData["entries"].([]interface{})
+	var foundDeleted bool
+	for _, raw := range entries {
+		item := raw.(map[string]interface{})
+		if int(item["id"].(float64)) == 2 {
+			if val, ok := item["deleted_at"]; ok && val != nil {
+				foundDeleted = true
+			}
+		}
+	}
+	if !foundDeleted {
+		t.Fatalf("expected soft-deleted entry to have deleted_at in sync response: %s", w.Body.String())
+	}
+}

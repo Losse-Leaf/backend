@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"chimu-lab/internal/config"
@@ -22,12 +23,20 @@ import (
 	"github.com/google/uuid"
 )
 
+type presignedCacheItem struct {
+	url       string
+	expiresAt time.Time
+}
+
 var (
 	s3Client       *s3.Client
 	presignClient  *s3.PresignClient
 	r2Bucket       string
 	r2PublicDomain string
 	isConfigured   bool
+
+	presignCacheMu sync.RWMutex
+	presignCache   = make(map[string]presignedCacheItem)
 
 	safeFilenameRegex = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 )
@@ -297,6 +306,23 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	if strings.HasPrefix(objectKey, "http://") || strings.HasPrefix(objectKey, "https://") {
 		cleanKey = ExtractObjectKey(objectKey)
 	}
+
+	// 内存复用近期签发有效凭证，消除响应体动态扰动，确保 ETag / 304 缓存生效 (BE-04)
+	cacheKey := fmt.Sprintf("%s|%d", cleanKey, expiresIn)
+	presignCacheMu.RLock()
+	if item, ok := presignCache[cacheKey]; ok {
+		buffer := 5 * time.Minute
+		if duration < 10*time.Minute {
+			buffer = duration / 5
+		}
+		if time.Now().Add(buffer).Before(item.expiresAt) {
+			presignCacheMu.RUnlock()
+			remaining := int(time.Until(item.expiresAt).Seconds())
+			return item.url, remaining, nil
+		}
+	}
+	presignCacheMu.RUnlock()
+
 	getInput := &s3.GetObjectInput{
 		Bucket: aws.String(r2Bucket),
 		Key:    aws.String(cleanKey),
@@ -306,6 +332,13 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to presign GET request: %w", err)
 	}
+
+	presignCacheMu.Lock()
+	presignCache[cacheKey] = presignedCacheItem{
+		url:       presignedReq.URL,
+		expiresAt: time.Now().Add(duration),
+	}
+	presignCacheMu.Unlock()
 
 	return presignedReq.URL, expiresIn, nil
 }

@@ -155,10 +155,24 @@ func GetLifeEntriesV1(c *gin.Context) {
 		pageSize = 50
 	}
 
-	query := db.DB.Model(&models.LifeEntry{}).
+	sinceStr := c.Query("since")
+	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+
+	dbScope := db.DB
+	if includeDeleted {
+		dbScope = db.DB.Unscoped()
+	}
+
+	query := dbScope.Model(&models.LifeEntry{}).
 		Preload("Attachments").
 		Preload("Project").
 		Order("occurred_at DESC, id DESC")
+
+	if sinceStr != "" {
+		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
+		}
+	}
 
 	if entryType != "" && entryType != "all" {
 		query = query.Where("type = ?", entryType)
@@ -201,6 +215,28 @@ func GetLifeEntriesV1(c *gin.Context) {
 
 	for i := range entries {
 		populateEntryURLs(&entries[i])
+	}
+
+	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
+	var maxUpdated time.Time
+	for _, e := range entries {
+		if e.UpdatedAt.After(maxUpdated) {
+			maxUpdated = e.UpdatedAt
+		}
+	}
+	etag := fmt.Sprintf(`W/"%d-%d"`, total, maxUpdated.UnixMilli())
+	c.Header("ETag", etag)
+
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
+		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
+			c.Status(http.StatusNotModified)
+			return
+		}
 	}
 
 	Success(c, gin.H{
@@ -313,23 +349,33 @@ func UpdateLifeEntry(c *gin.Context) {
 	Success(c, entry)
 }
 
-// DeleteLifeEntry 删除生活记录及关联的附件与 R2 对象
+// DeleteLifeEntry 删除生活记录（支持软删除标记与增量同步 BE-05）
 func DeleteLifeEntry(c *gin.Context) {
 	id := c.Param("id")
+	purge := c.Query("purge") == "true"
+
 	var entry models.LifeEntry
 	if err := db.DB.Preload("Attachments").First(&entry, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "记录不存在或已被删除")
 		return
 	}
 
-	// 级联清理 R2 存储中的对象文件
-	for _, att := range entry.Attachments {
-		if att.ObjectKey != "" {
-			_ = storage.DeleteObject(att.ObjectKey)
+	if purge {
+		// 物理硬清理关联的 R2 存储对象与数据库记录
+		for _, att := range entry.Attachments {
+			if att.ObjectKey != "" {
+				_ = storage.DeleteObject(att.ObjectKey)
+			}
 		}
+		if err := db.DB.Unscoped().Delete(&entry).Error; err != nil {
+			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
+			return
+		}
+		Success(c, gin.H{"id": id, "purged": true})
+		return
 	}
 
-	// 删除数据库记录 (GORM 会自动外键级联删除 attachments)
+	// 软删除落库，支持多端增量同步感知与离线仲裁 (BE-05)
 	if err := db.DB.Delete(&entry).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return

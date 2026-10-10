@@ -21,9 +21,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// Version 应用程序版本号，在构建时通过 -ldflags 注入 (RC-66)
+var Version = "dev"
+
 func main() {
+	if Version != "dev" && config.Version == "dev" {
+		config.Version = Version
+	}
+
 	// 1. 加载配置并初始化 R2 存储 (支持 .env 自动读取)
 	cfg := config.LoadConfig()
+	log.Printf("Starting Loose-Leaf core engine (version: %s)...", config.Version)
 	if err := storage.InitR2(cfg.R2); err != nil {
 		log.Printf("Notice: R2 storage initialization: %v", err)
 	} else if storage.IsConfigured() {
@@ -195,7 +203,7 @@ func main() {
 
 	// 启动 HTTP 服务协程
 	go func() {
-		log.Printf("Loose-Leaf Server starting on :%s ...", port)
+		log.Printf("Loose-Leaf Server %s starting on :%s ...", config.Version, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}

@@ -25,6 +25,9 @@ type Config struct {
 
 var AppConfig Config
 
+// Version 应用程序版本号，在构建时通过 -ldflags 注入 (RC-66)
+var Version = "dev"
+
 // loadDotEnv 轻量读取当前工作目录或 backend/ 下的 .env 文件
 func loadDotEnv() {
 	file, err := os.Open(".env")
@@ -79,14 +82,6 @@ func LoadConfig() Config {
 
 	expireSec := 1800 // 默认 30 分钟 (1800 秒)
 	if s := os.Getenv("R2_PRESIGN_EXPIRES"); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			expireSec = v
-		}
-	} else if s := os.Getenv("R2_PRESIGN_EXPIRE_MINUTES"); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			expireSec = v * 60
-		}
-	} else if s := os.Getenv("R2_PRESIGN_EXPIRE_SECONDS"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil && v > 0 {
 			expireSec = v
 		}

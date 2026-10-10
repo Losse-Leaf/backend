@@ -389,6 +389,25 @@ func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) 
 	return url
 }
 
+var (
+	localUploadDirMu sync.RWMutex
+	localUploadDir   = filepath.Join("data", "uploads")
+)
+
+// SetLocalUploadDir 动态设置本地媒体上传根目录 (支持单元测试隔离到临时目录 RC-68)
+func SetLocalUploadDir(dir string) {
+	localUploadDirMu.Lock()
+	defer localUploadDirMu.Unlock()
+	localUploadDir = dir
+}
+
+// GetLocalUploadDir 获取当前本地媒体上传根目录
+func GetLocalUploadDir() string {
+	localUploadDirMu.RLock()
+	defer localUploadDirMu.RUnlock()
+	return localUploadDir
+}
+
 // UploadObject 服务器端直接上传流到 R2，并在未配置 R2 时自动平滑回退写入本地存储
 func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size int64, contentType string) error {
 	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
@@ -413,7 +432,7 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 	}
 
 	// 离线/本地环境兜底写入 data/uploads/<objectKey>
-	localBase := filepath.Join("data", "uploads")
+	localBase := GetLocalUploadDir()
 	targetPath := filepath.Join(localBase, filepath.FromSlash(objectKey))
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 		return fmt.Errorf("failed to create upload dir: %w", err)

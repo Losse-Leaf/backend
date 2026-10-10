@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
@@ -129,7 +130,34 @@ func UnifiedUploadFile(c *gin.Context) {
 	})
 }
 
+// isRegisteredObjectKey 检查 objectKey 是否属于数据库中已登记的合法附件或主理人媒体 (BE-21)
+func isRegisteredObjectKey(cleanKey string) bool {
+	if cleanKey == "" || db.DB == nil {
+		return false
+	}
+
+	// 1. 检查 attachments 附件表
+	var count int64
+	if err := db.DB.Model(&models.Attachment{}).Where("object_key = ?", cleanKey).Count(&count).Error; err == nil && count > 0 {
+		return true
+	}
+
+	// 2. 检查主理人头像 (包含默认 avatar/user.png 与自定义头像相对路径)
+	if cleanKey == "avatar/user.png" {
+		return true
+	}
+	var profile models.CuratorProfile
+	if err := db.DB.Select("avatar_url").First(&profile).Error; err == nil && profile.AvatarURL != "" {
+		if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || strings.Contains(profile.AvatarURL, cleanKey) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // SignFileURL 获取指定相对路径文件的临时签名预签名 URL (公开只读接口)
+// 鉴权策略 (BE-21)：已登录管理员可签名任意 key；未认证访客仅可为数据库已登记附件与头像换取签名，阻断签名预言机
 // Query 参数：
 //   - key / path / object_key: 相对路径 (如 avatar/user.png)
 //   - expires: 自定义过期时效 (秒，可选，默认 1800 秒 / 30 分钟)
@@ -148,6 +176,12 @@ func SignFileURL(c *gin.Context) {
 	}
 
 	cleanKey := storage.ExtractObjectKey(key)
+
+	// 校验资源归属 (BE-21): 非管理员仅允许签名合法登记的资源
+	if !middleware.IsAdmin(c) && !isRegisteredObjectKey(cleanKey) {
+		Error(c, http.StatusForbidden, "该资源未在系统中登记，访客无权获取签名")
+		return
+	}
 
 	var customDuration time.Duration
 	if expStr := c.Query("expires"); expStr != "" {
@@ -194,6 +228,7 @@ func SignFilesBatch(c *gin.Context) {
 		ExpiresIn int    `json:"expires_in"`
 	}
 
+	isAdmin := middleware.IsAdmin(c)
 	var results []Item
 	for _, rawKey := range req.Keys {
 		rawKey = strings.TrimSpace(rawKey)
@@ -201,6 +236,12 @@ func SignFilesBatch(c *gin.Context) {
 			continue
 		}
 		cleanKey := storage.ExtractObjectKey(rawKey)
+
+		// 资源归属过滤 (BE-21): 访客请求自动忽略未在数据库登记的游离资源
+		if !isAdmin && !isRegisteredObjectKey(cleanKey) {
+			continue
+		}
+
 		signedURL, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
 		if err != nil {
 			signedURL = storage.GetPublicURL(cleanKey)

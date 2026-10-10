@@ -22,6 +22,14 @@ func TestFilesHandler(t *testing.T) {
 	setupTestFullDB(t)
 	_ = storage.InitR2(config.R2Config{})
 
+	// 隔离测试运行期间的本地落盘到临时目录 (RC-68)
+	tempUploadDir := t.TempDir()
+	origDir := storage.GetLocalUploadDir()
+	storage.SetLocalUploadDir(tempUploadDir)
+	t.Cleanup(func() {
+		storage.SetLocalUploadDir(origDir)
+	})
+
 	r := gin.New()
 	v1 := r.Group("/api/v1")
 	{
@@ -91,6 +99,13 @@ func TestFilesHandler(t *testing.T) {
 	})
 
 	t.Run("Batch sign files", func(t *testing.T) {
+		// 注册一条合法的附件记录 (BE-21)
+		db.DB.Create(&models.Attachment{
+			ObjectKey:        "entries/2026/10/09/sample.jpg",
+			OriginalFilename: "sample.jpg",
+			MimeType:         "image/jpeg",
+		})
+
 		payload := BatchSignRequest{
 			Keys: []string{"avatar/user.png", "entries/2026/10/09/sample.jpg"},
 		}
@@ -110,6 +125,52 @@ func TestFilesHandler(t *testing.T) {
 		items := dataMap["items"].([]interface{})
 		if len(items) != 2 {
 			t.Fatalf("expected 2 signed items, got %d", len(items))
+		}
+	})
+
+	t.Run("BE-21 Public visitor signing oracle prevention", func(t *testing.T) {
+		// 1. 访客尝试对未在系统登记的游离 object_key 签名，应被 403 拦截
+		unregisteredKey := "system/confidential_backup.sql"
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unregisteredKey, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for unregistered key, got %d: %s", w.Code, w.Body.String())
+		}
+
+		// 2. 访客批量签名时，未登记的游离 key 应被静默过滤
+		batchPayload := BatchSignRequest{
+			Keys: []string{"avatar/user.png", unregisteredKey},
+		}
+		batchBody, _ := json.Marshal(batchPayload)
+		batchReq := httptest.NewRequest(http.MethodPost, "/api/v1/files/sign-batch", bytes.NewReader(batchBody))
+		batchReq.Header.Set("Content-Type", "application/json")
+		batchW := httptest.NewRecorder()
+		r.ServeHTTP(batchW, batchReq)
+
+		if batchW.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", batchW.Code)
+		}
+		var batchResp Response
+		_ = json.Unmarshal(batchW.Body.Bytes(), &batchResp)
+		batchMap := batchResp.Data.(map[string]interface{})
+		batchItems := batchMap["items"].([]interface{})
+		if len(batchItems) != 1 {
+			t.Fatalf("expected 1 item (unregistered key filtered out), got %d", len(batchItems))
+		}
+
+		// 3. 管理员授权请求对未登记 key 签名，应放行 200
+		adminToken := "lldt_test_admin_signing_token_12345"
+		seedTestAdminDevice(adminToken)
+
+		adminReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unregisteredKey, nil)
+		adminReq.Header.Set("Authorization", "Bearer "+adminToken)
+		adminW := httptest.NewRecorder()
+		r.ServeHTTP(adminW, adminReq)
+
+		if adminW.Code != http.StatusOK {
+			t.Fatalf("expected 200 for authenticated admin signing, got %d: %s", adminW.Code, adminW.Body.String())
 		}
 	})
 

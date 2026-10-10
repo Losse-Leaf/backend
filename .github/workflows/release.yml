@@ -20,7 +20,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Set up Node.js (Fallback Web Builder)
@@ -85,7 +85,7 @@ jobs:
             IFS="/" read -r os arch output <<< "$target"
             echo "Compiling single binary for ${os}/${arch} -> release-dist/${output}..."
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
-              -ldflags="-s -w -X 'main.Version=${VERSION}'" \
+              -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'loose-leaf/internal/config.Version=${VERSION}'" \
               -o "release-dist/${output}" .
           done
           

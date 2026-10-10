@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -1254,9 +1255,10 @@ func HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":     "operational",
 		"service":    "Loose-Leaf Life Archive Core",
+		"version":    config.Version,
 		"runtime":    runtime.Version(),
 		"storage_r2": storage.IsConfigured(),
 		"time":       time.Now().Unix(),
-		"message":    fmt.Sprintf("Archive engine running quietly on %s", runtime.GOARCH),
+		"message":    fmt.Sprintf("Archive engine %s running quietly on %s", config.Version, runtime.GOARCH),
 	})
 }

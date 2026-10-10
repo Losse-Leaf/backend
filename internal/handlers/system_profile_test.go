@@ -59,7 +59,7 @@ func TestProfileAndConfig(t *testing.T) {
 		// 更新 Config
 		updatePayload := models.SiteConfig{
 			SiteName:    "新散页 · Living Archive",
-			CuratorName: "迟暮君",
+			CuratorName: "测试主理人",
 		}
 		body, _ := json.Marshal(updatePayload)
 		putReq := httptest.NewRequest(http.MethodPut, "/api/v1/config", bytes.NewReader(body))
@@ -75,20 +75,20 @@ func TestProfileAndConfig(t *testing.T) {
 			Data models.SiteConfig `json:"data"`
 		}
 		_ = json.Unmarshal(putW.Body.Bytes(), &res)
-		if res.Data.SiteName != "新散页 · Living Archive" || res.Data.CuratorName != "迟暮君" {
+		if res.Data.SiteName != "新散页 · Living Archive" || res.Data.CuratorName != "测试主理人" {
 			t.Fatalf("unexpected updated config: %+v", res.Data)
 		}
 	})
 
-	// 2. 初始化并获取 Profile
+	// 2. 初始化并获取 Profile (含 RG-09 email / github 保存与平铺校验)
 	t.Run("Get and update curator profile", func(t *testing.T) {
 		// 先初始化一个基础 profile
 		initialProfile := models.CuratorProfile{
-			Name:        "迟暮",
+			Name:        "测试主理人",
 			Title:       "数字手艺人",
 			Location:    "杭州",
-			SocialLinks: `{"github":"https://github.com/YN1753"}`,
-			EDCGear:     `[{"name":"Contax T2","category":"影像器材"}]`,
+			SocialLinks: `{"github":"https://github.com/example"}`,
+			EDCGear:     `[{"name":"机械相机","category":"影像器材"}]`,
 		}
 		db.DB.Create(&initialProfile)
 
@@ -99,10 +99,12 @@ func TestProfileAndConfig(t *testing.T) {
 			t.Fatalf("expected 200, got %d", w.Code)
 		}
 
-		// 更新 profile
+		// 更新 profile (传入顶层 email 与 github 验证 RG-09)
 		updatePayload := UpdateCuratorProfileRequest{
-			Motto: "真实生活大于一切",
-			Bio:   "安静写字的数字工坊",
+			Motto:  "真实生活大于一切",
+			Bio:    "安静写字的数字工坊",
+			Email:  "hello@example.com",
+			Github: "https://github.com/new-curator",
 		}
 		body, _ := json.Marshal(updatePayload)
 		putReq := httptest.NewRequest(http.MethodPut, "/api/v1/profile", bytes.NewReader(body))
@@ -120,6 +122,9 @@ func TestProfileAndConfig(t *testing.T) {
 		_ = json.Unmarshal(putW.Body.Bytes(), &res)
 		if res.Data.Motto != "真实生活大于一切" || res.Data.Bio != "安静写字的数字工坊" {
 			t.Fatalf("unexpected updated profile: %+v", res.Data)
+		}
+		if res.Data.Email != "hello@example.com" || res.Data.Github != "https://github.com/new-curator" {
+			t.Fatalf("expected flat email and github in response (RG-09), got email=%q github=%q", res.Data.Email, res.Data.Github)
 		}
 	})
 }
@@ -149,7 +154,7 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 	t.Run("2. Bootstrap system successfully", func(t *testing.T) {
 		config.AppConfig.AdminAPIKey = ""
 		reqBody := BootstrapRequest{
-			CuratorName:    "迟暮",
+			CuratorName:    "测试主理人",
 			Location:       "中国 · 杭州",
 			MasterPasscode: "my-secret-passcode",
 		}
@@ -170,7 +175,7 @@ func TestSystemLifecycleAndQRAuth(t *testing.T) {
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.Token == "" || res.Data.CuratorName != "迟暮" {
+		if res.Data.Token == "" || res.Data.CuratorName != "测试主理人" {
 			t.Fatalf("unexpected bootstrap response: %+v", res.Data)
 		}
 	})

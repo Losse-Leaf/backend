@@ -890,6 +890,19 @@ func GetProjectByID(c *gin.Context) {
 	})
 }
 
+type ProjectUpdateRequest struct {
+	Title       *string `json:"title"`
+	Subtitle    *string `json:"subtitle"`
+	Description *string `json:"description"`
+	Story       *string `json:"story"`
+	Category    *string `json:"category"`
+	Tags        *string `json:"tags"`
+	GithubURL   *string `json:"github_url"`
+	Status      *string `json:"status"`
+	Featured    *bool   `json:"featured"`
+	Order       *int    `json:"order"`
+}
+
 func UpdateProject(c *gin.Context) {
 	id := c.Param("id")
 	var p models.Project
@@ -898,42 +911,55 @@ func UpdateProject(c *gin.Context) {
 		return
 	}
 
-	var req ProjectRequest
+	var req ProjectUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
 
-	title := strings.TrimSpace(req.Title)
-	if title != "" {
+	if req.Title != nil {
+		title := strings.TrimSpace(*req.Title)
+		if title == "" {
+			Error(c, http.StatusBadRequest, "项目标题不能为空")
+			return
+		}
 		p.Title = title
 	}
-	if req.Subtitle != "" {
-		p.Subtitle = strings.TrimSpace(req.Subtitle)
+	if req.Subtitle != nil {
+		p.Subtitle = strings.TrimSpace(*req.Subtitle)
 	}
-	if req.Description != "" {
-		p.Description = strings.TrimSpace(req.Description)
+	if req.Description != nil {
+		p.Description = strings.TrimSpace(*req.Description)
 	}
-	story := strings.TrimSpace(req.Story)
-	if story != "" {
-		p.Story = story
+	if req.Story != nil {
+		p.Story = strings.TrimSpace(*req.Story)
 	}
-	if req.Category != "" {
-		p.Category = strings.TrimSpace(req.Category)
+	if req.Category != nil {
+		p.Category = strings.TrimSpace(*req.Category)
 	}
-	if req.Tags != "" {
-		p.Tags = strings.TrimSpace(req.Tags)
+	if req.Tags != nil {
+		p.Tags = strings.TrimSpace(*req.Tags)
 	}
-	if req.GithubURL != "" {
-		p.GithubURL = strings.TrimSpace(req.GithubURL)
+	if req.GithubURL != nil {
+		p.GithubURL = strings.TrimSpace(*req.GithubURL)
 	}
-	if req.Status != "" {
-		p.Status = strings.TrimSpace(req.Status)
+	if req.Status != nil {
+		status := strings.TrimSpace(*req.Status)
+		if status != "" {
+			p.Status = status
+		}
 	}
-	p.Featured = req.Featured
-	p.Order = req.Order
+	if req.Featured != nil {
+		p.Featured = *req.Featured
+	}
+	if req.Order != nil {
+		p.Order = *req.Order
+	}
 
-	db.DB.Save(&p)
+	if err := db.DB.Save(&p).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新项目失败: "+err.Error())
+		return
+	}
 	Success(c, p)
 }
 
@@ -1046,11 +1072,11 @@ func GetConfigV1(c *gin.Context) {
 		config = models.SiteConfig{
 			SiteName:        "散页 · 时光手账与生活档案",
 			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
-			CuratorName:     "迟暮",
-			DefaultLocation: "中国 · 杭州",
-			Domain:          "codeactivityhub.top",
-			ICPNumber:       "浙ICP备2026081664号",
-			ICPLink:         "https://beian.miit.gov.cn",
+			CuratorName:     "",
+			DefaultLocation: "",
+			Domain:          "",
+			ICPNumber:       "",
+			ICPLink:         "",
 		}
 	}
 	Success(c, config)

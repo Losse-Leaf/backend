@@ -43,7 +43,7 @@ func TestWishAndTravelModules(t *testing.T) {
 			CityCode:  "330100",
 			CityName:  "杭州市",
 			VisitedAt: "2026-10-08 14:00:00",
-			Note:      "满觉陇桂花初落",
+			Note:      "春日西湖漫步",
 		}
 		body, _ := json.Marshal(fpReq)
 		w := httptest.NewRecorder()

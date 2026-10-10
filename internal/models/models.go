@@ -91,8 +91,8 @@ type SiteConfig struct {
 	DefaultLocation string    `json:"default_location,omitempty"`
 	SiteDesc        string    `json:"site_desc,omitempty"`
 	Domain          string    `json:"domain"`
-	ICPNumber       string    `json:"icp_number"`    // 工信部 ICP 备案号
-	ICPLink         string    `json:"icp_link"`      // https://beian.miit.gov.cn
+	ICPNumber       string    `json:"icp_number"`              // 备案号 (可选)
+	ICPLink         string    `json:"icp_link"`                // 备案链接 (可选)
 	PoliceNumber    string    `json:"police_number,omitempty"` // 公安联网备案号
 	PoliceCode      string    `json:"police_code,omitempty"`   // 公安备案编号
 	Initialized     bool      `gorm:"default:false" json:"initialized"`
@@ -113,6 +113,8 @@ type CuratorProfile struct {
 	AvatarKey   string    `gorm:"-" json:"avatar_key,omitempty"` // 原始存储对象 Key / 相对路径 (如 avatar/user.png)
 	Motto       string    `json:"motto"`
 	Manifesto   string    `gorm:"type:text" json:"manifesto"`
+	Email       string    `gorm:"-" json:"email"`  // 从 SocialLinks 提取平铺下发 (RG-09)
+	Github      string    `gorm:"-" json:"github"` // 从 SocialLinks 提取平铺下发 (RG-09)
 	SocialLinks string    `gorm:"type:text" json:"-"` // JSON 格式存储
 	SocialData  any       `gorm:"-" json:"social_links"`
 	EDCGear     string    `gorm:"type:text" json:"-"` // JSON 格式存储

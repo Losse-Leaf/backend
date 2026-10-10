@@ -71,41 +71,41 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	return database, nil
 }
 
-// seedData 初始化站点全局配置与主理人初始档案 (空态冷启动 RG-05)
+// seedData 初始化站点全局配置与主理人初始档案 (空态冷启动 RG-05, RC-50, RC-52)
 func seedData(database *gorm.DB) {
-	// 1. 站点全局与备案合规配置 (全新部署置未初始化 RG-01)
+	// 1. 站点全局配置 (全新部署置未初始化与纯净空态 RG-01, RC-50, RC-52)
 	var cfgCount int64
 	database.Model(&models.SiteConfig{}).Count(&cfgCount)
 	if cfgCount == 0 {
 		config := models.SiteConfig{
 			SiteName:        "散页 · 时光手账与生活档案",
 			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
-			CuratorName:     "迟暮",
-			DefaultLocation: "中国 · 杭州",
+			CuratorName:     "",
+			DefaultLocation: "",
 			SiteDesc:        "生活档案与时光手账，记录真实可感的日子。",
-			Domain:          "codeactivityhub.top",
-			ICPNumber:       "浙ICP备2026081664号",
-			ICPLink:         "https://beian.miit.gov.cn",
+			Domain:          "",
+			ICPNumber:       "",
+			ICPLink:         "",
 			Initialized:     false,
 		}
 		database.Create(&config)
 	}
 
-	// 2. 初始化主理人身份中枢 (Curator Profile)
+	// 2. 初始化主理人身份中枢 (Curator Profile 纯净空态 RC-52)
 	var profileCount int64
 	database.Model(&models.CuratorProfile{}).Count(&profileCount)
 	if profileCount == 0 {
 		profile := models.CuratorProfile{
-			Name:        "迟暮",
-			Title:       "独立开发者 · 胶片摄影与手冲咖啡学徒",
-			Bio:         "在数字洪流中筑造一座安静的纸质庇护所，记录具体而微的真实生活。",
-			Location:    "中国 · 杭州",
-			CurrentCity: "杭州",
+			Name:        "",
+			Title:       "",
+			Bio:         "",
+			Location:    "",
+			CurrentCity: "",
 			AvatarURL:   "",
-			Motto:       "真实生活大于一切",
-			Manifesto:   "不做功利的知识管理，不建庞杂的卡片盒。只记日落、快门光圈、一杯手冲浅烘、一次深夜长谈，与每一个平淡却不可复制的当下。",
-			SocialLinks: `{"github":"https://github.com/YN1753","email":"curator@looseleaf.me"}`,
-			EDCGear:     `[{"name":"Contax T2","category":"影像器材","spec":"Carl Zeiss Sonnar 38mm F2.8","note":"极简旁轴机械手感，锐利且通透的德系发色，记录四季街头。"},{"name":"MacBook Pro 14 (M3 Max)","category":"工作台算力","spec":"Space Black · 36GB Unified Memory","note":"随身代码与文字创作工坊，安静而深邃的算力中枢。"}]`,
+			Motto:       "",
+			Manifesto:   "",
+			SocialLinks: `{}`,
+			EDCGear:     `[]`,
 		}
 		database.Create(&profile)
 	}

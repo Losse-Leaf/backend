@@ -63,9 +63,6 @@ func BootstrapSystem(c *gin.Context) {
 
 	curatorName := strings.TrimSpace(req.CuratorName)
 	location := strings.TrimSpace(req.Location)
-	if location == "" {
-		location = "中国 · 杭州"
-	}
 
 	// 1. 初始化 SiteConfig
 	cfg.CuratorName = curatorName
@@ -76,20 +73,17 @@ func BootstrapSystem(c *gin.Context) {
 	}
 	db.DB.Save(&cfg)
 
-	// 2. 初始化 CuratorProfile
+	// 2. 初始化 CuratorProfile (未填写的字段保持纯净空字符串或空数组 RC-52)
 	var profile models.CuratorProfile
 	db.DB.FirstOrCreate(&profile)
 	profile.Name = curatorName
 	profile.Location = location
 	profile.CurrentCity = location
-	if profile.Title == "" {
-		profile.Title = "独立开发者 · 胶片摄影与手冲咖啡学徒"
+	if strings.TrimSpace(profile.SocialLinks) == "" {
+		profile.SocialLinks = "{}"
 	}
-	if profile.Bio == "" {
-		profile.Bio = "在数字洪流中筑造一座安静的纸质庇护所，记录具体而微的真实生活。"
-	}
-	if profile.Motto == "" {
-		profile.Motto = "真实生活大于一切"
+	if strings.TrimSpace(profile.EDCGear) == "" {
+		profile.EDCGear = "[]"
 	}
 	db.DB.Save(&profile)
 

@@ -84,6 +84,16 @@ func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	return atts
 }
 
+// populateEntryURLs 填充条目附件与首图预览的预签名 URL，避免重复签名 (BE-02 / RC-13)
+func populateEntryURLs(e *models.LifeEntry) {
+	e.Attachments = populateAttachmentURLs(e.Attachments)
+	if len(e.Attachments) > 0 {
+		e.Images = e.Attachments[0].URL
+	} else if e.Images != "" {
+		e.Images = signImagesString(e.Images)
+	}
+}
+
 // signImagesString 对逗号分割的图片相对路径或 URL 列表进行批量动态签名
 func signImagesString(imagesStr string) string {
 	imagesStr = strings.TrimSpace(imagesStr)
@@ -172,12 +182,7 @@ func CreateLifeEntry(c *gin.Context) {
 
 	// 重新预加载关联
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
-	entry.Attachments = populateAttachmentURLs(entry.Attachments)
-	if entry.Images != "" {
-		entry.Images = signImagesString(entry.Images)
-	} else if len(entry.Attachments) > 0 {
-		entry.Images = entry.Attachments[0].URL
-	}
+	populateEntryURLs(&entry)
 
 	Success(c, entry)
 }
@@ -238,13 +243,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 	}
 
 	for i := range entries {
-		entries[i].Attachments = populateAttachmentURLs(entries[i].Attachments)
-		// 动态签名现有 images 字段中的相对路径 (或回退到首个附件的动态签名地址)
-		if entries[i].Images != "" {
-			entries[i].Images = signImagesString(entries[i].Images)
-		} else if len(entries[i].Attachments) > 0 {
-			entries[i].Images = entries[i].Attachments[0].URL
-		}
+		populateEntryURLs(&entries[i])
 	}
 
 	Success(c, gin.H{
@@ -264,12 +263,7 @@ func GetLifeEntryByID(c *gin.Context) {
 		return
 	}
 
-	entry.Attachments = populateAttachmentURLs(entry.Attachments)
-	if entry.Images != "" {
-		entry.Images = signImagesString(entry.Images)
-	} else if len(entry.Attachments) > 0 {
-		entry.Images = entry.Attachments[0].URL
-	}
+	populateEntryURLs(&entry)
 
 	Success(c, entry)
 }
@@ -358,12 +352,7 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
-	entry.Attachments = populateAttachmentURLs(entry.Attachments)
-	if entry.Images != "" {
-		entry.Images = signImagesString(entry.Images)
-	} else if len(entry.Attachments) > 0 {
-		entry.Images = entry.Attachments[0].URL
-	}
+	populateEntryURLs(&entry)
 
 	Success(c, entry)
 }
@@ -765,7 +754,7 @@ func GetProjectByID(c *gin.Context) {
 	var entries []models.LifeEntry
 	db.DB.Where("project_id = ?", p.ID).Preload("Attachments").Order("occurred_at DESC").Find(&entries)
 	for i := range entries {
-		entries[i].Attachments = populateAttachmentURLs(entries[i].Attachments)
+		populateEntryURLs(&entries[i])
 	}
 
 	Success(c, gin.H{

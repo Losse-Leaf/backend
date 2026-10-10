@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -143,14 +144,23 @@ func main() {
 	}
 
 	if stat, err := os.Stat(distDir); err == nil && stat.IsDir() {
-		r.Static("/assets", filepath.Join(distDir, "assets"))
+		assetsDir := filepath.Join(distDir, "assets")
+		r.GET("/assets/*filepath", func(c *gin.Context) {
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			c.FileFromFS(c.Param("filepath"), http.Dir(assetsDir))
+		})
 		r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
 		r.StaticFile("/favicon.svg", filepath.Join(distDir, "favicon.svg"))
 		r.StaticFile("/icons.svg", filepath.Join(distDir, "icons.svg"))
 		r.StaticFile("/robots.txt", filepath.Join(distDir, "robots.txt"))
 
-		// SPA 单页应用回退到 index.html
+		// SPA 单页应用回退到 index.html (带 no-cache 响应头，确保前端发版即时生效 BE-01)
 		r.NoRoute(func(c *gin.Context) {
+			if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+				c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "API endpoint not found"})
+				return
+			}
+			c.Header("Cache-Control", "no-cache")
 			c.File(filepath.Join(distDir, "index.html"))
 		})
 		log.Printf("Serving frontend from %s", distDir)
@@ -164,8 +174,12 @@ func main() {
 
 	port := cfg.Port
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// 启动 HTTP 服务协程

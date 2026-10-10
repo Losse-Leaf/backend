@@ -339,10 +339,10 @@ func PollPairingStatus(c *gin.Context) {
 // 4. 设备列表与吊销管理
 // ==========================================
 
-// GetTrustedDevices 获取已配对信任的设备列表
+// GetTrustedDevices 获取已配对信任的设备列表（仅返回当前有效授信的设备）
 func GetTrustedDevices(c *gin.Context) {
 	var devices []models.Device
-	if err := db.DB.Order("status ASC, last_active_at DESC, id DESC").Find(&devices).Error; err != nil {
+	if err := db.DB.Where("status = ?", "active").Order("last_active_at DESC, id DESC").Find(&devices).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取设备列表失败: "+err.Error())
 		return
 	}

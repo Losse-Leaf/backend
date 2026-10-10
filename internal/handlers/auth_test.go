@@ -166,7 +166,7 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("6. Revoke device", func(t *testing.T) {
+	t.Run("6. Revoke device and verify it is excluded from GetTrustedDevices", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/devices/"+deviceID, nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -179,6 +179,23 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		db.DB.Where("device_id = ?", deviceID).First(&device)
 		if device.Status != "revoked" {
 			t.Fatalf("expected status 'revoked', got '%s'", device.Status)
+		}
+
+		// Verify GetTrustedDevices only returns active devices
+		listReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
+		listW := httptest.NewRecorder()
+		r.ServeHTTP(listW, listReq)
+
+		var res struct {
+			Code int             `json:"code"`
+			Data []models.Device `json:"data"`
+		}
+		_ = json.Unmarshal(listW.Body.Bytes(), &res)
+		if len(res.Data) != 1 {
+			t.Fatalf("expected 1 active device after revocation, got %d", len(res.Data))
+		}
+		if res.Data[0].DeviceID == deviceID {
+			t.Fatalf("expected revoked device %s to be excluded from trusted devices list", deviceID)
 		}
 	})
 

@@ -551,7 +551,7 @@ func seedData(database *gorm.DB) {
 			Domain:          "codeactivityhub.top",
 			ICPNumber:       "浙ICP备2026081664号",
 			ICPLink:         "https://beian.miit.gov.cn",
-			Initialized:     true,
+			Initialized:     false,
 		}
 		database.Create(&config)
 	}

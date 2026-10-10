@@ -202,7 +202,7 @@ func GetPublicURL(objectKey string) string {
 	if config.AppConfig.R2.Endpoint != "" && r2Bucket != "" {
 		return fmt.Sprintf("%s/%s/%s", strings.TrimRight(config.AppConfig.R2.Endpoint, "/"), r2Bucket, path.Clean(objectKey))
 	}
-	return objectKey
+	return "/media/" + strings.TrimPrefix(path.Clean(objectKey), "/")
 }
 
 // ExtractObjectKey 从全量 URL 或相对路径中提取出标准的对象存储相对路径 Key (如 "avatar/user.png")
@@ -282,7 +282,7 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 		return objectKey, expiresIn, nil
 	}
 
-	// 未配置 R2 时回退本地或公共域名代理
+	// 未配置 R2 时回退本地或公共域名代理 (RC-44: 本地媒体统一走 /media 前缀)
 	if !isConfigured || presignClient == nil {
 		if r2PublicDomain != "" {
 			return fmt.Sprintf("%s/%s", strings.TrimRight(r2PublicDomain, "/"), path.Clean(objectKey)), expiresIn, nil
@@ -290,7 +290,7 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 		if config.AppConfig.R2.Endpoint != "" && r2Bucket != "" {
 			return fmt.Sprintf("%s/%s/%s", strings.TrimRight(config.AppConfig.R2.Endpoint, "/"), r2Bucket, path.Clean(objectKey)), expiresIn, nil
 		}
-		return "/assets/" + path.Clean(objectKey), expiresIn, nil
+		return "/media/" + strings.TrimPrefix(path.Clean(objectKey), "/"), expiresIn, nil
 	}
 
 	cleanKey := strings.TrimPrefix(path.Clean(objectKey), "/")

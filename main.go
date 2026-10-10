@@ -135,7 +135,12 @@ func main() {
 		v1.GET("/health", handlers.HealthCheck)
 	}
 
-	// 7. 前端静态文件托管（支持从根目录或 backend 目录下直接启动）
+	// 7. 本地媒体静态托管 (未配 R2 时服务 data/uploads/ 下的文件 RC-44)
+	uploadsDir := filepath.Join("data", "uploads")
+	_ = os.MkdirAll(uploadsDir, 0755)
+	r.Static("/media", uploadsDir)
+
+	// 8. 前端静态文件托管（支持从根目录或 backend 目录下直接启动）
 	distDir := "web/dist"
 	if stat, err := os.Stat(distDir); err != nil || !stat.IsDir() {
 		if statUp, errUp := os.Stat("../web/dist"); errUp == nil && statUp.IsDir() {

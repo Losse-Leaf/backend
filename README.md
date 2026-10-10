@@ -69,24 +69,31 @@ sqlite3 data/looseleaf.db "UPDATE site_configs SET initialized = 0, master_passc
 执行后刷新浏览器即可重新进入「首次装帧」向导设定新密钥并绑定设备。
 
 
-## 生产编译与单二进制部署
+## 生产编译与单二进制分发 (Single Binary & Embed)
 
-Go 语言最大的优势之一就是编译为**零外部依赖、CGO-Free 的单个静态可执行文件**，无需安装 Docker 或配置复杂的运行环境。
+根据 `docs/ecosystem.md` §十.4 规范，后端原生支持 `//go:embed all:web/dist` 将 Web 静态展厅打入单一二进制产物中，做到**去 Docker 化、零环境依赖极简分发**。
 
-### 1. 编译静态二进制
+### 1. 编译静态单二进制产物
+
+在编译前，只需将前端构建产物放至 `web/dist`（或依赖 GitHub Actions 自动拉取与注入）：
 
 ```bash
-# 本地编译 (macOS / 当前系统)
-go build -ldflags="-s -w" -o server main.go
+# 本地编译 (macOS / 当前系统，自动内嵌 web/dist)
+CGO_ENABLED=0 go build -ldflags="-s -w" -o looseleaf-server .
 
 # 交叉编译为 Linux (64位 x86 服务器)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o server main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o looseleaf-linux-amd64 .
 
 # 交叉编译为 Linux ARM (如部分云服务器或树莓派)
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o server main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o looseleaf-linux-arm64 .
 ```
 
-编译出的 `server` 单文件约 15~20MB，直接通过 `scp` 或 `rsync` 丢到服务器上即可。
+编译出的单文件约 15~20MB，内嵌完整 Web 展厅与 API 核心，无需安装 Node.js、Nginx 或 Docker，直接运行即可。
+
+### 2. CI/CD 质量门禁与自动发布流水线
+
+- **质量门禁 (CI)**：每次提交触发 `.github/workflows/ci.yml`，执行 `go mod verify`、`go vet ./...`、`go test -v ./...` 及零 CGO 编译校验；
+- **全架构发布 (Release)**：推送 `v*` 标签时触发 `.github/workflows/release.yml`，自动解压前端 Release 包并编译 Linux (amd64/arm64)、macOS (Intel/Apple Silicon) 与 Windows 产物及 SHA-256 校验清单挂载至 Release。
 
 ### 2. 服务器 Systemd 守护进程 (推荐)
 

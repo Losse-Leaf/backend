@@ -1,4 +1,4 @@
-name: Single Binary Embed & Release Pipeline
+name: Single Binary Embed Release Pipeline
 
 on:
   push:
@@ -10,109 +10,111 @@ permissions:
 
 jobs:
   build-and-release:
-    name: Build & Release Embedded Single Binaries
+    name: Build Embed Single Binaries & Release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Backend Repository
+      - name: Check out backend repository
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.24.x'
           cache: true
 
-      - name: Set up Node.js (for Fallback Frontend Build)
+      - name: Set up Node.js (Fallback Web Builder)
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-      # 步骤 1 & 2：拉取 Web 展厅构建包并解压至 web/dist (docs/ecosystem.md §10.4)
-      - name: Prepare Frontend Web Distribution
+      - name: Fetch Frontend Release Asset or Build (web/dist)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
           mkdir -p web/dist
-          TAG_NAME="${{ github.ref_name }}"
-          DOWNLOAD_URL="https://github.com/Losse-Leaf/web/releases/download/${TAG_NAME}/web-dist.tar.gz"
-          LATEST_URL="https://github.com/Losse-Leaf/web/releases/latest/download/web-dist.tar.gz"
-
-          echo "Attempting to download web-dist.tar.gz from: ${DOWNLOAD_URL}"
-          if curl -sL --fail -o web-dist.tar.gz "${DOWNLOAD_URL}"; then
-            echo "Successfully downloaded tag asset ${TAG_NAME}"
-            tar -xzf web-dist.tar.gz -C web/dist
-          elif curl -sL --fail -o web-dist.tar.gz "${LATEST_URL}"; then
-            echo "Downloaded latest web release asset as fallback"
-            tar -xzf web-dist.tar.gz -C web/dist
+          echo "Preparing frontend assets for embedding (docs/ecosystem.md §10.4)..."
+          
+          FETCH_SUCCESS=false
+          # 1. 尝试从 Losse-Leaf/web Release 中下载与当前 Tag 对应的 web-dist.tar.gz
+          if gh release download "${TAG}" --repo Losse-Leaf/web --pattern "web-dist.tar.gz" --dir /tmp/ 2>/dev/null; then
+            echo "Successfully downloaded web-dist.tar.gz for tag ${TAG} from Losse-Leaf/web."
+            FETCH_SUCCESS=true
+          elif gh release download --repo Losse-Leaf/web --pattern "web-dist.tar.gz" --dir /tmp/ 2>/dev/null; then
+            echo "Successfully downloaded latest available web-dist.tar.gz from Losse-Leaf/web."
+            FETCH_SUCCESS=true
+          fi
+          
+          if [ "$FETCH_SUCCESS" = "true" ] && [ -f /tmp/web-dist.tar.gz ]; then
+            echo "Extracting web-dist.tar.gz into web/dist/..."
+            tar -xzf /tmp/web-dist.tar.gz -C web/dist/
           else
-            echo "Release asset not found on GitHub. Falling back to cloning and building web repository..."
-            git clone --depth 1 https://github.com/Losse-Leaf/web.git /tmp/web-repo
-            cd /tmp/web-repo
+            echo "Notice: Prebuilt web-dist.tar.gz not found in releases. Building from Losse-Leaf/web main branch..."
+            git clone --depth=1 https://github.com/Losse-Leaf/web.git /tmp/looseleaf-web
+            cd /tmp/looseleaf-web
             npm ci || npm install
             npm run build
-            cp -r dist/* ${{ github.workspace }}/web/dist/
-            cd ${{ github.workspace }}
+            cp -r dist/* $GITHUB_WORKSPACE/web/dist/
+            cd $GITHUB_WORKSPACE
           fi
-
-          if [ ! -f "web/dist/index.html" ]; then
-            echo "Error: web/dist/index.html was not generated!"
+          
+          # 验证 index.html 存在，保证内嵌完整性
+          if [ ! -f web/dist/index.html ]; then
+            echo "Error: web/dist/index.html not found! Single binary cannot be built."
             exit 1
           fi
-          echo "Frontend dist successfully staged in web/dist/ (size: $(du -sh web/dist | cut -f1))"
+          echo "Web frontend assets successfully staged in web/dist/:"
+          ls -la web/dist/
 
-      # 步骤 3：Go 编译器通过 //go:embed web/dist/* 内嵌静态展厅，产出跨平台单二进制文件
-      - name: Cross-Compile Single Binaries
+      - name: Compile Cross-Platform Standalone Single Binaries
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p release-dist
-          LDFLAGS="-s -w"
-
-          # Linux amd64 & arm64
-          echo "Building Linux amd64..."
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-linux-amd64 .
-          echo "Building Linux arm64..."
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-linux-arm64 .
-
-          # macOS (Darwin) amd64 & arm64 (Apple Silicon)
-          echo "Building macOS amd64..."
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-darwin-amd64 .
-          echo "Building macOS arm64..."
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-darwin-arm64 .
-
-          # Windows amd64
-          echo "Building Windows amd64..."
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-windows-amd64.exe .
-
-          # 计算 SHA-256 校验和
+          
+          declare -a TARGETS=(
+            "linux/amd64/looseleaf-linux-amd64"
+            "linux/arm64/looseleaf-linux-arm64"
+            "darwin/amd64/looseleaf-darwin-amd64"
+            "darwin/arm64/looseleaf-darwin-arm64"
+            "windows/amd64/looseleaf-windows-amd64.exe"
+          )
+          
+          for target in "${TARGETS[@]}"; do
+            IFS="/" read -r os arch output <<< "$target"
+            echo "Compiling single binary for ${os}/${arch} -> release-dist/${output}..."
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags="-s -w -X 'main.Version=${VERSION}'" \
+              -o "release-dist/${output}" .
+          done
+          
           cd release-dist
-          sha256sum * > checksums.txt
+          sha256sum looseleaf-* > checksums.txt
+          echo "Generated SHA256 checksums:"
           cat checksums.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "Loose Leaf Single Binary Release ${{ github.ref_name }}"
+          files: |
+            release-dist/looseleaf-*
+            release-dist/checksums.txt
+          name: Loose-Leaf ${{ github.ref_name }}
+          body: |
+            ## Loose-Leaf 散页数字档案核心（单二进制开箱即用版本）
+            
+            根据 `docs/ecosystem.md` §十.4 规范自动构建的去 Docker 化单二进制产物，内嵌完整 Web 静态展厅。无需配置 Node.js 或 Docker，下载后赋予执行权限即可直接运行：
+            
+            ```bash
+            # Linux x86_64
+            chmod +x looseleaf-linux-amd64 && ./looseleaf-linux-amd64
+            
+            # Apple Silicon Mac (M1/M2/M3/M4)
+            chmod +x looseleaf-darwin-arm64 && ./looseleaf-darwin-arm64
+            ```
+            
+            ### 校验和 (SHA-256)
+            见附件 `checksums.txt`。
           draft: false
           prerelease: false
-          files: |
-            release-dist/looseleaf-linux-amd64
-            release-dist/looseleaf-linux-arm64
-            release-dist/looseleaf-darwin-amd64
-            release-dist/looseleaf-darwin-arm64
-            release-dist/looseleaf-windows-amd64.exe
-            release-dist/checksums.txt
-          body: |
-            ## 《散页》（Loose Leaf）单二进制全功能分发包
-
-            无需 Docker，无需 Node.js 环境，下载单个可执行文件赋予执行权限即可开箱运行！
-
-            ### 产物特性
-            - **全功能内嵌**：Go 原生内嵌完整 Web 前端展厅与管理后台 (`//go:embed web/dist/*`)；
-            - **纯 Go 零依赖**：基于纯 Go SQLite (`glebarez/sqlite`) 编译，彻底告别 glibc / CGO 动态库依赖；
-            - **零配置启动**：支持 SQLite 自动建表与 WAL 高并发优化，开箱即用。
-
-            ### 快速运行指南 (以 Linux 为例)
-            ```bash
-            chmod +x looseleaf-linux-amd64
-            ./looseleaf-linux-amd64
-            ```
-            打开浏览器访问 `http://localhost:8088` 即可开启首次装帧或浏览生活档案。

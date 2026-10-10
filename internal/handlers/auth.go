@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -16,6 +17,7 @@ import (
 	"chimu-lab/internal/models"
 
 	"github.com/gin-gonic/gin"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 // HashToken 计算 Token 的 SHA-256 哈希字符串，数据库仅存储哈希
@@ -56,12 +58,29 @@ func resolveHubURL(c *gin.Context) string {
 	return fmt.Sprintf("%s://%s", scheme, host)
 }
 
+// generateQRCodeDataURL 生成 base64 PNG Data URL 二维码 (RG-02)
+func generateQRCodeDataURL(content string) string {
+	pngBytes, err := qrcode.Encode(content, qrcode.Medium, 256)
+	if err != nil {
+		return ""
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+}
+
 // ==========================================
 // 1. 发起设备配对工单 (Init Pairing)
 // ==========================================
 
+type InitPairingRequest struct {
+	HubURL     string `json:"hub_url"`
+	DeviceHint string `json:"device_hint"`
+}
+
 // InitPairing 签发 5 分钟有效期的配对 Ticket 与 6 位 PIN 码 (需管理员/已配对凭据)
 func InitPairing(c *gin.Context) {
+	var req InitPairingRequest
+	_ = c.ShouldBindJSON(&req)
+
 	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(8))
 	pinCode := generatePinCode()
 	expiresIn := 300 // 5 分钟
@@ -79,15 +98,23 @@ func InitPairing(c *gin.Context) {
 		return
 	}
 
-	hubURL := resolveHubURL(c)
-	qrPayload := fmt.Sprintf("looseleaf://pair?ticket=%s&hub=%s", ticketStr, hubURL)
+	hubURL := strings.TrimSpace(req.HubURL)
+	if hubURL == "" {
+		hubURL = resolveHubURL(c)
+	}
+	hubURL = strings.TrimRight(hubURL, "/")
+
+	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticketStr)
+	qrDataURL := generateQRCodeDataURL(qrPayload)
 
 	Success(c, gin.H{
 		"ticket":             ticketStr,
 		"pin_code":           pinCode,
+		"hub_url":            hubURL,
 		"expires_at":         expiresAt.Format(time.RFC3339),
 		"expires_in_seconds": expiresIn,
 		"qr_payload":         qrPayload,
+		"qr_code_data_url":   qrDataURL,
 	})
 }
 
@@ -224,8 +251,15 @@ func RevokeDevice(c *gin.Context) {
 // 4. 网页端反向扫码登录与口令验证 (Reverse QR & Passcode)
 // ==========================================
 
+type CreateQRRequest struct {
+	HubURL string `json:"hub_url"`
+}
+
 // CreateQRSession 申请网页端反向登录二维码 Session (公开)
 func CreateQRSession(c *gin.Context) {
+	var req CreateQRRequest
+	_ = c.ShouldBindJSON(&req)
+
 	sessionID := fmt.Sprintf("qr_sess_%s", generateRandomHex(8))
 	expiresIn := 120 // 2分钟
 	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
@@ -241,11 +275,20 @@ func CreateQRSession(c *gin.Context) {
 		return
 	}
 
-	qrPayload := fmt.Sprintf("looseleaf://login?session_id=%s", sessionID)
+	hubURL := strings.TrimSpace(req.HubURL)
+	if hubURL == "" {
+		hubURL = resolveHubURL(c)
+	}
+	hubURL = strings.TrimRight(hubURL, "/")
+
+	qrPayload := fmt.Sprintf("looseleaf://login?hub=%s&session_id=%s", hubURL, sessionID)
+	qrDataURL := generateQRCodeDataURL(qrPayload)
 
 	Success(c, gin.H{
 		"session_id":         sessionID,
+		"hub_url":            hubURL,
 		"qr_payload":         qrPayload,
+		"qr_code_data_url":   qrDataURL,
 		"expires_in_seconds": expiresIn,
 	})
 }

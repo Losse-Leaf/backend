@@ -48,7 +48,6 @@ func GetCuratorProfile(c *gin.Context) {
 // UpdateCuratorProfileRequest 主理人更新载荷
 type UpdateCuratorProfileRequest struct {
 	Name        string `json:"name"`
-	EnglishName string `json:"english_name"`
 	Title       string `json:"title"`
 	Bio         string `json:"bio"`
 	Location    string `json:"location"`
@@ -75,9 +74,6 @@ func UpdateCuratorProfile(c *gin.Context) {
 
 	if req.Name != "" {
 		profile.Name = strings.TrimSpace(req.Name)
-	}
-	if req.EnglishName != "" {
-		profile.EnglishName = strings.TrimSpace(req.EnglishName)
 	}
 	if req.Title != "" {
 		profile.Title = strings.TrimSpace(req.Title)

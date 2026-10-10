@@ -556,12 +556,25 @@ func CreateTransaction(c *gin.Context) {
 	Success(c, tx)
 }
 
-// GetTransactions 列表查询账目 (支持按年、按月)
+// GetTransactions 列表查询账目 (支持按年、按月、增量游标与 ETag 缓存协商 BE-05)
 func GetTransactions(c *gin.Context) {
 	yearStr := c.Query("year")
 	monthStr := c.Query("month")
+	sinceStr := c.Query("since")
+	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
 
-	query := db.DB.Order("occurred_at DESC, id DESC")
+	dbScope := db.DB
+	if includeDeleted {
+		dbScope = db.DB.Unscoped()
+	}
+
+	query := dbScope.Model(&models.Transaction{}).Order("occurred_at DESC, id DESC")
+
+	if sinceStr != "" {
+		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
+		}
+	}
 
 	if yearStr != "" {
 		y, err := strconv.Atoi(yearStr)
@@ -593,6 +606,31 @@ func GetTransactions(c *gin.Context) {
 	if err := query.Find(&txs).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取记账列表失败")
 		return
+	}
+
+	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
+	var maxUpdated time.Time
+	for _, tx := range txs {
+		if tx.UpdatedAt.After(maxUpdated) {
+			maxUpdated = tx.UpdatedAt
+		}
+		if tx.DeletedAt.Valid && tx.DeletedAt.Time.After(maxUpdated) {
+			maxUpdated = tx.DeletedAt.Time
+		}
+	}
+	etag := fmt.Sprintf(`W/"%d-%d"`, len(txs), maxUpdated.UnixMilli())
+	c.Header("ETag", etag)
+
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
+		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
+			c.Status(http.StatusNotModified)
+			return
+		}
 	}
 
 	Success(c, txs)
@@ -672,11 +710,28 @@ func UpdateTransaction(c *gin.Context) {
 	Success(c, tx)
 }
 
-// DeleteTransaction 删除账目
+// DeleteTransaction 删除账目 (默认软删除，?purge=true 为物理清理 BE-05)
 func DeleteTransaction(c *gin.Context) {
 	id := c.Param("id")
-	if err := db.DB.Delete(&models.Transaction{}, id).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "删除失败")
+	purge := c.Query("purge") == "true"
+
+	var tx models.Transaction
+	if err := db.DB.First(&tx, id).Error; err != nil {
+		Error(c, http.StatusNotFound, "账目不存在或已被删除")
+		return
+	}
+
+	if purge {
+		if err := db.DB.Unscoped().Delete(&tx).Error; err != nil {
+			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
+			return
+		}
+		Success(c, gin.H{"id": id, "purged": true})
+		return
+	}
+
+	if err := db.DB.Delete(&tx).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
 	Success(c, gin.H{"id": id, "deleted": true})
@@ -736,13 +791,59 @@ func CreateProject(c *gin.Context) {
 	Success(c, p)
 }
 
+// GetProjectsV1 获取项目列表 (支持增量游标与 ETag 缓存协商 BE-05)
 func GetProjectsV1(c *gin.Context) {
-	var projects []models.Project
-	query := db.DB.Order("`order` ASC, id DESC")
+	sinceStr := c.Query("since")
+	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+
+	dbScope := db.DB
+	if includeDeleted {
+		dbScope = db.DB.Unscoped()
+	}
+
+	query := dbScope.Model(&models.Project{}).Order("`order` ASC, id DESC")
+
+	if sinceStr != "" {
+		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
+		}
+	}
+
 	if limit, err := strconv.Atoi(c.Query("limit")); err == nil && limit > 0 {
 		query = query.Limit(limit)
 	}
-	query.Find(&projects)
+
+	var projects []models.Project
+	if err := query.Find(&projects).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "获取项目列表失败")
+		return
+	}
+
+	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
+	var maxUpdated time.Time
+	for _, p := range projects {
+		if p.UpdatedAt.After(maxUpdated) {
+			maxUpdated = p.UpdatedAt
+		}
+		if p.DeletedAt.Valid && p.DeletedAt.Time.After(maxUpdated) {
+			maxUpdated = p.DeletedAt.Time
+		}
+	}
+	etag := fmt.Sprintf(`W/"%d-%d"`, len(projects), maxUpdated.UnixMilli())
+	c.Header("ETag", etag)
+
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
+	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
+		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
+			c.Status(http.StatusNotModified)
+			return
+		}
+	}
+
 	Success(c, projects)
 }
 
@@ -814,9 +915,30 @@ func UpdateProject(c *gin.Context) {
 	Success(c, p)
 }
 
+// DeleteProject 删除项目 (默认软删除，?purge=true 为物理清理 BE-05)
 func DeleteProject(c *gin.Context) {
 	id := c.Param("id")
-	db.DB.Delete(&models.Project{}, id)
+	purge := c.Query("purge") == "true"
+
+	var p models.Project
+	if err := db.DB.First(&p, id).Error; err != nil {
+		Error(c, http.StatusNotFound, "项目不存在或已被删除")
+		return
+	}
+
+	if purge {
+		if err := db.DB.Unscoped().Delete(&p).Error; err != nil {
+			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
+			return
+		}
+		Success(c, gin.H{"id": id, "purged": true})
+		return
+	}
+
+	if err := db.DB.Delete(&p).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
+		return
+	}
 	Success(c, gin.H{"id": id, "deleted": true})
 }
 
@@ -903,7 +1025,6 @@ func GetConfigV1(c *gin.Context) {
 			SiteName:        "散页 · 时光手账与生活档案",
 			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
 			CuratorName:     "迟暮",
-			CuratorEn:       "",
 			DefaultLocation: "中国 · 杭州",
 			Domain:          "codeactivityhub.top",
 			ICPNumber:       "浙ICP备2026081664号",
@@ -931,9 +1052,6 @@ func UpdateConfig(c *gin.Context) {
 	}
 	if req.CuratorName != "" {
 		config.CuratorName = strings.TrimSpace(req.CuratorName)
-	}
-	if req.CuratorEn != "" {
-		config.CuratorEn = strings.TrimSpace(req.CuratorEn)
 	}
 	if req.DefaultLocation != "" {
 		config.DefaultLocation = strings.TrimSpace(req.DefaultLocation)

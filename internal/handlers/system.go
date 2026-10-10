@@ -31,7 +31,6 @@ func GetSystemStatus(c *gin.Context) {
 
 type BootstrapRequest struct {
 	CuratorName    string `json:"curator_name" binding:"required"`
-	CuratorEn      string `json:"curator_en"`
 	Location       string `json:"location"`
 	MasterPasscode string `json:"master_passcode"`
 	MasterKey      string `json:"master_key"`
@@ -70,7 +69,6 @@ func BootstrapSystem(c *gin.Context) {
 
 	// 1. 初始化 SiteConfig
 	cfg.CuratorName = curatorName
-	cfg.CuratorEn = ""
 	cfg.DefaultLocation = location
 	cfg.Initialized = true
 	if req.MasterPasscode != "" {
@@ -82,7 +80,6 @@ func BootstrapSystem(c *gin.Context) {
 	var profile models.CuratorProfile
 	db.DB.FirstOrCreate(&profile)
 	profile.Name = curatorName
-	profile.EnglishName = ""
 	profile.Location = location
 	profile.CurrentCity = location
 	if profile.Title == "" {

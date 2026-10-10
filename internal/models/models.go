@@ -45,33 +45,35 @@ type Attachment struct {
 
 // Project 长期进行的事情、创造与造物
 type Project struct {
-	ID          uint      `gorm:"primaryKey" json:"id"`
-	Title       string    `json:"title"`
-	Subtitle    string    `json:"subtitle,omitempty"`
-	Description string    `json:"description"`
-	Story       string    `gorm:"type:text" json:"story,omitempty"`
-	Category    string    `json:"category,omitempty"`
-	Tags        string    `json:"tags,omitempty"`
-	GithubURL   string    `json:"github_url,omitempty"`
-	Status      string    `json:"status,omitempty"`
-	Featured    bool      `json:"featured,omitempty"`
-	Order       int       `json:"order,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          uint           `gorm:"primaryKey" json:"id"`
+	Title       string         `json:"title"`
+	Subtitle    string         `json:"subtitle,omitempty"`
+	Description string         `json:"description"`
+	Story       string         `gorm:"type:text" json:"story,omitempty"`
+	Category    string         `json:"category,omitempty"`
+	Tags        string         `json:"tags,omitempty"`
+	GithubURL   string         `json:"github_url,omitempty"`
+	Status      string         `json:"status,omitempty"`
+	Featured    bool           `json:"featured,omitempty"`
+	Order       int            `json:"order,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // Transaction 独立记账记录 (单位：分，避免浮点数精度误差，如 1250 表示 12.50 元)
 type Transaction struct {
-	ID            uint      `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
-	Amount        int64     `gorm:"not null" json:"amount"` // 分
-	Type          string    `gorm:"index;not null" json:"type"` // "income" 或 "expense"
-	Category      string    `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
-	Title         string    `json:"title"`
-	Note          string    `json:"note"`
-	PaymentMethod string    `json:"payment_method"`
-	OccurredAt    time.Time `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID            uint           `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
+	Amount        int64          `gorm:"not null" json:"amount"` // 分
+	Type          string         `gorm:"index;not null" json:"type"` // "income" 或 "expense"
+	Category      string         `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
+	Title         string         `json:"title"`
+	Note          string         `json:"note"`
+	PaymentMethod string         `json:"payment_method"`
+	OccurredAt    time.Time      `gorm:"index:idx_tx_occurred_id,priority:1;index;not null" json:"occurred_at"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // SiteConfig 站点全局与备案合规配置
@@ -80,7 +82,6 @@ type SiteConfig struct {
 	SiteName        string    `json:"site_name"`
 	SiteSubtitle    string    `json:"site_subtitle,omitempty"`
 	CuratorName     string    `json:"curator_name,omitempty"`
-	CuratorEn       string    `json:"curator_en,omitempty"`
 	DefaultLocation string    `json:"default_location,omitempty"`
 	SiteDesc        string    `json:"site_desc,omitempty"`
 	Domain          string    `json:"domain"`
@@ -98,7 +99,6 @@ type SiteConfig struct {
 type CuratorProfile struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
 	Name        string    `json:"name"`
-	EnglishName string    `json:"english_name"`
 	Title       string    `json:"title"`
 	Bio         string    `gorm:"type:text" json:"bio"`
 	Location    string    `json:"location"`

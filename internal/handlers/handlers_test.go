@@ -278,3 +278,137 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 		t.Fatalf("expected soft-deleted entry to have deleted_at in sync response: %s", w.Body.String())
 	}
 }
+
+func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	r := gin.New()
+	r.POST("/api/v1/transactions", CreateTransaction)
+	r.GET("/api/v1/transactions", GetTransactions)
+	r.DELETE("/api/v1/transactions/:id", DeleteTransaction)
+
+	r.POST("/api/v1/projects", CreateProject)
+	r.GET("/api/v1/projects", GetProjectsV1)
+	r.DELETE("/api/v1/projects/:id", DeleteProject)
+
+	// 1. Transactions CRUD, ETag & Soft Delete
+	txReq := TransactionRequest{
+		Amount:        2500,
+		Type:          "expense",
+		Category:      "餐饮",
+		Title:         "手冲咖啡",
+		OccurredAt:    "2026-10-10 10:00:00",
+		PaymentMethod: "wechat",
+	}
+	body, _ := json.Marshal(txReq)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/transactions", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to create transaction")
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
+	r.ServeHTTP(w, req)
+	etag := w.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("expected ETag for transactions")
+	}
+
+	// 304 on matching ETag
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
+	req.Header.Set("If-None-Match", etag)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 for transactions, got %d", w.Code)
+	}
+
+	// Soft delete
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/transactions/1", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to soft delete transaction")
+	}
+
+	// Normal list returns empty
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
+	r.ServeHTTP(w, req)
+	var txListResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &txListResp)
+	txs := txListResp["data"].([]interface{})
+	if len(txs) != 0 {
+		t.Fatalf("expected 0 active transactions, got %d", len(txs))
+	}
+
+	// Sync with since returns soft deleted transaction
+	w = httptest.NewRecorder()
+	sinceTime := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions?since="+sinceTime, nil)
+	r.ServeHTTP(w, req)
+	_ = json.Unmarshal(w.Body.Bytes(), &txListResp)
+	txs = txListResp["data"].([]interface{})
+	if len(txs) != 1 {
+		t.Fatalf("expected 1 transaction in sync, got %d", len(txs))
+	}
+	item := txs[0].(map[string]interface{})
+	if item["deleted_at"] == nil {
+		t.Fatalf("expected deleted_at to be populated in transaction")
+	}
+
+	// 2. Projects CRUD, ETag & Soft Delete
+	projReq := ProjectRequest{
+		Title:       "Test Project",
+		Description: "A great project",
+		Category:    "code",
+	}
+	body, _ = json.Marshal(projReq)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to create project")
+	}
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	r.ServeHTTP(w, req)
+	projEtag := w.Header().Get("ETag")
+	if projEtag == "" {
+		t.Fatalf("expected ETag for projects")
+	}
+
+	// 304 on matching ETag
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	req.Header.Set("If-None-Match", projEtag)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 for projects, got %d", w.Code)
+	}
+
+	// Soft delete project
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/projects/1", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to soft delete project")
+	}
+
+	// Normal list returns empty
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
+	r.ServeHTTP(w, req)
+	var projListResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &projListResp)
+	projs := projListResp["data"].([]interface{})
+	if len(projs) != 0 {
+		t.Fatalf("expected 0 active projects, got %d", len(projs))
+	}
+}

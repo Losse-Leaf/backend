@@ -334,9 +334,26 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	}
 
 	presignCacheMu.Lock()
+	now := time.Now()
+	// 定期淘汰过期项并硬限制容量上限，避免无界累积 (BE-04)
+	if len(presignCache) > 1000 {
+		for k, v := range presignCache {
+			if now.After(v.expiresAt) {
+				delete(presignCache, k)
+			}
+		}
+		if len(presignCache) > 2000 {
+			for k := range presignCache {
+				delete(presignCache, k)
+				if len(presignCache) <= 1000 {
+					break
+				}
+			}
+		}
+	}
 	presignCache[cacheKey] = presignedCacheItem{
 		url:       presignedReq.URL,
-		expiresAt: time.Now().Add(duration),
+		expiresAt: now.Add(duration),
 	}
 	presignCacheMu.Unlock()
 

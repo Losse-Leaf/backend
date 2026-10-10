@@ -83,7 +83,6 @@ func TestProfileAndConfig(t *testing.T) {
 		// 先初始化一个基础 profile
 		initialProfile := models.CuratorProfile{
 			Name:        "迟暮",
-			EnglishName: "",
 			Title:       "数字手艺人",
 			Location:    "杭州",
 			SocialLinks: `{"github":"https://github.com/YN1753"}`,

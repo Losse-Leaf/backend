@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"chimu-lab/internal/db"
@@ -826,7 +827,30 @@ func DeleteProject(c *gin.Context) {
 // 5. Global Stats (生活档案统计概览)
 // ==========================================
 
+var (
+	statsCacheMutex sync.RWMutex
+	cachedStats     gin.H
+	cachedStatsTime time.Time
+)
+
+// InvalidateStatsCache 主动失效全局统计缓存
+func InvalidateStatsCache() {
+	statsCacheMutex.Lock()
+	cachedStatsTime = time.Time{}
+	statsCacheMutex.Unlock()
+}
+
 func GetGlobalStats(c *gin.Context) {
+	now := time.Now()
+	statsCacheMutex.RLock()
+	if cachedStats != nil && now.Sub(cachedStatsTime) < 30*time.Second {
+		resp := cachedStats
+		statsCacheMutex.RUnlock()
+		Success(c, resp)
+		return
+	}
+	statsCacheMutex.RUnlock()
+
 	var totalEntries int64
 	db.DB.Model(&models.LifeEntry{}).Count(&totalEntries)
 
@@ -840,7 +864,6 @@ func GetGlobalStats(c *gin.Context) {
 	db.DB.Model(&models.Project{}).Count(&totalProjects)
 
 	// 当月支出
-	now := time.Now()
 	start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local)
 	end := start.AddDate(0, 1, 0)
 
@@ -855,14 +878,21 @@ func GetGlobalStats(c *gin.Context) {
 		Scan(&res)
 	monthExpense = res.Total
 
-	Success(c, gin.H{
-		"total_entries": totalEntries,
-		"total_photos":  totalPhotos,
+	result := gin.H{
+		"total_entries":  totalEntries,
+		"total_photos":   totalPhotos,
 		"total_projects": totalProjects,
-		"month_expense": monthExpense,
-		"current_year":  now.Year(),
-		"current_month": int(now.Month()),
-	})
+		"month_expense":  monthExpense,
+		"current_year":   now.Year(),
+		"current_month":  int(now.Month()),
+	}
+
+	statsCacheMutex.Lock()
+	cachedStats = result
+	cachedStatsTime = now
+	statsCacheMutex.Unlock()
+
+	Success(c, result)
 }
 
 // ==========================================

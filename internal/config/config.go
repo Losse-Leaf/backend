@@ -57,7 +57,7 @@ func loadDotEnv() {
 	}
 }
 
-const DefaultDBPath = "data/chimu.db"
+const DefaultDBPath = "data/looseleaf.db"
 
 func LoadConfig() Config {
 	loadDotEnv()

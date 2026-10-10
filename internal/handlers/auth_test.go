@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"chimu-lab/internal/db"
-	"chimu-lab/internal/models"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"

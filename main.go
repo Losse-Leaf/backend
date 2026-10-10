@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	"chimu-lab/internal/config"
-	"chimu-lab/internal/db"
-	"chimu-lab/internal/handlers"
-	"chimu-lab/internal/middleware"
-	"chimu-lab/internal/storage"
+	"loose-leaf/internal/config"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/handlers"
+	"loose-leaf/internal/middleware"
+	"loose-leaf/internal/storage"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/gzip"

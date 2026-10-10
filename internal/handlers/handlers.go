@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"chimu-lab/internal/db"
-	"chimu-lab/internal/models"
-	"chimu-lab/internal/storage"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/models"
+	"loose-leaf/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )

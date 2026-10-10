@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"chimu-lab/internal/config"
+	"loose-leaf/internal/config"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3config "github.com/aws/aws-sdk-go-v2/config"

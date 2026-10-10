@@ -5,7 +5,7 @@
 *.so
 *.dylib
 loose-leaf-server
-chimu-server
+looseleaf-server
 server
 tmp/
 build-errors.log

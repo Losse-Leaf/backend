@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"chimu-lab/internal/config"
+	"loose-leaf/internal/config"
 )
 
 func TestStorageHelpers(t *testing.T) {

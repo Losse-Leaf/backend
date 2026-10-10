@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"chimu-lab/internal/config"
-	"chimu-lab/internal/db"
-	"chimu-lab/internal/models"
+	"loose-leaf/internal/config"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
 	qrcode "github.com/skip2/go-qrcode"

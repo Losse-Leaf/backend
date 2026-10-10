@@ -40,6 +40,18 @@ func ExtractToken(c *gin.Context) string {
 	return strings.TrimSpace(c.Query("admin_key"))
 }
 
+// isSystemInitialized 检查系统是否已完成初次装帧或设置了主理人口令 (BE-13)
+func isSystemInitialized() bool {
+	if db.DB == nil {
+		return false
+	}
+	var cfg models.SiteConfig
+	if err := db.DB.First(&cfg).Error; err != nil {
+		return false
+	}
+	return cfg.Initialized || strings.TrimSpace(cfg.MasterPasscode) != ""
+}
+
 // IsAdmin 判定当前请求是否具备管理员权限 (母密钥或有效激活设备)
 func IsAdmin(c *gin.Context) bool {
 	if authType, exists := c.Get("auth_type"); exists && authType != "" {
@@ -47,26 +59,25 @@ func IsAdmin(c *gin.Context) bool {
 	}
 
 	token := ExtractToken(c)
-	if token == "" {
-		return false
-	}
 
 	expectedMasterKey := strings.TrimSpace(config.AppConfig.AdminAPIKey)
-	if expectedMasterKey != "" {
+	if token != "" && expectedMasterKey != "" {
 		if subtle.ConstantTimeCompare([]byte(token), []byte(expectedMasterKey)) == 1 {
 			return true
 		}
-	} else {
-		// 本地开发未配置 master key 模式下，携带任意凭据即视为主理人请求
-		return true
 	}
 
-	if db.DB != nil {
+	if token != "" && db.DB != nil {
 		tHash := HashToken(token)
 		var count int64
 		if err := db.DB.Model(&models.Device{}).Where("token_hash = ? AND status = 'active'", tHash).Count(&count).Error; err == nil && count > 0 {
 			return true
 		}
+	}
+
+	// 仅当系统未初始化纯空态且未配置母密钥时，允许本地初始引导体验 (BE-13)
+	if expectedMasterKey == "" && !isSystemInitialized() {
+		return true
 	}
 
 	return false
@@ -93,7 +104,7 @@ func AdminAuthRequired() gin.HandlerFunc {
 
 		// 3. 轨二校验：比对已配对受信任设备令牌 (Device Token)
 		if token != "" && db.DB != nil {
-			tHash := hashToken(token)
+			tHash := HashToken(token)
 			var device models.Device
 			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).First(&device).Error; err == nil {
 				// 异步轻量更新设备的最近活跃时间 (带 60 秒节流防抖 BE-03)
@@ -114,8 +125,8 @@ func AdminAuthRequired() gin.HandlerFunc {
 			}
 		}
 
-		// 4. 若服务器未配置母密钥，且处于本地无密开发模式，放行体验
-		if expectedMasterKey == "" {
+		// 4. 仅当系统未初始化纯空态且未配置母密钥时，允许本地冷启动引导 (BE-13 核心防线)
+		if expectedMasterKey == "" && !isSystemInitialized() {
 			c.Set("auth_type", "dev_open")
 			c.Next()
 			return

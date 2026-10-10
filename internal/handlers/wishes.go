@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 )
@@ -114,8 +115,15 @@ func GetWishes(c *gin.Context) {
 		return
 	}
 
+	isAdmin := middleware.IsAdmin(c)
 	for i := range wishes {
 		populateWishURLs(&wishes[i])
+		// 访客模式财务隐私严格脱敏 (BE-14)
+		if !isAdmin {
+			wishes[i].ActualCost = 0
+			wishes[i].TransactionID = nil
+			wishes[i].GearID = nil
+		}
 	}
 
 	// ETag 与 304 缓存协商
@@ -144,7 +152,7 @@ func GetWishes(c *gin.Context) {
 	})
 }
 
-// GetWishByID 单个心愿详情
+// GetWishByID 单个心愿详情 (访客模式脱敏 BE-14)
 func GetWishByID(c *gin.Context) {
 	id := c.Param("id")
 	var w models.Wish
@@ -153,6 +161,11 @@ func GetWishByID(c *gin.Context) {
 		return
 	}
 	populateWishURLs(&w)
+	if !middleware.IsAdmin(c) {
+		w.ActualCost = 0
+		w.TransactionID = nil
+		w.GearID = nil
+	}
 	Success(c, w)
 }
 

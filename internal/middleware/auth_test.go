@@ -20,7 +20,7 @@ func setupTestDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open test in-memory db: %v", err)
 	}
-	_ = database.AutoMigrate(&models.Device{}, &models.PairTicket{})
+	_ = database.AutoMigrate(&models.Device{}, &models.PairTicket{}, &models.SiteConfig{})
 	db.DB = database
 }
 
@@ -28,8 +28,9 @@ func TestAdminAuthRequired(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
 
-	t.Run("Passes when ADMIN_API_KEY is empty", func(t *testing.T) {
+	t.Run("Passes when ADMIN_API_KEY is empty and system is uninitialized", func(t *testing.T) {
 		config.AppConfig.AdminAPIKey = ""
+		db.DB.Exec("DELETE FROM site_configs")
 		r := gin.New()
 		r.Use(AdminAuthRequired())
 		r.POST("/test", func(c *gin.Context) {
@@ -42,6 +43,28 @@ func TestAdminAuthRequired(t *testing.T) {
 
 		if w.Code != http.StatusOK {
 			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("Rejects unauthorized request when ADMIN_API_KEY is empty but system is initialized (BE-13)", func(t *testing.T) {
+		config.AppConfig.AdminAPIKey = ""
+		db.DB.Create(&models.SiteConfig{Initialized: true, MasterPasscode: "hashedpass"})
+		defer func() {
+			db.DB.Exec("DELETE FROM site_configs")
+		}()
+
+		r := gin.New()
+		r.Use(AdminAuthRequired())
+		r.POST("/test", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		})
+
+		req := httptest.NewRequest(http.MethodPost, "/test", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401 on initialized system without credentials, got %d", w.Code)
 		}
 	})
 

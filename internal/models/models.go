@@ -130,10 +130,11 @@ type SiteConfig struct {
 	ICPLink         string    `json:"icp_link"`                // 备案链接 (可选)
 	PoliceNumber    string    `json:"police_number,omitempty"` // 公安联网备案号
 	PoliceCode      string    `json:"police_code,omitempty"`   // 公安备案编号
-	Initialized     bool      `gorm:"default:false" json:"initialized"`
-	MasterPasscode  string    `gorm:"size:128" json:"-"` // 主理人记忆口令哈希
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	Initialized          bool      `gorm:"default:false" json:"initialized"`
+	MasterPasscode       string    `gorm:"size:128" json:"-"` // 主理人记忆口令哈希
+	InitialLiquidBalance int64     `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // CuratorProfile 主理人档案与身份中枢 (全端动态获取，禁止前端硬编码)

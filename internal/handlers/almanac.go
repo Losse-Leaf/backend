@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 )
 
@@ -162,6 +163,37 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		wishRatio = float64(wishExpenses) / float64(totalExpense)
 	}
 
+	isAdmin := middleware.IsAdmin(c)
+
+	txCount := len(txs)
+	finSpectrum := gin.H{
+		"total_income":       totalIncome,
+		"total_expense":      totalExpense,
+		"balance":            totalIncome - totalExpense,
+		"wish_expenses":      wishExpenses,
+		"wish_expense_ratio": wishRatio,
+		"categories":         categories,
+	}
+
+	// 访客模式财务隐私严格脱敏 (BE-14)
+	if !isAdmin {
+		txCount = 0
+		totalWishActual = 0
+		for i := range fulfilledWishes {
+			fulfilledWishes[i].ActualCost = 0
+			fulfilledWishes[i].TransactionID = nil
+			fulfilledWishes[i].GearID = nil
+		}
+		finSpectrum = gin.H{
+			"total_income":       0,
+			"total_expense":      0,
+			"balance":            0,
+			"wish_expenses":      0,
+			"wish_expense_ratio": 0.0,
+			"categories":         []catItem{},
+		}
+	}
+
 	// 组装年鉴信封
 	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d"`, year, len(entries), len(txs))
 	c.Header("ETag", etag)
@@ -181,7 +213,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"last_date":        lastDateStr,
 			"wishes_fulfilled": len(fulfilledWishes),
 			"cities_visited":   len(citiesVisited),
-			"tx_count":         len(txs),
+			"tx_count":         txCount,
 		},
 		"atlas_journey": gin.H{
 			"footprints":     footprints,
@@ -200,13 +232,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"winter":       winterHighlight,
 			"film_gallery": filmGallery,
 		},
-		"financial_spectrum": gin.H{
-			"total_income":       totalIncome,
-			"total_expense":      totalExpense,
-			"balance":            totalIncome - totalExpense,
-			"wish_expenses":      wishExpenses,
-			"wish_expense_ratio": wishRatio,
-			"categories":         categories,
-		},
+		"financial_spectrum": finSpectrum,
 	})
 }

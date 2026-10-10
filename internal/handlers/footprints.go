@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 )
@@ -389,6 +390,22 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		categories = append(categories, catItem{Name: name, Amount: amt})
 	}
 
+	var ledgerSummary any
+	if middleware.IsAdmin(c) {
+		ledgerSummary = gin.H{
+			"total_spent":       totalSpent,
+			"transaction_count": len(txs),
+			"categories":        categories,
+		}
+	} else {
+		// 访客模式财务隐私严格脱敏 (BE-14)
+		ledgerSummary = gin.H{
+			"total_spent":       0,
+			"transaction_count": 0,
+			"categories":        []catItem{},
+		}
+	}
+
 	Success(c, gin.H{
 		"city_code": cityCode,
 		"city_name": cityName,
@@ -397,12 +414,8 @@ func GetCityMemoryDrawer(c *gin.Context) {
 			"first_visited_at":  firstVisitStr,
 			"latest_visited_at": latestVisitStr,
 		},
-		"footprints": footprints,
-		"entries":    entries,
-		"ledger_summary": gin.H{
-			"total_spent":        totalSpent,
-			"transaction_count": len(txs),
-			"categories":        categories,
-		},
+		"footprints":     footprints,
+		"entries":        entries,
+		"ledger_summary": ledgerSummary,
 	})
 }

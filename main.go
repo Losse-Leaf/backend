@@ -136,8 +136,9 @@ func main() {
 			write.PUT("/transactions/:id", handlers.UpdateTransaction)
 			write.DELETE("/transactions/:id", handlers.DeleteTransaction)
 
-			// 资产管理中枢与设备全生命周期 (RC-53)
+			// 资产管理中枢与设备全生命周期 (RC-53, BE-15)
 			write.GET("/assets/overview", handlers.GetAssetsOverview)
+			write.PUT("/assets/liquid-balance", handlers.SetInitialLiquidBalance)
 			write.POST("/assets/gear", handlers.AddGearAsset)
 			write.POST("/assets/gear/:id/sell", handlers.SellGearAsset)
 			write.DELETE("/assets/gear/:id", handlers.DeleteGearAsset)

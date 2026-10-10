@@ -36,15 +36,16 @@ type GearSummary struct {
 	Items              []models.GearItem `json:"items"`
 }
 
-// AssetsOverviewResponse 资产大盘看板聚合响应 (RC-53)
+// AssetsOverviewResponse 资产大盘看板聚合响应 (RC-53, BE-15)
 type AssetsOverviewResponse struct {
-	NetWorth           int64                      `json:"net_worth"`           // 个人净资产 = 流动可用余额 + 固定资产沉淀 - 待还信贷负债
-	LiquidBalance      int64                      `json:"liquid_balance"`      // 流动可用现金余额
-	FixedAssets        int64                      `json:"fixed_assets"`        // 在用固定设备资产沉淀
-	TotalLiabilities   int64                      `json:"total_liabilities"`   // 待还信贷分期总负债
-	MonthlyLiabilities int64                      `json:"monthly_liabilities"` // 每月固定还款支出
-	GearSummary        GearSummary                `json:"gear_summary"`        // 设备库全生命周期盘点
-	ChannelLiabilities []ChannelLiabilitySummary  `json:"channel_liabilities"` // 信贷渠道明细与独立还款日倒计时
+	NetWorth             int64                      `json:"net_worth"`              // 个人净资产 = 流动可用余额 + 固定资产沉淀 - 待还信贷负债
+	LiquidBalance        int64                      `json:"liquid_balance"`         // 流动可用现金余额
+	InitialLiquidBalance int64                      `json:"initial_liquid_balance"` // 初始流动现金底数 (BE-15)
+	FixedAssets          int64                      `json:"fixed_assets"`           // 在用固定设备资产沉淀
+	TotalLiabilities     int64                      `json:"total_liabilities"`      // 待还信贷分期总负债
+	MonthlyLiabilities   int64                      `json:"monthly_liabilities"`    // 每月固定还款支出
+	GearSummary          GearSummary                `json:"gear_summary"`           // 设备库全生命周期盘点
+	ChannelLiabilities   []ChannelLiabilitySummary  `json:"channel_liabilities"`    // 信贷渠道明细与独立还款日倒计时
 }
 
 // calculateDaysUntilRepayment 计算距离每月独立还款日的天数倒计时
@@ -141,11 +142,15 @@ func GetAssetsOverview(c *gin.Context) {
 		}
 	}
 
-	// 查询全部流水，核算流动可用余额与待还信贷
+	// 查询全部流水，核算流动可用余额与待还信贷 (纳入初始流动现金基准 BE-15)
 	var txs []models.Transaction
 	db.DB.Find(&txs)
 
-	var liquidBalance int64
+	var siteCfg models.SiteConfig
+	db.DB.First(&siteCfg)
+	initialLiquid := siteCfg.InitialLiquidBalance
+
+	liquidBalance := initialLiquid
 	var totalLiabilities int64
 	var monthlyLiabilities int64
 
@@ -237,11 +242,12 @@ func GetAssetsOverview(c *gin.Context) {
 	netWorth := liquidBalance + fixedAssets - totalLiabilities
 
 	res := AssetsOverviewResponse{
-		NetWorth:           netWorth,
-		LiquidBalance:      liquidBalance,
-		FixedAssets:        fixedAssets,
-		TotalLiabilities:   totalLiabilities,
-		MonthlyLiabilities: monthlyLiabilities,
+		NetWorth:             netWorth,
+		LiquidBalance:        liquidBalance,
+		InitialLiquidBalance: initialLiquid,
+		FixedAssets:          fixedAssets,
+		TotalLiabilities:     totalLiabilities,
+		MonthlyLiabilities:   monthlyLiabilities,
 		GearSummary: GearSummary{
 			TotalCount:         len(gearList),
 			ActiveCount:        activeGearCount,
@@ -254,6 +260,38 @@ func GetAssetsOverview(c *gin.Context) {
 	}
 
 	Success(c, res)
+}
+
+// SetLiquidBalanceRequest 设定初始流动资产底数入参 (BE-15)
+type SetLiquidBalanceRequest struct {
+	InitialLiquidBalance int64 `json:"initial_liquid_balance"`
+}
+
+// SetInitialLiquidBalance 设定初始流动资产底数 (BE-15)
+// PUT /api/v1/assets/liquid-balance
+func SetInitialLiquidBalance(c *gin.Context) {
+	var req SetLiquidBalanceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+
+	var cfg models.SiteConfig
+	if err := db.DB.FirstOrCreate(&cfg).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "获取配置失败: "+err.Error())
+		return
+	}
+
+	cfg.InitialLiquidBalance = req.InitialLiquidBalance
+	cfg.UpdatedAt = time.Now()
+	if err := db.DB.Save(&cfg).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新初始流动资产底数失败: "+err.Error())
+		return
+	}
+
+	Success(c, gin.H{
+		"initial_liquid_balance": cfg.InitialLiquidBalance,
+	})
 }
 
 // AddGearAssetRequest 录入新设备单品请求 (RC-53)

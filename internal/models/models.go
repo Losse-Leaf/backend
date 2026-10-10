@@ -27,7 +27,6 @@ type LifeEntry struct {
 	Meta           string `json:"meta,omitempty"`
 	Tags           string `json:"tags,omitempty"`
 	Link           string `json:"link,omitempty"`
-	RelatedProject string `json:"related_project,omitempty"`
 	Featured       bool   `json:"featured,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -51,20 +50,16 @@ type Attachment struct {
 // Project 长期进行的事情、创造与造物
 type Project struct {
 	ID          uint      `gorm:"primaryKey" json:"id"`
-	Name        string    `json:"name"` // 兼容 title
 	Title       string    `json:"title"`
 	Subtitle    string    `json:"subtitle,omitempty"`
 	Description string    `json:"description"`
-	Content     string    `gorm:"type:text" json:"content"`
 	Story       string    `gorm:"type:text" json:"story,omitempty"`
 	Category    string    `json:"category,omitempty"`
 	Tags        string    `json:"tags,omitempty"`
-	DemoURL     string    `json:"demo_url,omitempty"`
 	GithubURL   string    `json:"github_url,omitempty"`
 	Status      string    `json:"status,omitempty"`
 	Featured    bool      `json:"featured,omitempty"`
 	Order       int       `json:"order,omitempty"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

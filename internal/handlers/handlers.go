@@ -108,13 +108,17 @@ func signImagesString(imagesStr string) string {
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
-	Type          string    `json:"type" binding:"required"` // life, thought, photo, project, collection
-	Title         string    `json:"title"`
-	Content       string    `json:"content" binding:"required"`
-	OccurredAt    string    `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
-	Location      string    `json:"location"`
-	ProjectID     *uint     `json:"project_id"`
-	AttachmentIDs []uint    `json:"attachment_ids"`
+	Type          string `json:"type" binding:"required"` // life, thought, photo, project, collection
+	Title         string `json:"title"`
+	Content       string `json:"content" binding:"required"`
+	OccurredAt    string `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
+	Location      string `json:"location"`
+	Tags          string `json:"tags"`
+	Meta          string `json:"meta"`
+	Link          string `json:"link"`
+	Featured      bool   `json:"featured"`
+	ProjectID     *uint  `json:"project_id"`
+	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
 // CreateLifeEntry 创建一条新的生活档案记录
@@ -133,6 +137,10 @@ func CreateLifeEntry(c *gin.Context) {
 		Content:    strings.TrimSpace(req.Content),
 		OccurredAt: occurred,
 		Location:   strings.TrimSpace(req.Location),
+		Tags:       strings.TrimSpace(req.Tags),
+		Meta:       strings.TrimSpace(req.Meta),
+		Link:       strings.TrimSpace(req.Link),
+		Featured:   req.Featured,
 		ProjectID:  req.ProjectID,
 	}
 	formatDatesFromTime(&entry)
@@ -273,6 +281,10 @@ type UpdateEntryRequest struct {
 	Content       string `json:"content"`
 	OccurredAt    string `json:"occurred_at"`
 	Location      string `json:"location"`
+	Tags          string `json:"tags"`
+	Meta          string `json:"meta"`
+	Link          string `json:"link"`
+	Featured      *bool  `json:"featured"`
 	ProjectID     *uint  `json:"project_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
@@ -301,7 +313,21 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.Content != "" {
 		entry.Content = strings.TrimSpace(req.Content)
 	}
-	entry.Location = strings.TrimSpace(req.Location)
+	if req.Location != "" {
+		entry.Location = strings.TrimSpace(req.Location)
+	}
+	if req.Tags != "" {
+		entry.Tags = strings.TrimSpace(req.Tags)
+	}
+	if req.Meta != "" {
+		entry.Meta = strings.TrimSpace(req.Meta)
+	}
+	if req.Link != "" {
+		entry.Link = strings.TrimSpace(req.Link)
+	}
+	if req.Featured != nil {
+		entry.Featured = *req.Featured
+	}
 	entry.ProjectID = req.ProjectID
 
 	if req.OccurredAt != "" {
@@ -662,32 +688,52 @@ func DeleteTransaction(c *gin.Context) {
 // ==========================================
 
 type ProjectRequest struct {
-	Name        string `json:"name" binding:"required"`
+	Title       string `json:"title"`
+	Name        string `json:"name"` // 兼容入参
+	Subtitle    string `json:"subtitle"`
 	Description string `json:"description"`
-	Content     string `json:"content"`
+	Story       string `json:"story"`
+	Content     string `json:"content"` // 兼容入参
 	Category    string `json:"category"`
 	Tags        string `json:"tags"`
 	GithubURL   string `json:"github_url"`
 	Status      string `json:"status"`
+	Featured    bool   `json:"featured"`
+	Order       int    `json:"order"`
 }
 
 func CreateProject(c *gin.Context) {
 	var req ProjectRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "项目名称必填")
+		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
 
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = strings.TrimSpace(req.Name)
+	}
+	if title == "" {
+		Error(c, http.StatusBadRequest, "项目标题必填")
+		return
+	}
+
+	story := strings.TrimSpace(req.Story)
+	if story == "" {
+		story = strings.TrimSpace(req.Content)
+	}
+
 	p := models.Project{
-		Name:        strings.TrimSpace(req.Name),
-		Title:       strings.TrimSpace(req.Name),
+		Title:       title,
+		Subtitle:    strings.TrimSpace(req.Subtitle),
 		Description: strings.TrimSpace(req.Description),
-		Content:     strings.TrimSpace(req.Content),
-		Story:       strings.TrimSpace(req.Content),
+		Story:       story,
 		Category:    strings.TrimSpace(req.Category),
 		Tags:        strings.TrimSpace(req.Tags),
 		GithubURL:   strings.TrimSpace(req.GithubURL),
 		Status:      strings.TrimSpace(req.Status),
+		Featured:    req.Featured,
+		Order:       req.Order,
 	}
 	if p.Status == "" {
 		p.Status = "Active"
@@ -742,15 +788,40 @@ func UpdateProject(c *gin.Context) {
 		return
 	}
 
-	p.Name = strings.TrimSpace(req.Name)
-	p.Title = strings.TrimSpace(req.Name)
-	p.Description = strings.TrimSpace(req.Description)
-	p.Content = strings.TrimSpace(req.Content)
-	p.Story = strings.TrimSpace(req.Content)
-	p.Category = strings.TrimSpace(req.Category)
-	p.Tags = strings.TrimSpace(req.Tags)
-	p.GithubURL = strings.TrimSpace(req.GithubURL)
-	p.Status = strings.TrimSpace(req.Status)
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = strings.TrimSpace(req.Name)
+	}
+	if title != "" {
+		p.Title = title
+	}
+	if req.Subtitle != "" {
+		p.Subtitle = strings.TrimSpace(req.Subtitle)
+	}
+	if req.Description != "" {
+		p.Description = strings.TrimSpace(req.Description)
+	}
+	story := strings.TrimSpace(req.Story)
+	if story == "" {
+		story = strings.TrimSpace(req.Content)
+	}
+	if story != "" {
+		p.Story = story
+	}
+	if req.Category != "" {
+		p.Category = strings.TrimSpace(req.Category)
+	}
+	if req.Tags != "" {
+		p.Tags = strings.TrimSpace(req.Tags)
+	}
+	if req.GithubURL != "" {
+		p.GithubURL = strings.TrimSpace(req.GithubURL)
+	}
+	if req.Status != "" {
+		p.Status = strings.TrimSpace(req.Status)
+	}
+	p.Featured = req.Featured
+	p.Order = req.Order
 
 	db.DB.Save(&p)
 	Success(c, p)

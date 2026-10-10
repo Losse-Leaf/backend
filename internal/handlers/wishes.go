@@ -126,7 +126,7 @@ func GetWishes(c *gin.Context) {
 		}
 	}
 
-	// ETag 与 304 缓存协商
+	// ETag 与 304 缓存协商 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17)
 	var maxUpdated time.Time
 	for _, w := range wishes {
 		if w.UpdatedAt.After(maxUpdated) {
@@ -136,8 +136,13 @@ func GetWishes(c *gin.Context) {
 			maxUpdated = w.DeletedAt.Time
 		}
 	}
-	etag := fmt.Sprintf(`W/"%d-%d"`, total, maxUpdated.UnixMilli())
+	role := "guest"
+	if isAdmin {
+		role = "admin"
+	}
+	etag := fmt.Sprintf(`W/"%d-%d-%s"`, total, maxUpdated.UnixMilli(), role)
 	c.Header("ETag", etag)
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -161,6 +166,7 @@ func GetWishByID(c *gin.Context) {
 		return
 	}
 	populateWishURLs(&w)
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 	if !middleware.IsAdmin(c) {
 		w.ActualCost = 0
 		w.TransactionID = nil

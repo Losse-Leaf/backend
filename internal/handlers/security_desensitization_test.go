@@ -415,3 +415,192 @@ func TestBE15_InitialLiquidBalanceAndAssetsOverview(t *testing.T) {
 		t.Fatalf("expected net_worth=%d, got %d", expectedLiquid, overviewResp.Data.NetWorth)
 	}
 }
+
+// TestBE16_PublicConfigDesensitization 测试公开配置接口对访客隐藏初始存款底数 (BE-16)
+func TestBE16_PublicConfigDesensitization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	testMasterKey := "test-secret-be16"
+	config.AppConfig.AdminAPIKey = testMasterKey
+	defer func() {
+		config.AppConfig.AdminAPIKey = ""
+	}()
+
+	var cfg models.SiteConfig
+	db.DB.FirstOrCreate(&cfg)
+	cfg.Initialized = true
+	cfg.SiteName = "散页 · 公开测试"
+	cfg.InitialLiquidBalance = 3000000 // 30,000 元
+	db.DB.Save(&cfg)
+
+	r := gin.New()
+	r.GET("/api/v1/config", GetConfigV1)
+
+	// 1. 访客请求: initial_liquid_balance 必须为 0
+	wGuest := httptest.NewRecorder()
+	reqGuest, _ := http.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	r.ServeHTTP(wGuest, reqGuest)
+	if wGuest.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wGuest.Code)
+	}
+	var guestResp struct {
+		Data models.SiteConfig `json:"data"`
+	}
+	_ = json.Unmarshal(wGuest.Body.Bytes(), &guestResp)
+	if guestResp.Data.InitialLiquidBalance != 0 {
+		t.Fatalf("BE-16 泄露初始存款底数: expected 0 for guest, got %d", guestResp.Data.InitialLiquidBalance)
+	}
+
+	// 2. 主理人请求: 返回真实底数 3000000
+	wAdmin := httptest.NewRecorder()
+	reqAdmin, _ := http.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	reqAdmin.Header.Set("Authorization", "Bearer "+testMasterKey)
+	r.ServeHTTP(wAdmin, reqAdmin)
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wAdmin.Code)
+	}
+	var adminResp struct {
+		Data models.SiteConfig `json:"data"`
+	}
+	_ = json.Unmarshal(wAdmin.Body.Bytes(), &adminResp)
+	if adminResp.Data.InitialLiquidBalance != 3000000 {
+		t.Fatalf("expected 3000000 for admin, got %d", adminResp.Data.InitialLiquidBalance)
+	}
+}
+
+// TestBE17_ETagRoleCacheIsolation 测试心愿单与年鉴 ETag 跨身份缓存隔离及 RG-17 双键兼容 (BE-17, RG-17)
+func TestBE17_ETagRoleCacheIsolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	testMasterKey := "test-secret-be17"
+	config.AppConfig.AdminAPIKey = testMasterKey
+	defer func() {
+		config.AppConfig.AdminAPIKey = ""
+	}()
+
+	var cfg models.SiteConfig
+	db.DB.FirstOrCreate(&cfg)
+	cfg.Initialized = true
+	db.DB.Save(&cfg)
+
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.Local)
+	db.DB.Create(&models.Wish{
+		Title:       "Sony A7C II",
+		Kind:        "item",
+		Budget:      1399900,
+		ActualCost:  1350000,
+		Status:      "fulfilled",
+		FulfilledAt: &now,
+	})
+	db.DB.Create(&models.Transaction{
+		Amount:     1350000,
+		Type:       "expense",
+		Category:   "好物购置",
+		Title:      "购置相机",
+		OccurredAt: now,
+	})
+
+	r := gin.New()
+	r.GET("/api/v1/wishes", GetWishes)
+	r.GET("/api/v1/almanac/summary", GetAnnualAlmanacSummary)
+
+	// 1. 访客先请求 /api/v1/wishes 获取 guest ETag
+	wGuestWish := httptest.NewRecorder()
+	reqGuestWish, _ := http.NewRequest(http.MethodGet, "/api/v1/wishes", nil)
+	r.ServeHTTP(wGuestWish, reqGuestWish)
+	guestWishETag := wGuestWish.Header().Get("ETag")
+	if guestWishETag == "" {
+		t.Fatalf("expected non-empty ETag for guest wishes")
+	}
+
+	// 2. 携带 guest ETag 但切换为 Admin Token 请求 -> 必须返回 200 OK 而非 304!
+	wAdminWish := httptest.NewRecorder()
+	reqAdminWish, _ := http.NewRequest(http.MethodGet, "/api/v1/wishes", nil)
+	reqAdminWish.Header.Set("If-None-Match", guestWishETag)
+	reqAdminWish.Header.Set("Authorization", "Bearer "+testMasterKey)
+	r.ServeHTTP(wAdminWish, reqAdminWish)
+	if wAdminWish.Code != http.StatusOK {
+		t.Fatalf("BE-17 跨权限缓存污染: expected 200 OK when switching guest->admin, got %d", wAdminWish.Code)
+	}
+	adminWishETag := wAdminWish.Header().Get("ETag")
+	if adminWishETag == guestWishETag {
+		t.Fatalf("BE-17 admin ETag (%s) must differ from guest ETag (%s)", adminWishETag, guestWishETag)
+	}
+
+	// 3. 访客请求 /api/v1/almanac/summary 获取 guest ETag，切换 Admin 后必须返回 200 OK 且兼容 RG-17 字段
+	wGuestAlm := httptest.NewRecorder()
+	reqGuestAlm, _ := http.NewRequest(http.MethodGet, "/api/v1/almanac/summary?year=2026", nil)
+	r.ServeHTTP(wGuestAlm, reqGuestAlm)
+	guestAlmETag := wGuestAlm.Header().Get("ETag")
+
+	wAdminAlm := httptest.NewRecorder()
+	reqAdminAlm, _ := http.NewRequest(http.MethodGet, "/api/v1/almanac/summary?year=2026", nil)
+	reqAdminAlm.Header.Set("If-None-Match", guestAlmETag)
+	reqAdminAlm.Header.Set("Authorization", "Bearer "+testMasterKey)
+	r.ServeHTTP(wAdminAlm, reqAdminAlm)
+	if wAdminAlm.Code != http.StatusOK {
+		t.Fatalf("BE-17 年鉴跨权限缓存污染: expected 200 OK when switching guest->admin, got %d", wAdminAlm.Code)
+	}
+
+	var almBody struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	_ = json.Unmarshal(wAdminAlm.Body.Bytes(), &almBody)
+	// 验证 RG-17 双键兼容存在
+	for _, key := range []string{"atlas", "atlas_journey", "wishes", "wishes_milestones", "highlights", "life_highlights", "finances", "financial_spectrum"} {
+		if _, exists := almBody.Data[key]; !exists {
+			t.Fatalf("RG-17 年鉴响应缺失兼容字段: %s", key)
+		}
+	}
+}
+
+// TestRG19_GearStatusAndPriceCompatibility 测试设备二手中文状态与 sold_price 字段兼容核算 (RG-19)
+func TestRG19_GearStatusAndPriceCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	testMasterKey := "test-secret-rg19"
+	config.AppConfig.AdminAPIKey = testMasterKey
+	defer func() {
+		config.AppConfig.AdminAPIKey = ""
+	}()
+
+	// 模拟前端写入了 status: "已出二手" 和 sold_price (而非 sold_price_cents)
+	rawGearJSON := `[
+		{"id":"g1","name":"MacBook Air M2","category":"计算设备","status":"日常自用","price_cents":799900},
+		{"id":"g2","name":"iPad mini 6","category":"计算设备","status":"已出二手","price_cents":379900,"sold_price":260000}
+	]`
+	db.DB.Create(&models.CuratorProfile{
+		Name:    "测试主理人",
+		EDCGear: rawGearJSON,
+	})
+
+	r := gin.New()
+	r.GET("/api/v1/assets/overview", middleware.AdminAuthRequired(), GetAssetsOverview)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/assets/overview", nil)
+	req.Header.Set("Authorization", "Bearer "+testMasterKey)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp struct {
+		Data AssetsOverviewResponse `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if resp.Data.GearSummary.ActiveCount != 1 || resp.Data.GearSummary.ActiveValue != 799900 {
+		t.Fatalf("RG-19 在用固资统计失真: active_count=%d, active_value=%d",
+			resp.Data.GearSummary.ActiveCount, resp.Data.GearSummary.ActiveValue)
+	}
+	if resp.Data.GearSummary.SoldCount != 1 || resp.Data.GearSummary.SoldRecoveredValue != 260000 {
+		t.Fatalf("RG-19 二手回血统计失真: sold_count=%d, sold_recovered=%d",
+			resp.Data.GearSummary.SoldCount, resp.Data.GearSummary.SoldRecoveredValue)
+	}
+}
+

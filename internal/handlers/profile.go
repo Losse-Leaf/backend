@@ -36,6 +36,23 @@ func sanitizeEDCGear(raw string, isAdmin bool) any {
 		return parseJSONOrRaw(raw)
 	}
 	if isAdmin {
+		for i := range list {
+			if _, hasCents := list[i]["sold_price_cents"]; !hasCents {
+				if sp, ok := list[i]["sold_price"]; ok {
+					list[i]["sold_price_cents"] = sp
+				}
+			}
+			if _, hasSp := list[i]["sold_price"]; !hasSp {
+				if spc, ok := list[i]["sold_price_cents"]; ok {
+					list[i]["sold_price"] = spc
+				}
+			}
+			if _, hasPriceCents := list[i]["price_cents"]; !hasPriceCents {
+				if p, ok := list[i]["price"]; ok {
+					list[i]["price_cents"] = p
+				}
+			}
+		}
 		return list
 	}
 	sanitized := make([]map[string]any, 0, len(list))
@@ -90,6 +107,7 @@ func GetCuratorProfile(c *gin.Context) {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")
 		return
 	}
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 	isAdmin := middleware.IsAdmin(c)
 	populateProfileData(&profile, isAdmin)
 	Success(c, profile)

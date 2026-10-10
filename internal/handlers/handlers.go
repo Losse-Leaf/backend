@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
@@ -1192,6 +1193,10 @@ func GetConfigV1(c *gin.Context) {
 			ICPNumber:       "",
 			ICPLink:         "",
 		}
+	}
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	if !middleware.IsAdmin(c) {
+		config.InitialLiquidBalance = 0
 	}
 	Success(c, config)
 }

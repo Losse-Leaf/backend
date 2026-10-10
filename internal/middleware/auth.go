@@ -46,7 +46,7 @@ func isSystemInitialized() bool {
 		return false
 	}
 	var cfg models.SiteConfig
-	if err := db.DB.First(&cfg).Error; err != nil {
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 {
 		return false
 	}
 	return cfg.Initialized || strings.TrimSpace(cfg.MasterPasscode) != ""

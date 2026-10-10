@@ -97,7 +97,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	// 4. 第四幕：浮光掠影 (四季高光与菲林相片)
 	var springHighlight, summerHighlight, autumnHighlight, winterHighlight *models.LifeEntry
-	var filmGallery []models.Attachment
+	filmGallery := make([]models.Attachment, 0)
 
 	for i, e := range entries {
 		m := e.OccurredAt.Month()
@@ -128,6 +128,13 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	// 截取最多 24 张精选照片作为长胶卷
 	if len(filmGallery) > 24 {
 		filmGallery = filmGallery[:24]
+	}
+
+	if footprints == nil {
+		footprints = make([]models.Footprint, 0)
+	}
+	if fulfilledWishes == nil {
+		fulfilledWishes = make([]models.Wish, 0)
 	}
 
 	// 5. 第五幕：柴米油盐 (Transactions 聚合)
@@ -167,12 +174,13 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	txCount := len(txs)
 	finSpectrum := gin.H{
-		"total_income":       totalIncome,
-		"total_expense":      totalExpense,
-		"balance":            totalIncome - totalExpense,
-		"wish_expenses":      wishExpenses,
-		"wish_expense_ratio": wishRatio,
-		"categories":         categories,
+		"total_income":        totalIncome,
+		"total_expense":       totalExpense,
+		"balance":             totalIncome - totalExpense,
+		"wish_expenses":       wishExpenses,
+		"wish_expense_ratio":  wishRatio,
+		"wish_spending_ratio": wishRatio * 100.0,
+		"categories":          categories,
 	}
 
 	// 访客模式财务隐私严格脱敏 (BE-14)
@@ -185,22 +193,54 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			fulfilledWishes[i].GearID = nil
 		}
 		finSpectrum = gin.H{
-			"total_income":       0,
-			"total_expense":      0,
-			"balance":            0,
-			"wish_expenses":      0,
-			"wish_expense_ratio": 0.0,
-			"categories":         []catItem{},
+			"total_income":        0,
+			"total_expense":       0,
+			"balance":             0,
+			"wish_expenses":       0,
+			"wish_expense_ratio":  0.0,
+			"wish_spending_ratio": 0.0,
+			"categories":          []catItem{},
 		}
 	}
 
-	// 组装年鉴信封
-	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d"`, year, len(entries), len(txs))
+	// 组装年鉴信封 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17)
+	role := "guest"
+	if isAdmin {
+		role = "admin"
+	}
+	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%s"`, year, len(entries), len(txs), role)
 	c.Header("ETag", etag)
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
 		return
+	}
+
+	atlasPayload := gin.H{
+		"total_cities":   len(citiesVisited),
+		"cities":         citiesVisited,
+		"cities_visited": citiesVisited,
+		"footprints":     footprints,
+	}
+	wishesPayload := gin.H{
+		"fulfilled_wishes":   fulfilledWishes,
+		"wishes":             fulfilledWishes,
+		"fulfilled_count":    len(fulfilledWishes),
+		"total_wish_budget":  totalWishBudget,
+		"total_budget":       totalWishBudget,
+		"total_wish_actual":  totalWishActual,
+		"total_actual":       totalWishActual,
+		"wanting_wish_count": wantingWishCount,
+		"wanting_count":      wantingWishCount,
+	}
+	highlightsPayload := gin.H{
+		"spring":       springHighlight,
+		"summer":       summerHighlight,
+		"autumn":       autumnHighlight,
+		"winter":       winterHighlight,
+		"film_gallery": filmGallery,
+		"photos":       filmGallery,
 	}
 
 	Success(c, gin.H{
@@ -209,29 +249,20 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"total_entries":    len(entries),
 			"total_words":      totalWords,
 			"active_days":      len(distinctDays),
+			"distinct_days":    len(distinctDays),
 			"first_date":       firstDateStr,
 			"last_date":        lastDateStr,
 			"wishes_fulfilled": len(fulfilledWishes),
 			"cities_visited":   len(citiesVisited),
 			"tx_count":         txCount,
 		},
-		"atlas_journey": gin.H{
-			"footprints":     footprints,
-			"cities_visited": citiesVisited,
-		},
-		"wishes_milestones": gin.H{
-			"fulfilled_wishes":   fulfilledWishes,
-			"total_wish_budget":  totalWishBudget,
-			"total_wish_actual":  totalWishActual,
-			"wanting_wish_count": wantingWishCount,
-		},
-		"life_highlights": gin.H{
-			"spring":       springHighlight,
-			"summer":       summerHighlight,
-			"autumn":       autumnHighlight,
-			"winter":       winterHighlight,
-			"film_gallery": filmGallery,
-		},
+		"atlas_journey":      atlasPayload,
+		"atlas":              atlasPayload,
+		"wishes_milestones":  wishesPayload,
+		"wishes":             wishesPayload,
+		"life_highlights":    highlightsPayload,
+		"highlights":         highlightsPayload,
 		"financial_spectrum": finSpectrum,
+		"finances":           finSpectrum,
 	})
 }

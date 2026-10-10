@@ -406,6 +406,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		}
 	}
 
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 	Success(c, gin.H{
 		"city_code": cityCode,
 		"city_name": cityName,

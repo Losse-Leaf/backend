@@ -1,6 +1,11 @@
 package handlers
 
 import (
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -23,6 +28,8 @@ type FileUploadResult struct {
 	Filename         string `json:"filename"`          // 原始文件名
 	MimeType         string `json:"mime_type"`         // 检测出的媒体 MIME 类型
 	Size             int64  `json:"size"`              // 文件物理大小 (字节)
+	Width            int    `json:"width,omitempty"`   // 图片宽度 (像素)
+	Height           int    `json:"height,omitempty"`  // 图片高度 (像素)
 	AttachmentID     uint   `json:"attachment_id"`     // 已持久化的关联附件 ID (便于 LifeEntry 快速关联)
 }
 
@@ -65,6 +72,16 @@ func UnifiedUploadFile(c *gin.Context) {
 	}
 	defer srcFile.Close()
 
+	// 尝试解析图片宽高尺寸 (RC-14)
+	var width, height int
+	if imgCfg, _, err := image.DecodeConfig(srcFile); err == nil {
+		width = imgCfg.Width
+		height = imgCfg.Height
+	}
+	if seeker, ok := srcFile.(io.Seeker); ok {
+		_, _ = seeker.Seek(0, io.SeekStart)
+	}
+
 	// MIME 探测
 	contentType := fileHeader.Header.Get("Content-Type")
 	if contentType == "" || contentType == "application/octet-stream" {
@@ -91,8 +108,13 @@ func UnifiedUploadFile(c *gin.Context) {
 		OriginalFilename: fileHeader.Filename,
 		MimeType:         contentType,
 		Size:             fileHeader.Size,
+		Width:            width,
+		Height:           height,
 	}
 	db.DB.Where(models.Attachment{ObjectKey: objectKey}).FirstOrCreate(&att)
+	if (att.Width == 0 || att.Height == 0) && (width > 0 && height > 0) {
+		db.DB.Model(&att).Updates(map[string]interface{}{"width": width, "height": height})
+	}
 
 	Success(c, FileUploadResult{
 		ObjectKey:    objectKey,
@@ -101,6 +123,8 @@ func UnifiedUploadFile(c *gin.Context) {
 		Filename:     fileHeader.Filename,
 		MimeType:     contentType,
 		Size:         fileHeader.Size,
+		Width:        width,
+		Height:       height,
 		AttachmentID: att.ID,
 	})
 }

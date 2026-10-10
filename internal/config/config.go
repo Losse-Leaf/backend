@@ -57,12 +57,14 @@ func loadDotEnv() {
 	}
 }
 
+const DefaultDBPath = "data/chimu.db"
+
 func LoadConfig() Config {
 	loadDotEnv()
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = "data/chimu.db"
+		dbPath = DefaultDBPath
 	}
 
 	port := os.Getenv("PORT")

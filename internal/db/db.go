@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"chimu-lab/internal/config"
 	"chimu-lab/internal/models"
 
 	"github.com/glebarez/sqlite"
@@ -19,7 +20,7 @@ var DB *gorm.DB
 // InitDB 初始化 SQLite 数据库
 func InitDB(dbPath string) (*gorm.DB, error) {
 	if dbPath == "" {
-		dbPath = "data/chimu.db"
+		dbPath = config.DefaultDBPath
 	}
 
 	dir := filepath.Dir(dbPath)
@@ -485,23 +486,7 @@ func seedData(database *gorm.DB) {
 		}
 	}
 
-	// 4. 回填历史数据中缺失的 OccurredAt 字段
-	var zeroEntries []models.LifeEntry
-	database.Where("occurred_at = ? OR occurred_at IS NULL", time.Time{}).Find(&zeroEntries)
-	for _, ze := range zeroEntries {
-		if ze.Date != "" {
-			tStr := ze.Time
-			if tStr == "" {
-				tStr = "12:00"
-			}
-			parsed, err := time.Parse("2006.01.02 15:04", ze.Date+" "+tStr)
-			if err == nil {
-				database.Model(&ze).Update("occurred_at", parsed)
-			}
-		}
-	}
-
-	// 5. 初始化基础记账记录 (Transactions)
+	// 4. 初始化基础记账记录 (Transactions)
 	var txCount int64
 	database.Model(&models.Transaction{}).Count(&txCount)
 	if txCount == 0 {
@@ -569,36 +554,9 @@ func seedData(database *gorm.DB) {
 			Initialized:     true,
 		}
 		database.Create(&config)
-	} else {
-		// 平滑迁移旧配置字段：彻底净化 ChiMu 与生硬的拼凑字样
-		var existingCfg models.SiteConfig
-		if err := database.First(&existingCfg).Error; err == nil {
-			updates := map[string]interface{}{}
-			if existingCfg.SiteSubtitle == "" || strings.Contains(existingCfg.SiteSubtitle, "档案馆") || strings.Contains(existingCfg.SiteSubtitle, "ChiMu") {
-				updates["site_subtitle"] = "时光手账与生活档案 · 记录真实可感的日子"
-			}
-			if strings.Contains(existingCfg.SiteName, "ChiMu") || strings.Contains(existingCfg.SiteName, "档案馆") {
-				updates["site_name"] = "散页 · 时光手账与生活档案"
-			}
-			if existingCfg.CuratorName == "" {
-				updates["curator_name"] = "迟暮"
-			}
-			if existingCfg.CuratorEn != "" {
-				updates["curator_en"] = ""
-			}
-			if existingCfg.DefaultLocation == "" {
-				updates["default_location"] = "中国 · 杭州"
-			}
-			if !existingCfg.Initialized {
-				updates["initialized"] = true
-			}
-			if len(updates) > 0 {
-				database.Model(&existingCfg).Updates(updates)
-			}
-		}
 	}
 
-	// 7. 初始化主理人身份中枢 (Curator Profile)
+	// 6. 初始化主理人身份中枢 (Curator Profile)
 	var profileCount int64
 	database.Model(&models.CuratorProfile{}).Count(&profileCount)
 	if profileCount == 0 {

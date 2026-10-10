@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -181,42 +180,8 @@ func main() {
 	_ = os.MkdirAll(uploadsDir, 0755)
 	r.Static("/media", uploadsDir)
 
-	// 8. 前端静态文件托管（支持从根目录或 backend 目录下直接启动）
-	distDir := "web/dist"
-	if stat, err := os.Stat(distDir); err != nil || !stat.IsDir() {
-		if statUp, errUp := os.Stat("../web/dist"); errUp == nil && statUp.IsDir() {
-			distDir = "../web/dist"
-		}
-	}
-
-	if stat, err := os.Stat(distDir); err == nil && stat.IsDir() {
-		assetsDir := filepath.Join(distDir, "assets")
-		r.GET("/assets/*filepath", func(c *gin.Context) {
-			c.Header("Cache-Control", "public, max-age=31536000, immutable")
-			c.FileFromFS(c.Param("filepath"), http.Dir(assetsDir))
-		})
-		r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
-		r.StaticFile("/favicon.svg", filepath.Join(distDir, "favicon.svg"))
-		r.StaticFile("/icons.svg", filepath.Join(distDir, "icons.svg"))
-		r.StaticFile("/robots.txt", filepath.Join(distDir, "robots.txt"))
-
-		// SPA 单页应用回退到 index.html (带 no-cache 响应头，确保前端发版即时生效 BE-01)
-		r.NoRoute(func(c *gin.Context) {
-			if strings.HasPrefix(c.Request.URL.Path, "/api/") {
-				c.JSON(http.StatusNotFound, gin.H{"code": 404, "message": "API endpoint not found"})
-				return
-			}
-			c.Header("Cache-Control", "no-cache")
-			c.File(filepath.Join(distDir, "index.html"))
-		})
-		log.Printf("Serving frontend from %s", distDir)
-	} else {
-		r.NoRoute(func(c *gin.Context) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"message": "Loose-Leaf API service is running. Web frontend dist not found, build it via 'cd web && npm run build'.",
-			})
-		})
-	}
+	// 8. 前端静态文件托管（支持 //go:embed 单二进制内嵌与本地磁盘双模，docs/ecosystem.md §10.4）
+	setupFrontendStaticServing(r)
 
 	port := cfg.Port
 	srv := &http.Server{

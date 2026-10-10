@@ -1,0 +1,118 @@
+name: Single Binary Embed & Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Embedded Single Binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Backend Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Set up Node.js (for Fallback Frontend Build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 步骤 1 & 2：拉取 Web 展厅构建包并解压至 web/dist (docs/ecosystem.md §10.4)
+      - name: Prepare Frontend Web Distribution
+        run: |
+          mkdir -p web/dist
+          TAG_NAME="${{ github.ref_name }}"
+          DOWNLOAD_URL="https://github.com/Losse-Leaf/web/releases/download/${TAG_NAME}/web-dist.tar.gz"
+          LATEST_URL="https://github.com/Losse-Leaf/web/releases/latest/download/web-dist.tar.gz"
+
+          echo "Attempting to download web-dist.tar.gz from: ${DOWNLOAD_URL}"
+          if curl -sL --fail -o web-dist.tar.gz "${DOWNLOAD_URL}"; then
+            echo "Successfully downloaded tag asset ${TAG_NAME}"
+            tar -xzf web-dist.tar.gz -C web/dist
+          elif curl -sL --fail -o web-dist.tar.gz "${LATEST_URL}"; then
+            echo "Downloaded latest web release asset as fallback"
+            tar -xzf web-dist.tar.gz -C web/dist
+          else
+            echo "Release asset not found on GitHub. Falling back to cloning and building web repository..."
+            git clone --depth 1 https://github.com/Losse-Leaf/web.git /tmp/web-repo
+            cd /tmp/web-repo
+            npm ci || npm install
+            npm run build
+            cp -r dist/* ${{ github.workspace }}/web/dist/
+            cd ${{ github.workspace }}
+          fi
+
+          if [ ! -f "web/dist/index.html" ]; then
+            echo "Error: web/dist/index.html was not generated!"
+            exit 1
+          fi
+          echo "Frontend dist successfully staged in web/dist/ (size: $(du -sh web/dist | cut -f1))"
+
+      # 步骤 3：Go 编译器通过 //go:embed web/dist/* 内嵌静态展厅，产出跨平台单二进制文件
+      - name: Cross-Compile Single Binaries
+        run: |
+          mkdir -p release-dist
+          LDFLAGS="-s -w"
+
+          # Linux amd64 & arm64
+          echo "Building Linux amd64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-linux-amd64 .
+          echo "Building Linux arm64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-linux-arm64 .
+
+          # macOS (Darwin) amd64 & arm64 (Apple Silicon)
+          echo "Building macOS amd64..."
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-darwin-amd64 .
+          echo "Building macOS arm64..."
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-darwin-arm64 .
+
+          # Windows amd64
+          echo "Building Windows amd64..."
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o release-dist/looseleaf-windows-amd64.exe .
+
+          # 计算 SHA-256 校验和
+          cd release-dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Loose Leaf Single Binary Release ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            release-dist/looseleaf-linux-amd64
+            release-dist/looseleaf-linux-arm64
+            release-dist/looseleaf-darwin-amd64
+            release-dist/looseleaf-darwin-arm64
+            release-dist/looseleaf-windows-amd64.exe
+            release-dist/checksums.txt
+          body: |
+            ## 《散页》（Loose Leaf）单二进制全功能分发包
+
+            无需 Docker，无需 Node.js 环境，下载单个可执行文件赋予执行权限即可开箱运行！
+
+            ### 产物特性
+            - **全功能内嵌**：Go 原生内嵌完整 Web 前端展厅与管理后台 (`//go:embed web/dist/*`)；
+            - **纯 Go 零依赖**：基于纯 Go SQLite (`glebarez/sqlite`) 编译，彻底告别 glibc / CGO 动态库依赖；
+            - **零配置启动**：支持 SQLite 自动建表与 WAL 高并发优化，开箱即用。
+
+            ### 快速运行指南 (以 Linux 为例)
+            ```bash
+            chmod +x looseleaf-linux-amd64
+            ./looseleaf-linux-amd64
+            ```
+            打开浏览器访问 `http://localhost:8088` 即可开启首次装帧或浏览生活档案。

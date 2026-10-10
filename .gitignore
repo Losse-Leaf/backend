@@ -23,3 +23,7 @@ data/
 # macOS & OS artifacts
 .DS_Store
 Thumbs.db
+
+# Embedded web frontend distribution build assets
+web/dist/*
+!web/dist/.gitkeep

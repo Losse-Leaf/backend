@@ -686,12 +686,10 @@ func DeleteTransaction(c *gin.Context) {
 // ==========================================
 
 type ProjectRequest struct {
-	Title       string `json:"title"`
-	Name        string `json:"name"` // 兼容入参
+	Title       string `json:"title" binding:"required"`
 	Subtitle    string `json:"subtitle"`
 	Description string `json:"description"`
 	Story       string `json:"story"`
-	Content     string `json:"content"` // 兼容入参
 	Category    string `json:"category"`
 	Tags        string `json:"tags"`
 	GithubURL   string `json:"github_url"`
@@ -703,29 +701,21 @@ type ProjectRequest struct {
 func CreateProject(c *gin.Context) {
 	var req ProjectRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "请求参数无效")
+		Error(c, http.StatusBadRequest, "项目标题必填且格式有效")
 		return
 	}
 
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
-		title = strings.TrimSpace(req.Name)
-	}
-	if title == "" {
 		Error(c, http.StatusBadRequest, "项目标题必填")
 		return
-	}
-
-	story := strings.TrimSpace(req.Story)
-	if story == "" {
-		story = strings.TrimSpace(req.Content)
 	}
 
 	p := models.Project{
 		Title:       title,
 		Subtitle:    strings.TrimSpace(req.Subtitle),
 		Description: strings.TrimSpace(req.Description),
-		Story:       story,
+		Story:       strings.TrimSpace(req.Story),
 		Category:    strings.TrimSpace(req.Category),
 		Tags:        strings.TrimSpace(req.Tags),
 		GithubURL:   strings.TrimSpace(req.GithubURL),
@@ -791,9 +781,6 @@ func UpdateProject(c *gin.Context) {
 	}
 
 	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		title = strings.TrimSpace(req.Name)
-	}
 	if title != "" {
 		p.Title = title
 	}
@@ -804,9 +791,6 @@ func UpdateProject(c *gin.Context) {
 		p.Description = strings.TrimSpace(req.Description)
 	}
 	story := strings.TrimSpace(req.Story)
-	if story == "" {
-		story = strings.TrimSpace(req.Content)
-	}
 	if story != "" {
 		p.Story = story
 	}

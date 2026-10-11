@@ -309,7 +309,6 @@ func UpdateWish(c *gin.Context) {
 			Content:    entryContent,
 			OccurredAt: fulfilledTime,
 			Location:   wish.CityName,
-			Tags:       "#心愿达成",
 			CityCode:   wish.CityCode,
 			CityName:   wish.CityName,
 		}
@@ -402,7 +401,6 @@ func ResolveWish(c *gin.Context) {
 					Title:      "理性拔草 · " + wish.Title,
 					Content:    content,
 					OccurredAt: fulfilledAt,
-					Tags:       "#心愿释怀",
 					CityCode:   wish.CityCode,
 					CityName:   wish.CityName,
 				}
@@ -527,7 +525,6 @@ func ResolveWish(c *gin.Context) {
 				Content:    content,
 				OccurredAt: fulfilledAt,
 				Location:   wish.CityName,
-				Tags:       "#心愿达成",
 				CityCode:   wish.CityCode,
 				CityName:   wish.CityName,
 			}

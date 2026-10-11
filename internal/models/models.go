@@ -20,7 +20,6 @@ type LifeEntry struct {
 	Attachments []Attachment `gorm:"-" json:"attachments"`       // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
 
 	Meta     string `json:"meta,omitempty"`
-	Tags     string `json:"tags,omitempty"`
 	Link     string `json:"link,omitempty"`
 	Featured bool   `json:"featured,omitempty"`
 	CityCode string `gorm:"size:12;index" json:"city_code,omitempty"`
@@ -55,7 +54,6 @@ type Project struct {
 	Description string         `json:"description"`
 	Story       string         `gorm:"type:text" json:"story,omitempty"`
 	Category    string         `json:"category,omitempty"`
-	Tags        string         `json:"tags,omitempty"`
 	GithubURL   string         `json:"github_url,omitempty"`
 	Status      string         `json:"status,omitempty"`
 	Featured    bool           `json:"featured,omitempty"`

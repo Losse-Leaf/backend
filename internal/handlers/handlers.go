@@ -111,7 +111,6 @@ type CreateEntryRequest struct {
 	Content       string `json:"content" binding:"required"`
 	OccurredAt    string `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
 	Location      string `json:"location"`
-	Tags          string `json:"tags"`
 	Meta          string `json:"meta"`
 	Link          string `json:"link"`
 	Featured      bool   `json:"featured"`
@@ -162,9 +161,6 @@ func CreateLifeEntry(c *gin.Context) {
 				if location != "" {
 					existing.Location = location
 				}
-				if t := strings.TrimSpace(req.Tags); t != "" {
-					existing.Tags = t
-				}
 				if m := strings.TrimSpace(req.Meta); m != "" {
 					existing.Meta = m
 				}
@@ -198,7 +194,6 @@ func CreateLifeEntry(c *gin.Context) {
 		Content:    content,
 		OccurredAt: occurred,
 		Location:   location,
-		Tags:       strings.TrimSpace(req.Tags),
 		Meta:       strings.TrimSpace(req.Meta),
 		Link:       strings.TrimSpace(req.Link),
 		Featured:   req.Featured,
@@ -357,7 +352,6 @@ type UpdateEntryRequest struct {
 	Content       string `json:"content"`
 	OccurredAt    string `json:"occurred_at"`
 	Location      string `json:"location"`
-	Tags          string `json:"tags"`
 	Meta          string `json:"meta"`
 	Link          string `json:"link"`
 	Featured      *bool  `json:"featured"`
@@ -393,9 +387,6 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 	if req.Location != "" {
 		entry.Location = strings.TrimSpace(req.Location)
-	}
-	if req.Tags != "" {
-		entry.Tags = strings.TrimSpace(req.Tags)
 	}
 	if req.Meta != "" {
 		entry.Meta = strings.TrimSpace(req.Meta)
@@ -991,7 +982,6 @@ type ProjectRequest struct {
 	Description string `json:"description"`
 	Story       string `json:"story"`
 	Category    string `json:"category"`
-	Tags        string `json:"tags"`
 	GithubURL   string `json:"github_url"`
 	Status      string `json:"status"`
 	Featured    bool   `json:"featured"`
@@ -1017,7 +1007,6 @@ func CreateProject(c *gin.Context) {
 		Description: strings.TrimSpace(req.Description),
 		Story:       strings.TrimSpace(req.Story),
 		Category:    strings.TrimSpace(req.Category),
-		Tags:        strings.TrimSpace(req.Tags),
 		GithubURL:   strings.TrimSpace(req.GithubURL),
 		Status:      strings.TrimSpace(req.Status),
 		Featured:    req.Featured,
@@ -1043,16 +1032,11 @@ func CreateProject(c *gin.Context) {
 	if entryContent == "" {
 		entryContent = fmt.Sprintf("立项开启造物项目「%s」。", p.Title)
 	}
-	entryTags := p.Tags
-	if entryTags == "" {
-		entryTags = p.Category
-	}
 	companionEntry := models.LifeEntry{
 		Type:       "project",
 		Title:      p.Title,
 		Content:    entryContent,
 		OccurredAt: time.Now(),
-		Tags:       entryTags,
 		Link:       p.GithubURL,
 		Featured:   p.Featured,
 		ProjectID:  &p.ID,
@@ -1146,7 +1130,6 @@ type ProjectUpdateRequest struct {
 	Description *string `json:"description"`
 	Story       *string `json:"story"`
 	Category    *string `json:"category"`
-	Tags        *string `json:"tags"`
 	GithubURL   *string `json:"github_url"`
 	Status      *string `json:"status"`
 	Featured    *bool   `json:"featured"`
@@ -1190,9 +1173,6 @@ func UpdateProject(c *gin.Context) {
 	if req.Category != nil {
 		p.Category = strings.TrimSpace(*req.Category)
 	}
-	if req.Tags != nil {
-		p.Tags = strings.TrimSpace(*req.Tags)
-	}
 	if req.GithubURL != nil {
 		p.GithubURL = strings.TrimSpace(*req.GithubURL)
 	}
@@ -1230,16 +1210,11 @@ func UpdateProject(c *gin.Context) {
 				entryContent = fmt.Sprintf("造物项目「%s」进展更新，当前状态：%s。", p.Title, p.Status)
 			}
 		}
-		entryTags := p.Tags
-		if entryTags == "" {
-			entryTags = p.Category
-		}
 		progressEntry := models.LifeEntry{
 			Type:       "project",
 			Title:      entryTitle,
 			Content:    entryContent,
 			OccurredAt: time.Now(),
-			Tags:       entryTags,
 			Link:       p.GithubURL,
 			ProjectID:  &p.ID,
 		}

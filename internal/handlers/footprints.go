@@ -294,7 +294,6 @@ func CreateFootprint(c *gin.Context) {
 			Location:   cityName,
 			CityCode:   cityCode,
 			CityName:   cityName,
-			Tags:       "足迹,行旅",
 		}
 		if err := db.DB.Create(&companionEntry).Error; err == nil && companionEntry.ID > 0 {
 			lifeEntryID = &companionEntry.ID

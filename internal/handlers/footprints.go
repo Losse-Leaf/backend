@@ -26,6 +26,7 @@ func populateFootprintURLs(f *models.Footprint) {
 type CreateFootprintRequest struct {
 	CityCode      string `json:"city_code" binding:"required"`
 	CityName      string `json:"city_name" binding:"required"`
+	Title         string `json:"title"`
 	VisitedAt     string `json:"visited_at" binding:"required"`
 	Note          string `json:"note"`
 	LifeEntryID   *uint  `json:"life_entry_id"`
@@ -44,8 +45,87 @@ type UpdateFootprintRequest struct {
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
+// syncFootprintFromLifeEntry 主流自然下渗：当一级记录 (LifeEntry) 带有 city_code 时，自动创建或同步更新对应的足迹 (Footprint)
+func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint) {
+	if entry == nil || entry.ID == 0 {
+		return
+	}
+	cityCode := strings.TrimSpace(entry.CityCode)
+	if cityCode == "" || entry.Type == "reflection" {
+		return
+	}
+
+	cityName := strings.TrimSpace(entry.CityName)
+	if cityName == "" {
+		cityName = strings.TrimSpace(entry.Location)
+	}
+	if cityName == "" {
+		cityName = cityCode
+	}
+
+	noteText := strings.TrimSpace(entry.Content)
+	if noteText == "" {
+		noteText = strings.TrimSpace(entry.Title)
+	}
+
+	visitedAt := entry.OccurredAt
+	if visitedAt.IsZero() {
+		visitedAt = time.Now()
+	}
+
+	var fp models.Footprint
+	err := db.DB.Where("life_entry_id = ?", entry.ID).Limit(1).Find(&fp).Error
+	if err == nil && fp.ID > 0 {
+		fp.CityCode = cityCode
+		fp.CityName = cityName
+		fp.VisitedAt = visitedAt
+		if noteText != "" {
+			fp.Note = noteText
+		}
+		_ = db.DB.Save(&fp).Error
+	} else {
+		fp = models.Footprint{
+			CityCode:    cityCode,
+			CityName:    cityName,
+			VisitedAt:   visitedAt,
+			Note:        noteText,
+			LifeEntryID: &entry.ID,
+		}
+		_ = db.DB.Create(&fp).Error
+	}
+
+	if fp.ID > 0 {
+		if len(attachmentIDs) > 0 {
+			db.DB.Model(&models.Attachment{}).
+				Where("id IN ?", attachmentIDs).
+				Update("footprint_id", fp.ID)
+		} else {
+			db.DB.Model(&models.Attachment{}).
+				Where("entry_id = ? AND (footprint_id IS NULL OR footprint_id = 0)", entry.ID).
+				Update("footprint_id", fp.ID)
+		}
+	}
+}
+
+// ensureEntryFootprintsSynced 确保所有带 city_code 的一级记录均已自然下渗生成对应足迹记录
+func ensureEntryFootprintsSynced() {
+	if db.DB == nil {
+		return
+	}
+	var unlinkedEntries []models.LifeEntry
+	db.DB.Where("city_code != '' AND city_code IS NOT NULL AND type != 'reflection'").
+		Where("id NOT IN (SELECT life_entry_id FROM footprints WHERE life_entry_id IS NOT NULL AND deleted_at IS NULL)").
+		Find(&unlinkedEntries)
+
+	for i := range unlinkedEntries {
+		syncFootprintFromLifeEntry(&unlinkedEntries[i], nil)
+	}
+}
+
 // GetFootprints 列表查询足迹记录 (支持 city_code, year, since, ETag)
 func GetFootprints(c *gin.Context) {
+	ensureEntryFootprintsSynced()
+
 	cityCode := c.Query("city_code")
 	yearStr := c.Query("year")
 	sinceStr := c.Query("since")
@@ -119,7 +199,7 @@ func GetFootprintByID(c *gin.Context) {
 	Success(c, f)
 }
 
-// CreateFootprint 录入足迹 (需管理员权限)
+// CreateFootprint 录入足迹，并自动伴生创建对应日期的一级记录写入主时间流 (Record-First Architecture)
 func CreateFootprint(c *gin.Context) {
 	var req CreateFootprintRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -132,12 +212,90 @@ func CreateFootprint(c *gin.Context) {
 		visited = time.Now()
 	}
 
+	cityCode := strings.TrimSpace(req.CityCode)
+	cityName := strings.TrimSpace(req.CityName)
+	note := strings.TrimSpace(req.Note)
+	lifeEntryID := req.LifeEntryID
+
+	// 若调用方已传入关联的 LifeEntryID，检查是否已由主流下渗自动生成过对应足迹，避免重复
+	if lifeEntryID != nil && *lifeEntryID > 0 {
+		var entry models.LifeEntry
+		if err := db.DB.Limit(1).Find(&entry, *lifeEntryID).Error; err == nil && entry.ID > 0 {
+			updated := false
+			if entry.CityCode == "" {
+				entry.CityCode = cityCode
+				updated = true
+			}
+			if entry.CityName == "" {
+				entry.CityName = cityName
+				updated = true
+			}
+			if entry.Location == "" {
+				entry.Location = cityName
+				updated = true
+			}
+			if updated {
+				_ = db.DB.Save(&entry).Error
+			}
+		}
+
+		var existingFP models.Footprint
+		if err := db.DB.Where("life_entry_id = ?", *lifeEntryID).Limit(1).Find(&existingFP).Error; err == nil && existingFP.ID > 0 {
+			existingFP.CityCode = cityCode
+			existingFP.CityName = cityName
+			existingFP.VisitedAt = visited
+			if note != "" {
+				existingFP.Note = note
+			}
+			if req.WishID != nil {
+				existingFP.WishID = req.WishID
+			}
+			_ = db.DB.Save(&existingFP).Error
+			if len(req.AttachmentIDs) > 0 {
+				db.DB.Model(&models.Attachment{}).
+					Where("id IN ?", req.AttachmentIDs).
+					Updates(map[string]interface{}{
+						"footprint_id": existingFP.ID,
+						"entry_id":     *lifeEntryID,
+					})
+			}
+			db.DB.Preload("Attachments").First(&existingFP, existingFP.ID)
+			populateFootprintURLs(&existingFP)
+			InvalidateStatsCache()
+			Success(c, existingFP)
+			return
+		}
+	} else {
+		// 伴生创建机制：从足迹入口直接录入时，自动伴生创建一条一级记录 (LifeEntry) 写入主时间流
+		entryTitle := strings.TrimSpace(req.Title)
+		if entryTitle == "" {
+			entryTitle = fmt.Sprintf("行迹 · %s", cityName)
+		}
+		entryContent := note
+		if entryContent == "" {
+			entryContent = fmt.Sprintf("踏足%s，在山川图谱中留下一枚足迹印信。", cityName)
+		}
+		companionEntry := models.LifeEntry{
+			Type:       "life",
+			Title:      entryTitle,
+			Content:    entryContent,
+			OccurredAt: visited,
+			Location:   cityName,
+			CityCode:   cityCode,
+			CityName:   cityName,
+			Tags:       "足迹,行旅",
+		}
+		if err := db.DB.Create(&companionEntry).Error; err == nil && companionEntry.ID > 0 {
+			lifeEntryID = &companionEntry.ID
+		}
+	}
+
 	footprint := models.Footprint{
-		CityCode:    strings.TrimSpace(req.CityCode),
-		CityName:    strings.TrimSpace(req.CityName),
+		CityCode:    cityCode,
+		CityName:    cityName,
 		VisitedAt:   visited,
-		Note:        strings.TrimSpace(req.Note),
-		LifeEntryID: req.LifeEntryID,
+		Note:        note,
+		LifeEntryID: lifeEntryID,
 		WishID:      req.WishID,
 	}
 
@@ -147,18 +305,25 @@ func CreateFootprint(c *gin.Context) {
 	}
 
 	if len(req.AttachmentIDs) > 0 {
+		updates := map[string]interface{}{
+			"footprint_id": footprint.ID,
+		}
+		if lifeEntryID != nil && *lifeEntryID > 0 {
+			updates["entry_id"] = *lifeEntryID
+		}
 		db.DB.Model(&models.Attachment{}).
 			Where("id IN ?", req.AttachmentIDs).
-			Update("footprint_id", footprint.ID)
+			Updates(updates)
 	}
 
 	db.DB.Preload("Attachments").First(&footprint, footprint.ID)
 	populateFootprintURLs(&footprint)
+	InvalidateStatsCache()
 
 	Success(c, footprint)
 }
 
-// UpdateFootprint 修改足迹
+// UpdateFootprint 修改足迹并同步更新伴生的一级记录
 func UpdateFootprint(c *gin.Context) {
 	id := c.Param("id")
 	var footprint models.Footprint
@@ -187,12 +352,31 @@ func UpdateFootprint(c *gin.Context) {
 	if req.Note != "" {
 		footprint.Note = strings.TrimSpace(req.Note)
 	}
-	footprint.LifeEntryID = req.LifeEntryID
-	footprint.WishID = req.WishID
+	if req.LifeEntryID != nil {
+		footprint.LifeEntryID = req.LifeEntryID
+	}
+	if req.WishID != nil {
+		footprint.WishID = req.WishID
+	}
 
 	if err := db.DB.Save(&footprint).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新足迹失败")
 		return
+	}
+
+	// 同步更新伴生的一级记录 (LifeEntry)
+	if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
+		var entry models.LifeEntry
+		if err := db.DB.First(&entry, *footprint.LifeEntryID).Error; err == nil {
+			entry.CityCode = footprint.CityCode
+			entry.CityName = footprint.CityName
+			entry.Location = footprint.CityName
+			entry.OccurredAt = footprint.VisitedAt
+			if req.Note != "" {
+				entry.Content = footprint.Note
+			}
+			_ = db.DB.Save(&entry).Error
+		}
 	}
 
 	if req.AttachmentIDs != nil {
@@ -201,14 +385,21 @@ func UpdateFootprint(c *gin.Context) {
 			Update("footprint_id", nil)
 
 		if len(req.AttachmentIDs) > 0 {
+			updates := map[string]interface{}{
+				"footprint_id": footprint.ID,
+			}
+			if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
+				updates["entry_id"] = *footprint.LifeEntryID
+			}
 			db.DB.Model(&models.Attachment{}).
 				Where("id IN ?", req.AttachmentIDs).
-				Update("footprint_id", footprint.ID)
+				Updates(updates)
 		}
 	}
 
 	db.DB.Preload("Attachments").First(&footprint, footprint.ID)
 	populateFootprintURLs(&footprint)
+	InvalidateStatsCache()
 
 	Success(c, footprint)
 }
@@ -251,6 +442,8 @@ type AtlasCitySummary struct {
 
 // GetFootprintsAtlas 获取全国足迹汇总 (按市级汇总去过的城市、次数与首次/最近日期)
 func GetFootprintsAtlas(c *gin.Context) {
+	ensureEntryFootprintsSynced()
+
 	var footprints []models.Footprint
 	db.DB.Order("visited_at ASC").Find(&footprints)
 
@@ -371,6 +564,8 @@ func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction
 
 // GetCityMemoryDrawer 城市回忆抽屉聚合接口 (RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 城市账单光谱)
 func GetCityMemoryDrawer(c *gin.Context) {
+	ensureEntryFootprintsSynced()
+
 	cityCode := strings.TrimSpace(c.Param("city_code"))
 	if cityCode == "" {
 		Error(c, http.StatusBadRequest, "城市代码必填")
@@ -520,6 +715,8 @@ var ProvinceShortNameMap = map[string]string{
 
 // GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91 / RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
 func GetProvinceMemoryDrawer(c *gin.Context) {
+	ensureEntryFootprintsSynced()
+
 	adcode := strings.TrimSpace(c.Param("adcode"))
 	if len(adcode) < 2 {
 		Error(c, http.StatusBadRequest, "省份行政代码格式无效")

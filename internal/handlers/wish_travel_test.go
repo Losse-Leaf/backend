@@ -201,4 +201,128 @@ func TestWishAndTravelModules(t *testing.T) {
 			t.Fatalf("expected at least 1 fulfilled wish in almanac")
 		}
 	})
+
+	// 4. Record-First Architecture: Companion Creation & Natural Infiltration (docs/wishlist-travel.md §6 & §11)
+	t.Run("Record-First Companion Creation and Natural Infiltration", func(t *testing.T) {
+		r.POST("/api/v1/entries", CreateLifeEntry)
+		r.PUT("/api/v1/entries/:id", UpdateLifeEntry)
+		r.GET("/api/v1/entries", GetLifeEntriesV1)
+		r.POST("/api/v1/projects", CreateProject)
+		r.PUT("/api/v1/projects/:id", UpdateProject)
+		r.GET("/api/v1/projects/:id", GetProjectByID)
+
+		// (a) 2.1 足迹录入伴生写入时间流：录入雅安足迹 (511800) 自动伴生创建 LifeEntry
+		fpYaan := CreateFootprintRequest{
+			CityCode:  "511800",
+			CityName:  "雅安市",
+			VisitedAt: "2026-10-11 09:30:00",
+			Note:      "碧峰峡看大熊猫，蒙顶山品秋茶",
+		}
+		fpBody, _ := json.Marshal(fpYaan)
+		wFP := httptest.NewRecorder()
+		reqFP, _ := http.NewRequest(http.MethodPost, "/api/v1/footprints", bytes.NewBuffer(fpBody))
+		reqFP.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wFP, reqFP)
+		if wFP.Code != http.StatusOK {
+			t.Fatalf("expected 200 creating footprint, got %d: %s", wFP.Code, wFP.Body.String())
+		}
+		var fpResp struct {
+			Data struct {
+				ID          uint  `json:"id"`
+				LifeEntryID *uint `json:"life_entry_id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wFP.Body.Bytes(), &fpResp)
+		if fpResp.Data.LifeEntryID == nil || *fpResp.Data.LifeEntryID == 0 {
+			t.Fatalf("expected CreateFootprint to automatically create companion LifeEntry and populate life_entry_id")
+		}
+
+		// (b) 2.2 造物流水伴生写入时间流：新建造物 & 更新进展自动伴生创建 LifeEntry
+		projCreate := ProjectRequest{
+			Title:       "手工胡桃木托盘",
+			Description: "打磨一块温润的桌面置物木盘",
+			Category:    "手艺造物",
+			Status:      "Active",
+		}
+		projBody, _ := json.Marshal(projCreate)
+		wProj := httptest.NewRecorder()
+		reqProj, _ := http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(projBody))
+		reqProj.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wProj, reqProj)
+		if wProj.Code != http.StatusOK {
+			t.Fatalf("expected 200 creating project, got %d", wProj.Code)
+		}
+		var projResp struct {
+			Data struct {
+				ID uint `json:"id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wProj.Body.Bytes(), &projResp)
+
+		// 更新造物进展手记 (story)
+		newStory := "今日完成木蜡油第二遍涂装，纹理愈发清晰。"
+		updProjBody, _ := json.Marshal(map[string]interface{}{
+			"story": newStory,
+		})
+		wProjUpd := httptest.NewRecorder()
+		reqProjUpd, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/projects/%d", projResp.Data.ID), bytes.NewBuffer(updProjBody))
+		reqProjUpd.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wProjUpd, reqProjUpd)
+		if wProjUpd.Code != http.StatusOK {
+			t.Fatalf("expected 200 updating project story, got %d", wProjUpd.Code)
+		}
+
+		// 查询项目详情，验证已包含立项与进展两条伴生 LifeEntry
+		wProjDetail := httptest.NewRecorder()
+		reqProjDetail, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/projects/%d", projResp.Data.ID), nil)
+		r.ServeHTTP(wProjDetail, reqProjDetail)
+		var projDetailResp struct {
+			Data struct {
+				Entries []interface{} `json:"entries"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wProjDetail.Body.Bytes(), &projDetailResp)
+		if len(projDetailResp.Data.Entries) < 2 {
+			t.Fatalf("expected at least 2 companion LifeEntries for project (creation + story update), got %d", len(projDetailResp.Data.Entries))
+		}
+
+		// (c) 2.3 主流自然下渗：在时间流直接创建带 city_code 的 LifeEntry (如景德镇 360200)，自动点亮足迹
+		entryJdz := CreateEntryRequest{
+			Type:       "life",
+			Title:      "三宝村寻瓷",
+			Content:    "在景德镇三宝村听溪水与窑火。",
+			OccurredAt: "2026-10-11 16:00:00",
+			CityCode:   "360200",
+			CityName:   "景德镇市",
+		}
+		entryBody, _ := json.Marshal(entryJdz)
+		wEntry := httptest.NewRecorder()
+		reqEntry, _ := http.NewRequest(http.MethodPost, "/api/v1/entries", bytes.NewBuffer(entryBody))
+		reqEntry.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wEntry, reqEntry)
+		if wEntry.Code != http.StatusOK {
+			t.Fatalf("expected 200 creating entry with city_code, got %d", wEntry.Code)
+		}
+
+		// 验证景德镇 (360200) 已在城市回忆抽屉与全国足迹图谱中自动点亮
+		wJdzDrawer := httptest.NewRecorder()
+		reqJdzDrawer, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/360200/drawer", nil)
+		r.ServeHTTP(wJdzDrawer, reqJdzDrawer)
+		if wJdzDrawer.Code != http.StatusOK {
+			t.Fatalf("expected 200 on auto-infiltrated city drawer, got %d", wJdzDrawer.Code)
+		}
+		var jdzDrawerResp struct {
+			Data struct {
+				CityName   string `json:"city_name"`
+				VisitStats struct {
+					TotalVisits int `json:"total_visits"`
+				} `json:"visit_stats"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wJdzDrawer.Body.Bytes(), &jdzDrawerResp)
+		if jdzDrawerResp.Data.CityName != "景德镇市" || jdzDrawerResp.Data.VisitStats.TotalVisits < 1 {
+			t.Fatalf("expected natural infiltration to light up 景德镇市 (360200), got %+v", jdzDrawerResp.Data)
+		}
+	})
 }
+

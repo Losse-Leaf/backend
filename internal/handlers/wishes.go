@@ -45,8 +45,10 @@ type UpdateWishRequest struct {
 	CityCode      string `json:"city_code"`
 	CityName      string `json:"city_name"`
 	Budget        int64  `json:"budget"`
+	ActualCost    *int64 `json:"actual_cost"`
 	Status        string `json:"status"` // wanting | fulfilled | shelved
 	TargetDate    string `json:"target_date"`
+	FulfilledAt   string `json:"fulfilled_at"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
@@ -255,12 +257,54 @@ func UpdateWish(c *gin.Context) {
 	if req.Budget != 0 {
 		wish.Budget = req.Budget
 	}
+	if req.ActualCost != nil {
+		wish.ActualCost = *req.ActualCost
+	}
 	if req.Status != "" {
 		wish.Status = strings.TrimSpace(req.Status)
 	}
 	if req.TargetDate != "" {
 		if t, err := ParseFlexTime(req.TargetDate); err == nil {
 			wish.TargetDate = &t
+		}
+	}
+	if req.FulfilledAt != "" {
+		if t, err := ParseFlexTime(req.FulfilledAt); err == nil {
+			wish.FulfilledAt = &t
+		}
+	}
+	if wish.Status == "fulfilled" && wish.FulfilledAt == nil {
+		now := time.Now()
+		wish.FulfilledAt = &now
+	}
+
+	// 若通过直接更新状态标记心愿达成，自动伴生创建一条对应的一级记录 (Record-First Architecture)
+	if wish.Status == "fulfilled" && wish.LifeEntryID == nil {
+		entryType := "collection"
+		if wish.Kind == "travel" {
+			entryType = "life"
+		}
+		fulfilledTime := time.Now()
+		if wish.FulfilledAt != nil {
+			fulfilledTime = *wish.FulfilledAt
+		}
+		entryContent := strings.TrimSpace(wish.Note)
+		if entryContent == "" {
+			entryContent = fmt.Sprintf("圆满达成心愿「%s」", wish.Title)
+		}
+		companionEntry := models.LifeEntry{
+			Type:       entryType,
+			Title:      "心愿达成 · " + wish.Title,
+			Content:    entryContent,
+			OccurredAt: fulfilledTime,
+			Location:   wish.CityName,
+			Tags:       "#心愿达成",
+			CityCode:   wish.CityCode,
+			CityName:   wish.CityName,
+		}
+		if err := db.DB.Create(&companionEntry).Error; err == nil && companionEntry.ID > 0 {
+			wish.LifeEntryID = &companionEntry.ID
+			syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs)
 		}
 	}
 
@@ -283,6 +327,7 @@ func UpdateWish(c *gin.Context) {
 
 	db.DB.Preload("Attachments").First(&wish, wish.ID)
 	populateWishURLs(&wish)
+	InvalidateStatsCache()
 
 	Success(c, wish)
 }
@@ -455,8 +500,8 @@ func ResolveWish(c *gin.Context) {
 			}
 		}
 
-		// 联动 3: 时间流散页随笔
-		if req.CreateLifeEntry {
+		// 联动 3: 时间流散页随笔 (Record-First: 若勾选了生成足迹或生成动态，均保证伴生一级记录)
+		if req.CreateLifeEntry || (req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "") {
 			content := strings.TrimSpace(req.EntryContent)
 			if content == "" {
 				content = fmt.Sprintf("圆满达成心愿「%s」", actualTitle)
@@ -470,6 +515,7 @@ func ResolveWish(c *gin.Context) {
 				Title:      "心愿达成 · " + actualTitle,
 				Content:    content,
 				OccurredAt: fulfilledAt,
+				Location:   wish.CityName,
 				Tags:       "#心愿达成",
 				CityCode:   wish.CityCode,
 				CityName:   wish.CityName,
@@ -487,16 +533,20 @@ func ResolveWish(c *gin.Context) {
 		}
 
 		// 联动 4: 足迹打卡 (travel 专属)
-		if req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "" {
+		if (req.CreateFootprint || req.CreateLifeEntry) && wish.Kind == "travel" && wish.CityCode != "" {
 			cityName := wish.CityName
 			if cityName == "" {
 				cityName = "旅行目的地"
+			}
+			fpNote := strings.TrimSpace(req.EntryContent)
+			if fpNote == "" {
+				fpNote = "心愿达成履迹: " + wish.Title
 			}
 			footprint := models.Footprint{
 				CityCode:    wish.CityCode,
 				CityName:    cityName,
 				VisitedAt:   fulfilledAt,
-				Note:        "心愿达成履迹: " + wish.Title,
+				Note:        fpNote,
 				WishID:      &wish.ID,
 				LifeEntryID: wish.LifeEntryID,
 			}
@@ -523,6 +573,7 @@ func ResolveWish(c *gin.Context) {
 
 	db.DB.Preload("Attachments").First(&wish, wish.ID)
 	populateWishURLs(&wish)
+	InvalidateStatsCache()
 
 	Success(c, wish)
 }

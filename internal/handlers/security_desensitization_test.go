@@ -93,7 +93,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		Type:       "expense",
 		Category:   "餐饮美食",
 		Title:      "上海弄堂本帮菜",
-		CityCode:   "SHA",
+		CityCode:   "310100",
 		OccurredAt: time.Date(2026, 5, 20, 12, 0, 0, 0, time.Local),
 	}
 	db.DB.Create(&txExpense)
@@ -125,8 +125,8 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 
 	// 3. 足迹数据
 	footprint := models.Footprint{
-		CityCode:  "SHA",
-		CityName:  "上海",
+		CityCode:  "310100",
+		CityName:  "上海市",
 		VisitedAt: time.Date(2026, 5, 20, 9, 0, 0, 0, time.Local),
 		Note:      "初夏漫步梧桐区",
 	}
@@ -197,7 +197,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 	t.Run("Footprints Drawer Visitor Desensitization", func(t *testing.T) {
 		// 访客视角
 		w := httptest.NewRecorder()
-		req, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/SHA/drawer", nil)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/310100/drawer", nil)
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200, got %d", w.Code)
@@ -221,7 +221,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 
 		// 管理员视角
 		wAdmin := httptest.NewRecorder()
-		reqAdmin, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/SHA/drawer", nil)
+		reqAdmin, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/310100/drawer", nil)
 		reqAdmin.Header.Set("Authorization", "Bearer "+testMasterKey)
 		r.ServeHTTP(wAdmin, reqAdmin)
 		if wAdmin.Code != http.StatusOK {

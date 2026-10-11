@@ -14,6 +14,8 @@ import (
 
 // GetAnnualAlmanacSummary 年度生活年鉴聚合计算接口 (五幕叙事：岁月卷首 / 山川行迹 / 心愿圆满 / 浮光掠影 / 柴米油盐)
 func GetAnnualAlmanacSummary(c *gin.Context) {
+	ensureEntryFootprintsSynced()
+
 	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", time.Now().Year()))
 	year, err := strconv.Atoi(yearStr)
 	if err != nil || year < 1900 || year > 3000 {

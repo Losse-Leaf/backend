@@ -101,7 +101,7 @@ type CreateEntryRequest struct {
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
-// CreateLifeEntry 创建一条新的生活档案记录
+// CreateLifeEntry 创建一条新的生活档案记录（支持主流自然下渗点亮足迹与造物伴生去重）
 func CreateLifeEntry(c *gin.Context) {
 	var req CreateEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -110,19 +110,80 @@ func CreateLifeEntry(c *gin.Context) {
 	}
 
 	occurred, _ := ParseFlexTime(req.OccurredAt)
+	title := strings.TrimSpace(req.Title)
+	content := strings.TrimSpace(req.Content)
+	location := strings.TrimSpace(req.Location)
+	cityCode := strings.TrimSpace(req.CityCode)
+	cityName := strings.TrimSpace(req.CityName)
+
+	if cityCode != "" {
+		if cityName == "" && location != "" {
+			cityName = location
+		}
+		if location == "" && cityName != "" {
+			location = cityName
+		}
+	}
+
+	// 若前端在 CreateProject 后立即调用了 CreateLifeEntry，复用刚伴生创建的同项目记录，避免重复入库
+	if req.Type == "project" && req.ProjectID != nil && *req.ProjectID > 0 {
+		var existing models.LifeEntry
+		if err := db.DB.Where("project_id = ? AND type = 'project'", *req.ProjectID).Order("id DESC").Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			if time.Since(existing.CreatedAt) < 10*time.Second && (existing.Title == title || title == "") {
+				if title != "" {
+					existing.Title = title
+				}
+				if content != "" {
+					existing.Content = content
+				}
+				if req.OccurredAt != "" {
+					existing.OccurredAt = occurred
+				}
+				if location != "" {
+					existing.Location = location
+				}
+				if t := strings.TrimSpace(req.Tags); t != "" {
+					existing.Tags = t
+				}
+				if m := strings.TrimSpace(req.Meta); m != "" {
+					existing.Meta = m
+				}
+				if l := strings.TrimSpace(req.Link); l != "" {
+					existing.Link = l
+				}
+				existing.Featured = req.Featured
+				if cityCode != "" {
+					existing.CityCode = cityCode
+					existing.CityName = cityName
+				}
+				_ = db.DB.Save(&existing).Error
+				if len(req.AttachmentIDs) > 0 {
+					db.DB.Model(&models.Attachment{}).
+						Where("id IN ?", req.AttachmentIDs).
+						Update("entry_id", existing.ID)
+				}
+				syncFootprintFromLifeEntry(&existing, req.AttachmentIDs)
+				db.DB.Preload("Attachments").Preload("Project").First(&existing, existing.ID)
+				populateEntryURLs(&existing)
+				InvalidateStatsCache()
+				Success(c, existing)
+				return
+			}
+		}
+	}
 
 	entry := models.LifeEntry{
 		Type:       req.Type,
-		Title:      strings.TrimSpace(req.Title),
-		Content:    strings.TrimSpace(req.Content),
+		Title:      title,
+		Content:    content,
 		OccurredAt: occurred,
-		Location:   strings.TrimSpace(req.Location),
+		Location:   location,
 		Tags:       strings.TrimSpace(req.Tags),
 		Meta:       strings.TrimSpace(req.Meta),
 		Link:       strings.TrimSpace(req.Link),
 		Featured:   req.Featured,
-		CityCode:   strings.TrimSpace(req.CityCode),
-		CityName:   strings.TrimSpace(req.CityName),
+		CityCode:   cityCode,
+		CityName:   cityName,
 		ProjectID:  req.ProjectID,
 	}
 
@@ -139,9 +200,13 @@ func CreateLifeEntry(c *gin.Context) {
 			Update("entry_id", entry.ID)
 	}
 
+	// 主流自然下渗：当记录携带 city_code 时，自动点亮/同步对应城市足迹
+	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
+
 	// 重新预加载关联
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
 	populateEntryURLs(&entry)
+	InvalidateStatsCache()
 
 	Success(c, entry)
 }
@@ -329,7 +394,17 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.CityName != "" {
 		entry.CityName = strings.TrimSpace(req.CityName)
 	}
-	entry.ProjectID = req.ProjectID
+	if entry.CityCode != "" {
+		if entry.CityName == "" && entry.Location != "" {
+			entry.CityName = entry.Location
+		}
+		if entry.Location == "" && entry.CityName != "" {
+			entry.Location = entry.CityName
+		}
+	}
+	if req.ProjectID != nil {
+		entry.ProjectID = req.ProjectID
+	}
 
 	if req.OccurredAt != "" {
 		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
@@ -357,8 +432,12 @@ func UpdateLifeEntry(c *gin.Context) {
 		}
 	}
 
+	// 主流自然下渗：同步或点亮关联城市足迹
+	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
+
 	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
 	populateEntryURLs(&entry)
+	InvalidateStatsCache()
 
 	Success(c, entry)
 }
@@ -926,6 +1005,34 @@ func CreateProject(c *gin.Context) {
 		return
 	}
 
+	// 伴生创建机制：在【造物】立项时自动伴生创建一条对应时间的一级记录写入主时间流 (Record-First Architecture)
+	entryContent := p.Description
+	if entryContent == "" {
+		entryContent = p.Story
+	}
+	if entryContent == "" {
+		entryContent = p.Subtitle
+	}
+	if entryContent == "" {
+		entryContent = fmt.Sprintf("立项开启造物项目「%s」。", p.Title)
+	}
+	entryTags := p.Tags
+	if entryTags == "" {
+		entryTags = p.Category
+	}
+	companionEntry := models.LifeEntry{
+		Type:       "project",
+		Title:      p.Title,
+		Content:    entryContent,
+		OccurredAt: time.Now(),
+		Tags:       entryTags,
+		Link:       p.GithubURL,
+		Featured:   p.Featured,
+		ProjectID:  &p.ID,
+	}
+	_ = db.DB.Create(&companionEntry).Error
+	InvalidateStatsCache()
+
 	Success(c, p)
 }
 
@@ -1033,6 +1140,9 @@ func UpdateProject(c *gin.Context) {
 		return
 	}
 
+	oldStory := p.Story
+	oldStatus := p.Status
+
 	if req.Title != nil {
 		title := strings.TrimSpace(*req.Title)
 		if title == "" {
@@ -1076,6 +1186,40 @@ func UpdateProject(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "更新项目失败: "+err.Error())
 		return
 	}
+
+	// 伴生创建机制：当造物项目更新进展手记 (story) 或状态变迁 (status) 时，自动伴生创建一条一级记录写入主时间流
+	storyChanged := req.Story != nil && p.Story != "" && p.Story != oldStory
+	statusChanged := req.Status != nil && p.Status != "" && p.Status != oldStatus
+	if storyChanged || statusChanged {
+		entryTitle := fmt.Sprintf("%s · 造物手记", p.Title)
+		if statusChanged && !storyChanged {
+			entryTitle = fmt.Sprintf("%s · 状态演进 (%s)", p.Title, p.Status)
+		}
+		entryContent := p.Story
+		if !storyChanged || entryContent == "" {
+			if p.Description != "" {
+				entryContent = p.Description
+			} else {
+				entryContent = fmt.Sprintf("造物项目「%s」进展更新，当前状态：%s。", p.Title, p.Status)
+			}
+		}
+		entryTags := p.Tags
+		if entryTags == "" {
+			entryTags = p.Category
+		}
+		progressEntry := models.LifeEntry{
+			Type:       "project",
+			Title:      entryTitle,
+			Content:    entryContent,
+			OccurredAt: time.Now(),
+			Tags:       entryTags,
+			Link:       p.GithubURL,
+			ProjectID:  &p.ID,
+		}
+		_ = db.DB.Create(&progressEntry).Error
+		InvalidateStatsCache()
+	}
+
 	Success(c, p)
 }
 

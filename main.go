@@ -99,9 +99,10 @@ func main() {
 		v1.GET("/files/sign", handlers.SignFileURL)
 		v1.POST("/files/sign-batch", handlers.SignFilesBatch)
 
-		// 足迹图谱与城市回忆抽屉 (公开只读)
+		// 足迹图谱与回忆抽屉 (公开只读，RC-91)
 		v1.GET("/footprints", handlers.GetFootprints)
 		v1.GET("/footprints/atlas", handlers.GetFootprintsAtlas)
+		v1.GET("/footprints/provinces/:adcode/drawer", handlers.GetProvinceMemoryDrawer)
 		v1.GET("/footprints/cities/:city_code/drawer", handlers.GetCityMemoryDrawer)
 		v1.GET("/footprints/:id", handlers.GetFootprintByID)
 

@@ -80,6 +80,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		v1.GET("/wishes", GetWishes)
 		v1.GET("/wishes/:id", GetWishByID)
 		v1.GET("/footprints/cities/:city_code/drawer", GetCityMemoryDrawer)
+		v1.GET("/footprints/provinces/:adcode/drawer", GetProvinceMemoryDrawer)
 		v1.GET("/almanac/summary", GetAnnualAlmanacSummary)
 	}
 
@@ -239,6 +240,60 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		if adminDrawerResp.Data.LedgerSummary.TotalSpent != 12800 ||
 			adminDrawerResp.Data.LedgerSummary.TransactionCount != 1 {
 			t.Fatalf("BE-14 管理员城市回忆抽屉数据错误: %+v", adminDrawerResp.Data.LedgerSummary)
+		}
+
+		// -------------------------------------------------------------
+		// B2. 检验省份回忆抽屉脱敏: GET /api/v1/footprints/provinces/:adcode/drawer (RC-91)
+		// -------------------------------------------------------------
+		// 访客视角：310000 (上海市)
+		wProv := httptest.NewRecorder()
+		reqProv, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/provinces/310000/drawer", nil)
+		r.ServeHTTP(wProv, reqProv)
+		if wProv.Code != http.StatusOK {
+			t.Fatalf("expected 200 on province drawer, got %d", wProv.Code)
+		}
+		var provVisitorResp struct {
+			Data struct {
+				ProvinceAdcode string `json:"province_adcode"`
+				ProvinceName   string `json:"province_name"`
+				LedgerSummary  struct {
+					TotalSpent       int64         `json:"total_spent"`
+					TransactionCount int           `json:"transaction_count"`
+					Categories       []interface{} `json:"categories"`
+				} `json:"ledger_summary"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wProv.Body.Bytes(), &provVisitorResp)
+		if provVisitorResp.Data.ProvinceAdcode != "310000" || provVisitorResp.Data.ProvinceName != "上海市" {
+			t.Fatalf("expected 上海市 310000, got %+v", provVisitorResp.Data)
+		}
+		if provVisitorResp.Data.LedgerSummary.TotalSpent != 0 ||
+			provVisitorResp.Data.LedgerSummary.TransactionCount != 0 ||
+			len(provVisitorResp.Data.LedgerSummary.Categories) != 0 {
+			t.Fatalf("BE-14 省份回忆抽屉访客泄露财务数据: %+v", provVisitorResp.Data.LedgerSummary)
+		}
+
+		// 管理员视角：完整回显上海财务流水
+		wProvAdmin := httptest.NewRecorder()
+		reqProvAdmin, _ := http.NewRequest(http.MethodGet, "/api/v1/footprints/provinces/310000/drawer", nil)
+		reqProvAdmin.Header.Set("Authorization", "Bearer "+testMasterKey)
+		r.ServeHTTP(wProvAdmin, reqProvAdmin)
+		if wProvAdmin.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", wProvAdmin.Code)
+		}
+		var provAdminResp struct {
+			Data struct {
+				LedgerSummary struct {
+					TotalSpent       int64         `json:"total_spent"`
+					TransactionCount int           `json:"transaction_count"`
+					Categories       []interface{} `json:"categories"`
+				} `json:"ledger_summary"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wProvAdmin.Body.Bytes(), &provAdminResp)
+		if provAdminResp.Data.LedgerSummary.TotalSpent != 12800 ||
+			provAdminResp.Data.LedgerSummary.TransactionCount != 1 {
+			t.Fatalf("BE-14 管理员省份回忆抽屉数据错误: %+v", provAdminResp.Data.LedgerSummary)
 		}
 	})
 

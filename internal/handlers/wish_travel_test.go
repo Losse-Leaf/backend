@@ -21,6 +21,7 @@ func TestWishAndTravelModules(t *testing.T) {
 	{
 		v1.GET("/footprints", GetFootprints)
 		v1.GET("/footprints/atlas", GetFootprintsAtlas)
+		v1.GET("/footprints/provinces/:adcode/drawer", GetProvinceMemoryDrawer)
 		v1.GET("/footprints/cities/:city_code/drawer", GetCityMemoryDrawer)
 		v1.GET("/footprints/:id", GetFootprintByID)
 		v1.POST("/footprints", CreateFootprint)
@@ -68,7 +69,7 @@ func TestWishAndTravelModules(t *testing.T) {
 			t.Fatalf("expected 1 city in atlas, got %v", data["total_cities"])
 		}
 
-		// Drawer endpoint
+		// City Drawer endpoint
 		w = httptest.NewRecorder()
 		req, _ = http.NewRequest(http.MethodGet, "/api/v1/footprints/cities/330100/drawer", nil)
 		r.ServeHTTP(w, req)
@@ -80,6 +81,50 @@ func TestWishAndTravelModules(t *testing.T) {
 		drawerData := drawerResp["data"].(map[string]interface{})
 		if drawerData["city_name"] != "杭州市" {
 			t.Fatalf("expected 杭州市 in drawer, got %v", drawerData["city_name"])
+		}
+
+		// Add another city in Zhejiang (Ningbo 330200) to test Province Drawer (RC-91)
+		fpReq2 := CreateFootprintRequest{
+			CityCode:  "330200",
+			CityName:  "宁波市",
+			VisitedAt: "2026-10-09 10:00:00",
+			Note:      "老外滩夜景",
+		}
+		body2, _ := json.Marshal(fpReq2)
+		w = httptest.NewRecorder()
+		req, _ = http.NewRequest(http.MethodPost, "/api/v1/footprints", bytes.NewBuffer(body2))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 on create footprint 2, got %d", w.Code)
+		}
+
+		// Province Drawer endpoint (GET /api/v1/footprints/provinces/330000/drawer)
+		w = httptest.NewRecorder()
+		req, _ = http.NewRequest(http.MethodGet, "/api/v1/footprints/provinces/330000/drawer", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 on province drawer, got %d", w.Code)
+		}
+		var provResp map[string]interface{}
+		_ = json.Unmarshal(w.Body.Bytes(), &provResp)
+		provData := provResp["data"].(map[string]interface{})
+		if provData["province_adcode"] != "330000" {
+			t.Fatalf("expected province_adcode 330000, got %v", provData["province_adcode"])
+		}
+		if provData["province_name"] != "浙江省" {
+			t.Fatalf("expected province_name 浙江省, got %v", provData["province_name"])
+		}
+		visitedCities := provData["visited_cities"].([]interface{})
+		if len(visitedCities) != 2 {
+			t.Fatalf("expected 2 visited cities in Zhejiang, got %d", len(visitedCities))
+		}
+		visitStats := provData["visit_stats"].(map[string]interface{})
+		if int(visitStats["city_count"].(float64)) != 2 {
+			t.Fatalf("expected city_count 2, got %v", visitStats["city_count"])
+		}
+		if int(visitStats["total_visits"].(float64)) != 2 {
+			t.Fatalf("expected total_visits 2, got %v", visitStats["total_visits"])
 		}
 	})
 

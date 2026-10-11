@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -409,3 +410,245 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		"ledger_summary": ledgerSummary,
 	})
 }
+
+// ProvinceVisitedCity 省级抽屉中记录的已访问城市简要统计
+type ProvinceVisitedCity struct {
+	CityCode   string `json:"city_code"`
+	CityName   string `json:"city_name"`
+	VisitCount int    `json:"visit_count"`
+}
+
+// ProvinceAdcodeMap 中国 34 个省级行政区划标准代码到全称的映射 (GB/T 2260)
+var ProvinceAdcodeMap = map[string]string{
+	"11": "北京市",
+	"12": "天津市",
+	"13": "河北省",
+	"14": "山西省",
+	"15": "内蒙古自治区",
+	"21": "辽宁省",
+	"22": "吉林省",
+	"23": "黑龙江省",
+	"31": "上海市",
+	"32": "江苏省",
+	"33": "浙江省",
+	"34": "安徽省",
+	"35": "福建省",
+	"36": "江西省",
+	"37": "山东省",
+	"41": "河南省",
+	"42": "湖北省",
+	"43": "湖南省",
+	"44": "广东省",
+	"45": "广西壮族自治区",
+	"46": "海南省",
+	"50": "重庆市",
+	"51": "四川省",
+	"52": "贵州省",
+	"53": "云南省",
+	"54": "西藏自治区",
+	"61": "陕西省",
+	"62": "甘肃省",
+	"63": "青海省",
+	"64": "宁夏回族自治区",
+	"65": "新疆维吾尔自治区",
+	"71": "台湾省",
+	"81": "香港特别行政区",
+	"82": "澳门特别行政区",
+}
+
+// ProvinceShortNameMap 省级行政区简称/无后缀名称 (供模糊搜索与标题匹配)
+var ProvinceShortNameMap = map[string]string{
+	"11": "北京",
+	"12": "天津",
+	"13": "河北",
+	"14": "山西",
+	"15": "内蒙古",
+	"21": "辽宁",
+	"22": "吉林",
+	"23": "黑龙江",
+	"31": "上海",
+	"32": "江苏",
+	"33": "浙江",
+	"34": "安徽",
+	"35": "福建",
+	"36": "江西",
+	"37": "山东",
+	"41": "河南",
+	"42": "湖北",
+	"43": "湖南",
+	"44": "广东",
+	"45": "广西",
+	"46": "海南",
+	"50": "重庆",
+	"51": "四川",
+	"52": "贵州",
+	"53": "云南",
+	"54": "西藏",
+	"61": "陕西",
+	"62": "甘肃",
+	"63": "青海",
+	"64": "宁夏",
+	"65": "新疆",
+	"71": "台湾",
+	"81": "香港",
+	"82": "澳门",
+}
+
+// GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91: 履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
+func GetProvinceMemoryDrawer(c *gin.Context) {
+	adcode := strings.TrimSpace(c.Param("adcode"))
+	if len(adcode) < 2 {
+		Error(c, http.StatusBadRequest, "省份行政代码格式无效")
+		return
+	}
+
+	provPrefix := adcode[:2]
+	provAdcode := provPrefix + "0000"
+	if len(adcode) == 6 {
+		provAdcode = adcode
+	}
+
+	provName, ok := ProvinceAdcodeMap[provPrefix]
+	if !ok {
+		provName = "未知省份"
+	}
+	provShort := ProvinceShortNameMap[provPrefix]
+
+	// 1. 该省的 Footprints 列表与相片
+	var footprints []models.Footprint
+	db.DB.Where("city_code LIKE ?", provPrefix+"%").Preload("Attachments").Order("visited_at DESC").Find(&footprints)
+	if footprints == nil {
+		footprints = []models.Footprint{}
+	}
+
+	var firstVisit, latestVisit time.Time
+	cityMap := make(map[string]*ProvinceVisitedCity)
+	cityOrder := make([]string, 0)
+
+	for i, f := range footprints {
+		populateFootprintURLs(&footprints[i])
+		if firstVisit.IsZero() || f.VisitedAt.Before(firstVisit) {
+			firstVisit = f.VisitedAt
+		}
+		if latestVisit.IsZero() || f.VisitedAt.After(latestVisit) {
+			latestVisit = f.VisitedAt
+		}
+
+		if f.CityCode != "" {
+			if item, exists := cityMap[f.CityCode]; exists {
+				item.VisitCount++
+			} else {
+				name := f.CityName
+				if name == "" {
+					name = f.CityCode
+				}
+				cityMap[f.CityCode] = &ProvinceVisitedCity{
+					CityCode:   f.CityCode,
+					CityName:   name,
+					VisitCount: 1,
+				}
+				cityOrder = append(cityOrder, f.CityCode)
+			}
+		}
+	}
+
+	firstVisitStr := ""
+	latestVisitStr := ""
+	if !firstVisit.IsZero() {
+		firstVisitStr = firstVisit.Format("2006-01-02")
+	}
+	if !latestVisit.IsZero() {
+		latestVisitStr = latestVisit.Format("2006-01-02")
+	}
+
+	visitedCities := make([]ProvinceVisitedCity, 0, len(cityMap))
+	for _, code := range cityOrder {
+		visitedCities = append(visitedCities, *cityMap[code])
+	}
+	sort.Slice(visitedCities, func(i, j int) bool {
+		if visitedCities[i].VisitCount != visitedCities[j].VisitCount {
+			return visitedCities[i].VisitCount > visitedCities[j].VisitCount
+		}
+		return visitedCities[i].CityCode < visitedCities[j].CityCode
+	})
+
+	// 2. 关联该省的 LifeEntries 随笔
+	var entries []models.LifeEntry
+	entryQuery := db.DB.Preload("Attachments").Order("occurred_at DESC")
+	if provShort != "" {
+		entryQuery = entryQuery.Where("city_code LIKE ? OR location LIKE ?", provPrefix+"%", "%"+provShort+"%")
+	} else {
+		entryQuery = entryQuery.Where("city_code LIKE ?", provPrefix+"%")
+	}
+	entryQuery.Limit(50).Find(&entries)
+	if entries == nil {
+		entries = []models.LifeEntry{}
+	}
+
+	for i := range entries {
+		populateEntryURLs(&entries[i])
+	}
+
+	type catItem struct {
+		Name   string `json:"name"`
+		Amount int64  `json:"amount"`
+	}
+
+	var ledgerSummary any
+	if middleware.IsAdmin(c) {
+		// 3. 关联该省份的消费账单光谱 (仅管理员下发 RC-81, RC-91)
+		var txs []models.Transaction
+		txQuery := db.DB.Where("city_code LIKE ?", provPrefix+"%")
+		if provShort != "" {
+			txQuery = db.DB.Where("city_code LIKE ? OR note LIKE ? OR title LIKE ?", provPrefix+"%", "%"+provShort+"%", "%"+provShort+"%")
+		}
+		txQuery.Find(&txs)
+
+		var totalSpent int64
+		categoryBreakdown := make(map[string]int64)
+		for _, tx := range txs {
+			if tx.Type == "expense" {
+				totalSpent += tx.Amount
+				categoryBreakdown[tx.Category] += tx.Amount
+			}
+		}
+
+		categories := make([]catItem, 0, len(categoryBreakdown))
+		for name, amt := range categoryBreakdown {
+			categories = append(categories, catItem{Name: name, Amount: amt})
+		}
+		sort.Slice(categories, func(i, j int) bool {
+			return categories[i].Amount > categories[j].Amount
+		})
+
+		ledgerSummary = gin.H{
+			"total_spent":       totalSpent,
+			"transaction_count": len(txs),
+			"categories":        categories,
+		}
+	} else {
+		// 访客模式财务隐私严格脱敏 (BE-14, RC-81, RC-91: 匿名访客不执行数据库拉取与聚合)
+		ledgerSummary = gin.H{
+			"total_spent":       0,
+			"transaction_count": 0,
+			"categories":        []catItem{},
+		}
+	}
+
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	Success(c, gin.H{
+		"province_adcode": provAdcode,
+		"province_name":   provName,
+		"visited_cities":  visitedCities,
+		"visit_stats": gin.H{
+			"city_count":        len(visitedCities),
+			"total_visits":      len(footprints),
+			"first_visited_at":  firstVisitStr,
+			"latest_visited_at": latestVisitStr,
+		},
+		"footprints":     footprints,
+		"entries":        entries,
+		"ledger_summary": ledgerSummary,
+	})
+}
+

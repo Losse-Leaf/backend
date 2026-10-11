@@ -15,8 +15,19 @@ import (
 	"loose-leaf/internal/storage"
 )
 
-// populateFootprintURLs 将足迹相片签名转化为可访问链接
+// populateFootprintURLs 通过纯逻辑外键加载足迹关联相片并签名转化为可访问链接
 func populateFootprintURLs(f *models.Footprint) {
+	if f == nil {
+		return
+	}
+	if f.ID > 0 {
+		var atts []models.Attachment
+		db.DB.Where("footprint_id = ?", f.ID).Order("id ASC").Find(&atts)
+		f.Attachments = atts
+	}
+	if f.Attachments == nil {
+		f.Attachments = []models.Attachment{}
+	}
 	for i := range f.Attachments {
 		f.Attachments[i].URL = storage.SignResourceURL(f.Attachments[i].ObjectKey)
 	}
@@ -136,7 +147,7 @@ func GetFootprints(c *gin.Context) {
 		dbScope = db.DB.Unscoped()
 	}
 
-	query := dbScope.Model(&models.Footprint{}).Preload("Attachments").Order("visited_at DESC, id DESC")
+	query := dbScope.Model(&models.Footprint{}).Order("visited_at DESC, id DESC")
 
 	if sinceStr != "" {
 		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
@@ -191,7 +202,7 @@ func GetFootprints(c *gin.Context) {
 func GetFootprintByID(c *gin.Context) {
 	id := c.Param("id")
 	var f models.Footprint
-	if err := db.DB.Preload("Attachments").First(&f, id).Error; err != nil {
+	if err := db.DB.First(&f, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "足迹记录不存在")
 		return
 	}
@@ -259,7 +270,7 @@ func CreateFootprint(c *gin.Context) {
 						"entry_id":     *lifeEntryID,
 					})
 			}
-			db.DB.Preload("Attachments").First(&existingFP, existingFP.ID)
+			db.DB.First(&existingFP, existingFP.ID)
 			populateFootprintURLs(&existingFP)
 			InvalidateStatsCache()
 			Success(c, existingFP)
@@ -316,7 +327,7 @@ func CreateFootprint(c *gin.Context) {
 			Updates(updates)
 	}
 
-	db.DB.Preload("Attachments").First(&footprint, footprint.ID)
+	db.DB.First(&footprint, footprint.ID)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
 
@@ -327,7 +338,7 @@ func CreateFootprint(c *gin.Context) {
 func UpdateFootprint(c *gin.Context) {
 	id := c.Param("id")
 	var footprint models.Footprint
-	if err := db.DB.Preload("Attachments").First(&footprint, id).Error; err != nil {
+	if err := db.DB.First(&footprint, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "足迹记录不存在")
 		return
 	}
@@ -397,7 +408,7 @@ func UpdateFootprint(c *gin.Context) {
 		}
 	}
 
-	db.DB.Preload("Attachments").First(&footprint, footprint.ID)
+	db.DB.First(&footprint, footprint.ID)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
 
@@ -416,6 +427,8 @@ func DeleteFootprint(c *gin.Context) {
 	}
 
 	if purge {
+		db.DB.Model(&models.Attachment{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
+		db.DB.Model(&models.Wish{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 		if err := db.DB.Unscoped().Delete(&f).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
@@ -574,7 +587,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 
 	// 1. 该城市的 Footprints 列表与相片
 	var footprints []models.Footprint
-	db.DB.Where("city_code = ?", cityCode).Preload("Attachments").Order("visited_at DESC").Find(&footprints)
+	db.DB.Where("city_code = ?", cityCode).Order("visited_at DESC").Find(&footprints)
 	if footprints == nil {
 		footprints = []models.Footprint{}
 	}
@@ -589,7 +602,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 
 	// 2. 关联该城市的 LifeEntries 随笔
 	var entries []models.LifeEntry
-	dbQuery := db.DB.Preload("Attachments").Order("occurred_at DESC")
+	dbQuery := db.DB.Order("occurred_at DESC")
 	if cityShort != "" {
 		dbQuery = dbQuery.Where("city_code = ? OR location LIKE ?", cityCode, "%"+cityShort+"%")
 	} else {
@@ -737,7 +750,7 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 
 	// 1. 该省的 Footprints 列表与相片
 	var footprints []models.Footprint
-	db.DB.Where("city_code LIKE ?", provPrefix+"%").Preload("Attachments").Order("visited_at DESC").Find(&footprints)
+	db.DB.Where("city_code LIKE ?", provPrefix+"%").Order("visited_at DESC").Find(&footprints)
 	if footprints == nil {
 		footprints = []models.Footprint{}
 	}
@@ -778,7 +791,7 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 
 	// 2. 关联该省的 LifeEntries 随笔
 	var entries []models.LifeEntry
-	entryQuery := db.DB.Preload("Attachments").Order("occurred_at DESC")
+	entryQuery := db.DB.Order("occurred_at DESC")
 	if provShort != "" {
 		entryQuery = entryQuery.Where("city_code LIKE ? OR location LIKE ?", provPrefix+"%", "%"+provShort+"%")
 	} else {

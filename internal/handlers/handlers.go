@@ -75,9 +75,29 @@ func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	return atts
 }
 
-// populateEntryURLs 填充条目附件的预签名 URL (RC-13)
+// populateEntryURLs 通过纯逻辑外键加载条目关联的附件与项目，并填充预签名 URL (RC-13)
 func populateEntryURLs(e *models.LifeEntry) {
+	if e == nil {
+		return
+	}
+	if e.ID > 0 {
+		var atts []models.Attachment
+		db.DB.Where("entry_id = ?", e.ID).Order("id ASC").Find(&atts)
+		e.Attachments = atts
+	}
+	if e.Attachments == nil {
+		e.Attachments = []models.Attachment{}
+	}
 	e.Attachments = populateAttachmentURLs(e.Attachments)
+
+	if e.ProjectID != nil && *e.ProjectID > 0 {
+		var proj models.Project
+		if db.DB.Where("id = ?", *e.ProjectID).Limit(1).Find(&proj).RowsAffected > 0 {
+			e.Project = &proj
+		}
+	} else {
+		e.Project = nil
+	}
 }
 
 // ==========================================
@@ -163,7 +183,7 @@ func CreateLifeEntry(c *gin.Context) {
 						Update("entry_id", existing.ID)
 				}
 				syncFootprintFromLifeEntry(&existing, req.AttachmentIDs)
-				db.DB.Preload("Attachments").Preload("Project").First(&existing, existing.ID)
+				db.DB.First(&existing, existing.ID)
 				populateEntryURLs(&existing)
 				InvalidateStatsCache()
 				Success(c, existing)
@@ -203,8 +223,8 @@ func CreateLifeEntry(c *gin.Context) {
 	// 主流自然下渗：当记录携带 city_code 时，自动点亮/同步对应城市足迹
 	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
 
-	// 重新预加载关联
-	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
+	// 重新加载逻辑外键关联
+	db.DB.First(&entry, entry.ID)
 	populateEntryURLs(&entry)
 	InvalidateStatsCache()
 
@@ -235,8 +255,6 @@ func GetLifeEntriesV1(c *gin.Context) {
 	}
 
 	query := dbScope.Model(&models.LifeEntry{}).
-		Preload("Attachments").
-		Preload("Project").
 		Order("occurred_at DESC, id DESC")
 
 	if sinceStr != "" {
@@ -322,7 +340,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 func GetLifeEntryByID(c *gin.Context) {
 	id := c.Param("id")
 	var entry models.LifeEntry
-	if err := db.DB.Preload("Attachments").Preload("Project").First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "未找到该条生活记录")
 		return
 	}
@@ -353,7 +371,7 @@ type UpdateEntryRequest struct {
 func UpdateLifeEntry(c *gin.Context) {
 	id := c.Param("id")
 	var entry models.LifeEntry
-	if err := db.DB.Preload("Attachments").First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "未找到该条生活记录")
 		return
 	}
@@ -435,7 +453,7 @@ func UpdateLifeEntry(c *gin.Context) {
 	// 主流自然下渗：同步或点亮关联城市足迹
 	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
 
-	db.DB.Preload("Attachments").Preload("Project").First(&entry, entry.ID)
+	db.DB.First(&entry, entry.ID)
 	populateEntryURLs(&entry)
 	InvalidateStatsCache()
 
@@ -448,18 +466,27 @@ func DeleteLifeEntry(c *gin.Context) {
 	purge := c.Query("purge") == "true"
 
 	var entry models.LifeEntry
-	if err := db.DB.Preload("Attachments").First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "记录不存在或已被删除")
 		return
 	}
 
 	if purge {
-		// 物理硬清理关联的 R2 存储对象与数据库记录
-		for _, att := range entry.Attachments {
-			if att.ObjectKey != "" {
-				_ = storage.DeleteObject(att.ObjectKey)
+		// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）
+		var atts []models.Attachment
+		db.DB.Where("entry_id = ?", entry.ID).Find(&atts)
+		for _, att := range atts {
+			if att.WishID == nil && att.FootprintID == nil {
+				if att.ObjectKey != "" {
+					_ = storage.DeleteObject(att.ObjectKey)
+				}
+				db.DB.Unscoped().Delete(&att)
+			} else {
+				db.DB.Model(&att).Update("entry_id", nil)
 			}
 		}
+		db.DB.Model(&models.Footprint{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
+		db.DB.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
 		if err := db.DB.Unscoped().Delete(&entry).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
@@ -1102,7 +1129,7 @@ func GetProjectByID(c *gin.Context) {
 
 	// 同时拉取关联该项目的 Life Entries
 	var entries []models.LifeEntry
-	db.DB.Where("project_id = ?", p.ID).Preload("Attachments").Order("occurred_at DESC").Find(&entries)
+	db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC").Find(&entries)
 	for i := range entries {
 		populateEntryURLs(&entries[i])
 	}

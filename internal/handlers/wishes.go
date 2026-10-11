@@ -16,8 +16,19 @@ import (
 	"loose-leaf/internal/storage"
 )
 
-// populateWishURLs 将心愿参考图签名转化为可访问链接
+// populateWishURLs 通过纯逻辑外键加载心愿参考图并签名转化为可访问链接
 func populateWishURLs(w *models.Wish) {
+	if w == nil {
+		return
+	}
+	if w.ID > 0 {
+		var atts []models.Attachment
+		db.DB.Where("wish_id = ?", w.ID).Order("id ASC").Find(&atts)
+		w.Attachments = atts
+	}
+	if w.Attachments == nil {
+		w.Attachments = []models.Attachment{}
+	}
 	for i := range w.Attachments {
 		w.Attachments[i].URL = storage.SignResourceURL(w.Attachments[i].ObjectKey)
 	}
@@ -92,7 +103,7 @@ func GetWishes(c *gin.Context) {
 		dbScope = db.DB.Unscoped()
 	}
 
-	query := dbScope.Model(&models.Wish{}).Preload("Attachments").Order("created_at DESC, id DESC")
+	query := dbScope.Model(&models.Wish{}).Order("created_at DESC, id DESC")
 
 	if sinceStr != "" {
 		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
@@ -163,7 +174,7 @@ func GetWishes(c *gin.Context) {
 func GetWishByID(c *gin.Context) {
 	id := c.Param("id")
 	var w models.Wish
-	if err := db.DB.Preload("Attachments").First(&w, id).Error; err != nil {
+	if err := db.DB.First(&w, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -215,7 +226,7 @@ func CreateWish(c *gin.Context) {
 			Update("wish_id", wish.ID)
 	}
 
-	db.DB.Preload("Attachments").First(&wish, wish.ID)
+	db.DB.First(&wish, wish.ID)
 	populateWishURLs(&wish)
 
 	Success(c, wish)
@@ -225,7 +236,7 @@ func CreateWish(c *gin.Context) {
 func UpdateWish(c *gin.Context) {
 	id := c.Param("id")
 	var wish models.Wish
-	if err := db.DB.Preload("Attachments").First(&wish, id).Error; err != nil {
+	if err := db.DB.First(&wish, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -325,7 +336,7 @@ func UpdateWish(c *gin.Context) {
 		}
 	}
 
-	db.DB.Preload("Attachments").First(&wish, wish.ID)
+	db.DB.First(&wish, wish.ID)
 	populateWishURLs(&wish)
 	InvalidateStatsCache()
 
@@ -336,7 +347,7 @@ func UpdateWish(c *gin.Context) {
 func ResolveWish(c *gin.Context) {
 	id := c.Param("id")
 	var wish models.Wish
-	if err := db.DB.Preload("Attachments").First(&wish, id).Error; err != nil {
+	if err := db.DB.First(&wish, id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -571,14 +582,14 @@ func ResolveWish(c *gin.Context) {
 		return
 	}
 
-	db.DB.Preload("Attachments").First(&wish, wish.ID)
+	db.DB.First(&wish, wish.ID)
 	populateWishURLs(&wish)
 	InvalidateStatsCache()
 
 	Success(c, wish)
 }
 
-// DeleteWish 删除心愿 (默认软删除，?purge=true 为物理清理)
+// DeleteWish 删除心愿 (默认软删除，?purge=true 为物理清理；解绑关联流水与动态逻辑外键)
 func DeleteWish(c *gin.Context) {
 	id := c.Param("id")
 	purge := c.Query("purge") == "true"
@@ -590,6 +601,9 @@ func DeleteWish(c *gin.Context) {
 	}
 
 	if purge {
+		db.DB.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+		db.DB.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+		db.DB.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		if err := db.DB.Unscoped().Delete(&w).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return

@@ -16,8 +16,8 @@ type LifeEntry struct {
 	OccurredAt  time.Time    `gorm:"index:idx_entry_occurred_id,priority:1;index" json:"occurred_at"`
 	Location    string       `json:"location"`
 	ProjectID   *uint        `gorm:"index" json:"project_id"`
-	Project     *Project     `gorm:"foreignKey:ProjectID" json:"project,omitempty"`
-	Attachments []Attachment `gorm:"foreignKey:EntryID;constraint:OnDelete:CASCADE" json:"attachments"`
+	Project     *Project     `gorm:"-" json:"project,omitempty"` // 纯逻辑外键关联 ProjectID，不建物理外键约束
+	Attachments []Attachment `gorm:"-" json:"attachments"`       // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
 
 	Meta     string `json:"meta,omitempty"`
 	Tags     string `json:"tags,omitempty"`
@@ -81,7 +81,7 @@ type Transaction struct {
 	IsInstallment           bool           `gorm:"default:false;index" json:"is_installment"`
 	InstallmentChannelCode  string         `gorm:"size:32;index" json:"installment_channel_code,omitempty"` // huabei, baitiao, etc.
 	InstallmentTotalAmount  int64          `gorm:"default:0" json:"installment_total_amount"` // 分期总额（分）
-	InstallmentMonths       int            `gorm:"default:0" json:"installment_months"`       // 总期数 (3/6/12/24)
+	InstallmentMonths       int            `gorm:"default:0" json:"installment_months"`       // 总期数 (3/6/12/12)
 	InstallmentMonthlyPay   int64          `gorm:"default:0" json:"installment_monthly_pay"`  // 每期还款额（分）
 	InstallmentRemainMonths int            `gorm:"default:0" json:"installment_remain_months"` // 剩余期数
 	RepaymentDay            int            `gorm:"default:10" json:"repayment_day"`           // 绑定渠道的每月独立还款日 (1~31)
@@ -203,7 +203,7 @@ type Wish struct {
 	LifeEntryID    *uint          `gorm:"index" json:"life_entry_id,omitempty"`
 	FootprintID    *uint          `gorm:"index" json:"footprint_id,omitempty"`
 	GearID         *string        `gorm:"size:64" json:"gear_id,omitempty"`
-	Attachments    []Attachment   `gorm:"foreignKey:WishID" json:"attachments"`
+	Attachments    []Attachment   `gorm:"-" json:"attachments"` // 纯逻辑外键关联 WishID，不建物理外键约束
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
 	DeletedAt      gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
@@ -218,7 +218,7 @@ type Footprint struct {
 	Note        string         `gorm:"type:text" json:"note"`                   // 足迹随笔或简注
 	LifeEntryID *uint          `gorm:"index" json:"life_entry_id,omitempty"`    // 可选关联时间流条目
 	WishID      *uint          `gorm:"index" json:"wish_id,omitempty"`          // 可选关联溯源心愿
-	Attachments []Attachment   `gorm:"foreignKey:FootprintID" json:"attachments"`
+	Attachments []Attachment   `gorm:"-" json:"attachments"`                    // 纯逻辑外键关联 FootprintID，不建物理外键约束
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`
 	DeletedAt   gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`

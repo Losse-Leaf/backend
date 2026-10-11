@@ -28,7 +28,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	// 1. 第一幕：岁月卷首数据 (LifeEntries 聚合)
 	var entries []models.LifeEntry
 	db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).
-		Preload("Attachments").
 		Order("occurred_at ASC").
 		Find(&entries)
 
@@ -54,7 +53,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	// 2. 第二幕：山川行迹 (Footprints 聚合)
 	var footprints []models.Footprint
 	db.DB.Where("visited_at >= ? AND visited_at < ?", startOfYear, endOfYear).
-		Preload("Attachments").
 		Order("visited_at ASC").
 		Find(&footprints)
 
@@ -80,7 +78,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	var fulfilledWishes []models.Wish
 	db.DB.Where("fulfilled_at >= ? AND fulfilled_at < ?", startOfYear, endOfYear).
 		Where("status = ?", "fulfilled").
-		Preload("Attachments").
 		Order("fulfilled_at ASC").
 		Find(&fulfilledWishes)
 

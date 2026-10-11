@@ -52,7 +52,7 @@ func isSystemInitialized() bool {
 
 // isBootstrapOrPairingPath 判断当前请求是否为冷启动装帧或配对必需路径 (BE-18)
 func isBootstrapOrPairingPath(path string) bool {
-	return strings.HasPrefix(path, "/api/v1/system/") || strings.HasPrefix(path, "/api/v1/auth/pair/")
+	return path == "/api/v1/system/status" || path == "/api/v1/system/bootstrap" || strings.HasPrefix(path, "/api/v1/auth/pair/")
 }
 
 // IsAdmin 判定当前请求是否具备主理人权限 (仅認 devices 表中 status = 'active' 的有效设备凭证 BE-18)

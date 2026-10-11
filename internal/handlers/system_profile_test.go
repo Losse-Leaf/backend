@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/glebarez/sqlite"
@@ -36,6 +38,7 @@ func setupTestFullDB(t *testing.T) {
 		&models.Wish{},
 		&models.Footprint{},
 		&models.CreditChannel{},
+		&models.UpdateNotice{},
 	)
 	database.Create(&models.CreditChannel{
 		Code:         "huabei",
@@ -436,3 +439,212 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 		}
 	})
 }
+
+// TestSystemUpdateCheckAndUpdateNotices 测试主理人系统版本更新检查与更新说明 CRUD (RC-97)
+func TestSystemUpdateCheckAndUpdateNotices(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+	resetUpdateCheckCache()
+
+	adminToken := "lldt_test_admin_update_token"
+	seedTestAdminDevice(adminToken)
+
+	r := gin.New()
+	write := r.Group("/api/v1")
+	write.Use(middleware.AdminAuthRequired())
+	{
+		write.GET("/system/update-check", CheckSystemUpdate)
+		write.GET("/system/update-notices", GetUpdateNotices)
+		write.POST("/system/update-notices", CreateUpdateNotice)
+		write.PUT("/system/update-notices/:id", UpdateUpdateNotice)
+		write.DELETE("/system/update-notices/:id", DeleteUpdateNotice)
+	}
+
+	t.Run("1. Visitors without admin token are rejected with 401 (zero visitor exposure)", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/system/update-check", "/api/v1/system/update-notices"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 Unauthorized for visitor on %s, got %d", path, w.Code)
+			}
+		}
+	})
+
+	t.Run("2. UpdateCheck handles 404 (no releases yet), 200 (newer version + 1h cache), and 500 (graceful check_error)", func(t *testing.T) {
+		origVersion := config.Version
+		origURL := githubLatestReleaseURL
+		defer func() {
+			config.Version = origVersion
+			githubLatestReleaseURL = origURL
+			resetUpdateCheckCache()
+		}()
+
+		config.Version = "v1.0.0"
+		mockMode := "404"
+		hitCount := 0
+
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hitCount++
+			switch mockMode {
+			case "404":
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+			case "200":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{
+					"tag_name": "v1.2.0",
+					"html_url": "https://github.com/Losse-Leaf/backend/releases/tag/v1.2.0",
+					"published_at": "2026-10-11T10:00:00Z"
+				}`))
+			case "500":
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+		defer mockServer.Close()
+		githubLatestReleaseURL = mockServer.URL
+
+		// (a) 404 empty release fallback
+		resetUpdateCheckCache()
+		req404 := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-check", nil)
+		req404.Header.Set("Authorization", "Bearer "+adminToken)
+		w404 := httptest.NewRecorder()
+		r.ServeHTTP(w404, req404)
+		if w404.Code != http.StatusOK {
+			t.Fatalf("expected 200 on 404 release fallback, got %d", w404.Code)
+		}
+		var res404 struct {
+			Data UpdateCheckResponse `json:"data"`
+		}
+		_ = json.Unmarshal(w404.Body.Bytes(), &res404)
+		if res404.Data.HasUpdate || res404.Data.LatestVersion != "" || res404.Data.CheckError != "" {
+			t.Fatalf("unexpected 404 fallback response: %+v", res404.Data)
+		}
+
+		// (b) 200 newer version + 1h cache hit
+		resetUpdateCheckCache()
+		mockMode = "200"
+		beforeHits := hitCount
+		req200 := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-check", nil)
+		req200.Header.Set("Authorization", "Bearer "+adminToken)
+		w200 := httptest.NewRecorder()
+		r.ServeHTTP(w200, req200)
+		if w200.Code != http.StatusOK {
+			t.Fatalf("expected 200 on update check, got %d", w200.Code)
+		}
+		var res200 struct {
+			Data UpdateCheckResponse `json:"data"`
+		}
+		_ = json.Unmarshal(w200.Body.Bytes(), &res200)
+		if !res200.Data.HasUpdate || res200.Data.LatestVersion != "v1.2.0" || res200.Data.CurrentVersion != "v1.0.0" {
+			t.Fatalf("expected has_update=true and latest_version=v1.2.0, got %+v", res200.Data)
+		}
+		if hitCount != beforeHits+1 {
+			t.Fatalf("expected 1 upstream hit, got %d", hitCount-beforeHits)
+		}
+
+		// Second call within 1h should hit memory cache without calling mockServer
+		reqCached := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-check", nil)
+		reqCached.Header.Set("Authorization", "Bearer "+adminToken)
+		wCached := httptest.NewRecorder()
+		r.ServeHTTP(wCached, reqCached)
+		if hitCount != beforeHits+1 {
+			t.Fatalf("expected cached response without new upstream hit, but hitCount increased")
+		}
+
+		// (c) 500 error returns HTTP 200 with check_error
+		resetUpdateCheckCache()
+		mockMode = "500"
+		req500 := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-check", nil)
+		req500.Header.Set("Authorization", "Bearer "+adminToken)
+		w500 := httptest.NewRecorder()
+		r.ServeHTTP(w500, req500)
+		if w500.Code != http.StatusOK {
+			t.Fatalf("expected HTTP 200 on upstream 500, got %d", w500.Code)
+		}
+		var res500 struct {
+			Data UpdateCheckResponse `json:"data"`
+		}
+		_ = json.Unmarshal(w500.Body.Bytes(), &res500)
+		if res500.Data.HasUpdate || res500.Data.CheckError == "" {
+			t.Fatalf("expected has_update=false and non-empty check_error, got %+v", res500.Data)
+		}
+	})
+
+	t.Run("3. UpdateNotices CRUD and semver descending sort", func(t *testing.T) {
+		// Create v1.0.0
+		n1, _ := json.Marshal(UpsertUpdateNoticeRequest{
+			Version:    "v1.0.0",
+			Title:      "散页首发版本",
+			Body:       "支持单二进制分发与完整生活档案管理",
+			ReleasedAt: "2026-10-10",
+		})
+		req1 := httptest.NewRequest(http.MethodPost, "/api/v1/system/update-notices", bytes.NewReader(n1))
+		req1.Header.Set("Content-Type", "application/json")
+		req1.Header.Set("Authorization", "Bearer "+adminToken)
+		w1 := httptest.NewRecorder()
+		r.ServeHTTP(w1, req1)
+		if w1.Code != http.StatusOK {
+			t.Fatalf("expected 200 creating notice v1.0.0, got %d: %s", w1.Code, w1.Body.String())
+		}
+
+		// Create v1.2.0
+		n2, _ := json.Marshal(UpsertUpdateNoticeRequest{
+			Version:    "v1.2.0",
+			Title:      "系统版本更新检查",
+			Body:       "新增版本检查与更新说明时间轴",
+			ReleasedAt: "2026-10-11",
+		})
+		req2 := httptest.NewRequest(http.MethodPost, "/api/v1/system/update-notices", bytes.NewReader(n2))
+		req2.Header.Set("Content-Type", "application/json")
+		req2.Header.Set("Authorization", "Bearer "+adminToken)
+		w2 := httptest.NewRecorder()
+		r.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusOK {
+			t.Fatalf("expected 200 creating notice v1.2.0, got %d", w2.Code)
+		}
+
+		// List and verify descending order (v1.2.0 first, v1.0.0 second)
+		listReq := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-notices", nil)
+		listReq.Header.Set("Authorization", "Bearer "+adminToken)
+		listW := httptest.NewRecorder()
+		r.ServeHTTP(listW, listReq)
+		var listRes struct {
+			Data []models.UpdateNotice `json:"data"`
+		}
+		_ = json.Unmarshal(listW.Body.Bytes(), &listRes)
+		if len(listRes.Data) != 2 || listRes.Data[0].Version != "v1.2.0" || listRes.Data[1].Version != "v1.0.0" {
+			t.Fatalf("expected [v1.2.0, v1.0.0], got %+v", listRes.Data)
+		}
+
+		// Update v1.0.0 title
+		targetID := listRes.Data[1].ID
+		updBody, _ := json.Marshal(UpsertUpdateNoticeRequest{
+			Version:    "v1.0.1",
+			Title:      "散页首发修正版",
+			Body:       "修复构建流水线",
+			ReleasedAt: "2026-10-10",
+		})
+		updReq := httptest.NewRequest(http.MethodPut, "/api/v1/system/update-notices/1", bytes.NewReader(updBody))
+		if targetID != 1 {
+			updReq = httptest.NewRequest(http.MethodPut, "/api/v1/system/update-notices/2", bytes.NewReader(updBody))
+		}
+		updReq.Header.Set("Content-Type", "application/json")
+		updReq.Header.Set("Authorization", "Bearer "+adminToken)
+		updW := httptest.NewRecorder()
+		r.ServeHTTP(updW, updReq)
+		if updW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on update notice, got %d: %s", updW.Code, updW.Body.String())
+		}
+
+		// Delete notice
+		delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/system/update-notices/1", nil)
+		delReq.Header.Set("Authorization", "Bearer "+adminToken)
+		delW := httptest.NewRecorder()
+		r.ServeHTTP(delW, delReq)
+		if delW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on delete notice, got %d", delW.Code)
+		}
+	})
+}
+

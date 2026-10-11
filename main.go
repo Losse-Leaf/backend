@@ -174,6 +174,13 @@ func main() {
 			write.POST("/auth/pair/init", handlers.InitPairing)
 			write.GET("/auth/devices", handlers.GetTrustedDevices)
 			write.DELETE("/auth/devices/:id", handlers.RevokeDevice)
+
+			// 主理人系统版本更新检查与更新说明维护 (需管理员鉴权，访客零感知 RC-97)
+			write.GET("/system/update-check", handlers.CheckSystemUpdate)
+			write.GET("/system/update-notices", handlers.GetUpdateNotices)
+			write.POST("/system/update-notices", handlers.CreateUpdateNotice)
+			write.PUT("/system/update-notices/:id", handlers.UpdateUpdateNotice)
+			write.DELETE("/system/update-notices/:id", handlers.DeleteUpdateNotice)
 		}
 
 		// Health Check

@@ -23,48 +23,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Set up Node.js (Fallback Web Builder)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Read pinned web version
+        run: echo "WEB_VERSION=$(cat WEB_VERSION | tr -d '[:space:]')" >> "$GITHUB_ENV"
 
-      - name: Fetch Frontend Release Asset or Build (web/dist)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+      - name: Fetch pinned web dist (anonymous, public repo)
         run: |
           mkdir -p web/dist
-          echo "Preparing frontend assets for embedding (docs/ecosystem.md §10.4)..."
-          
-          FETCH_SUCCESS=false
-          # 1. 尝试从 Losse-Leaf/web Release 中下载与当前 Tag 对应的 web-dist.tar.gz
-          if gh release download "${TAG}" --repo Losse-Leaf/web --pattern "web-dist.tar.gz" --dir /tmp/ 2>/dev/null; then
-            echo "Successfully downloaded web-dist.tar.gz for tag ${TAG} from Losse-Leaf/web."
-            FETCH_SUCCESS=true
-          elif gh release download --repo Losse-Leaf/web --pattern "web-dist.tar.gz" --dir /tmp/ 2>/dev/null; then
-            echo "Successfully downloaded latest available web-dist.tar.gz from Losse-Leaf/web."
-            FETCH_SUCCESS=true
-          fi
-          
-          if [ "$FETCH_SUCCESS" = "true" ] && [ -f /tmp/web-dist.tar.gz ]; then
-            echo "Extracting web-dist.tar.gz into web/dist/..."
-            tar -xzf /tmp/web-dist.tar.gz -C web/dist/
-          else
-            echo "Notice: Prebuilt web-dist.tar.gz not found in releases. Building from Losse-Leaf/web main branch..."
-            git clone --depth=1 https://github.com/Losse-Leaf/web.git /tmp/looseleaf-web
-            cd /tmp/looseleaf-web
-            npm ci || npm install
-            npm run build
-            cp -r dist/* $GITHUB_WORKSPACE/web/dist/
-            cd $GITHUB_WORKSPACE
-          fi
-          
-          # 验证 index.html 存在，保证内嵌完整性
+          echo "Fetching pinned web dist (${WEB_VERSION}) from Losse-Leaf/web releases (RC-96)..."
+          curl -fL --retry 3 \
+            "https://github.com/Losse-Leaf/web/releases/download/${WEB_VERSION}/web-dist.tar.gz" \
+            -o /tmp/web-dist.tar.gz
+          tar -xzf /tmp/web-dist.tar.gz -C web/dist/
           if [ ! -f web/dist/index.html ]; then
             echo "Error: web/dist/index.html not found! Single binary cannot be built."
             exit 1
           fi
-          echo "Web frontend assets successfully staged in web/dist/:"
+          echo "Web frontend assets (${WEB_VERSION}) successfully staged in web/dist/:"
           ls -la web/dist/
 
       - name: Compile Cross-Platform Standalone Single Binaries

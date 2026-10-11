@@ -224,4 +224,13 @@ type Footprint struct {
 	DeletedAt   gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
-
+// UpdateNotice 版本装订更新公告历史存档表 (管理端专用 RC-97)
+type UpdateNotice struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	Version    string    `gorm:"size:32;index;not null" json:"version"`
+	Title      string    `gorm:"size:255;not null" json:"title"`
+	Body       string    `gorm:"type:text;not null" json:"body"`
+	ReleasedAt string    `gorm:"size:32" json:"released_at"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}

@@ -302,23 +302,14 @@ func GetFootprintsAtlas(c *gin.Context) {
 	})
 }
 
-// GetCityMemoryDrawer 城市回忆抽屉聚合接口 (履迹简志 + 菲林画廊 + 散页随笔 + 城市账单光谱)
-func GetCityMemoryDrawer(c *gin.Context) {
-	cityCode := c.Param("city_code")
-	if cityCode == "" {
-		Error(c, http.StatusBadRequest, "城市代码必填")
-		return
-	}
+// DrawerCategoryItem 回忆抽屉消费分类统计项
+type DrawerCategoryItem struct {
+	Name   string `json:"name"`
+	Amount int64  `json:"amount"`
+}
 
-	// 1. 该城市的 Footprints 列表与相片
-	var footprints []models.Footprint
-	db.DB.Where("city_code = ?", cityCode).Preload("Attachments").Order("visited_at DESC").Find(&footprints)
-
-	cityName := ""
-	if len(footprints) > 0 {
-		cityName = footprints[0].CityName
-	}
-
+// processDrawerFootprints 统一处理抽屉足迹相片签名并计算首访与最近到访日期
+func processDrawerFootprints(footprints []models.Footprint) (string, string) {
 	var firstVisit, latestVisit time.Time
 	for i, f := range footprints {
 		populateFootprintURLs(&footprints[i])
@@ -330,71 +321,104 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		}
 	}
 
-	firstVisitStr := ""
-	latestVisitStr := ""
+	firstVisitStr, latestVisitStr := "", ""
 	if !firstVisit.IsZero() {
 		firstVisitStr = firstVisit.Format("2006-01-02")
 	}
 	if !latestVisit.IsZero() {
 		latestVisitStr = latestVisit.Format("2006-01-02")
 	}
+	return firstVisitStr, latestVisitStr
+}
+
+// buildDrawerLedgerSummary 统一构建回忆抽屉账单光谱 (RC-81, BE-14, RC-93: 仅管理员执行查询与聚合，访客严格脱敏)
+func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction) gin.H {
+	if !isAdmin {
+		return gin.H{
+			"total_spent":       0,
+			"transaction_count": 0,
+			"categories":        []DrawerCategoryItem{},
+		}
+	}
+
+	txs := fetchTxs()
+	var totalSpent int64
+	categoryBreakdown := make(map[string]int64)
+	for _, tx := range txs {
+		if tx.Type == "expense" {
+			totalSpent += tx.Amount
+			categoryBreakdown[tx.Category] += tx.Amount
+		}
+	}
+
+	categories := make([]DrawerCategoryItem, 0, len(categoryBreakdown))
+	for name, amt := range categoryBreakdown {
+		categories = append(categories, DrawerCategoryItem{Name: name, Amount: amt})
+	}
+	sort.Slice(categories, func(i, j int) bool {
+		if categories[i].Amount != categories[j].Amount {
+			return categories[i].Amount > categories[j].Amount
+		}
+		return categories[i].Name < categories[j].Name
+	})
+
+	return gin.H{
+		"total_spent":       totalSpent,
+		"transaction_count": len(txs),
+		"categories":        categories,
+	}
+}
+
+// GetCityMemoryDrawer 城市回忆抽屉聚合接口 (RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 城市账单光谱)
+func GetCityMemoryDrawer(c *gin.Context) {
+	cityCode := strings.TrimSpace(c.Param("city_code"))
+	if cityCode == "" {
+		Error(c, http.StatusBadRequest, "城市代码必填")
+		return
+	}
+
+	// 1. 该城市的 Footprints 列表与相片
+	var footprints []models.Footprint
+	db.DB.Where("city_code = ?", cityCode).Preload("Attachments").Order("visited_at DESC").Find(&footprints)
+	if footprints == nil {
+		footprints = []models.Footprint{}
+	}
+
+	cityName := ""
+	if len(footprints) > 0 {
+		cityName = footprints[0].CityName
+	}
+	cityShort := strings.TrimSuffix(cityName, "市")
+
+	firstVisitStr, latestVisitStr := processDrawerFootprints(footprints)
 
 	// 2. 关联该城市的 LifeEntries 随笔
 	var entries []models.LifeEntry
 	dbQuery := db.DB.Preload("Attachments").Order("occurred_at DESC")
-	if cityName != "" {
-		dbQuery = dbQuery.Where("city_code = ? OR location LIKE ?", cityCode, "%"+cityName+"%")
+	if cityShort != "" {
+		dbQuery = dbQuery.Where("city_code = ? OR location LIKE ?", cityCode, "%"+cityShort+"%")
 	} else {
 		dbQuery = dbQuery.Where("city_code = ?", cityCode)
 	}
 	dbQuery.Limit(50).Find(&entries)
+	if entries == nil {
+		entries = []models.LifeEntry{}
+	}
 
 	for i := range entries {
 		populateEntryURLs(&entries[i])
 	}
 
-	type catItem struct {
-		Name   string `json:"name"`
-		Amount int64  `json:"amount"`
-	}
-
-	var ledgerSummary any
-	if middleware.IsAdmin(c) {
-		// 3. 关联该城市的消费账单光谱 (仅管理员下发 RC-81)
+	// 3. 关联该城市的消费账单光谱 (仅管理员查询聚合 RC-81, BE-14)
+	ledgerSummary := buildDrawerLedgerSummary(middleware.IsAdmin(c), func() []models.Transaction {
 		var txs []models.Transaction
 		txQuery := db.DB.Where("city_code = ?", cityCode)
-		if cityName != "" {
-			txQuery = db.DB.Where("city_code = ? OR note LIKE ? OR title LIKE ?", cityCode, "%"+cityName+"%", "%"+cityName+"%")
+		if cityShort != "" {
+			txQuery = db.DB.Where("city_code = ? OR note LIKE ? OR title LIKE ?", cityCode, "%"+cityShort+"%", "%"+cityShort+"%")
 		}
 		txQuery.Find(&txs)
-
-		var totalSpent int64
-		categoryBreakdown := make(map[string]int64)
-		for _, tx := range txs {
-			if tx.Type == "expense" {
-				totalSpent += tx.Amount
-				categoryBreakdown[tx.Category] += tx.Amount
-			}
-		}
-
-		categories := make([]catItem, 0, len(categoryBreakdown))
-		for name, amt := range categoryBreakdown {
-			categories = append(categories, catItem{Name: name, Amount: amt})
-		}
-
-		ledgerSummary = gin.H{
-			"total_spent":       totalSpent,
-			"transaction_count": len(txs),
-			"categories":        categories,
-		}
-	} else {
-		// 访客模式财务隐私严格脱敏 (BE-14, RC-81: 匿名访客不执行数据库全量拉取与内存聚合)
-		ledgerSummary = gin.H{
-			"total_spent":       0,
-			"transaction_count": 0,
-			"categories":        []catItem{},
-		}
-	}
+		return txs
+	})
 
 	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 	Success(c, gin.H{
@@ -494,7 +518,7 @@ var ProvinceShortNameMap = map[string]string{
 	"82": "澳门",
 }
 
-// GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91: 履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
+// GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91 / RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
 func GetProvinceMemoryDrawer(c *gin.Context) {
 	adcode := strings.TrimSpace(c.Param("adcode"))
 	if len(adcode) < 2 {
@@ -521,19 +545,11 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		footprints = []models.Footprint{}
 	}
 
-	var firstVisit, latestVisit time.Time
+	firstVisitStr, latestVisitStr := processDrawerFootprints(footprints)
+
 	cityMap := make(map[string]*ProvinceVisitedCity)
 	cityOrder := make([]string, 0)
-
-	for i, f := range footprints {
-		populateFootprintURLs(&footprints[i])
-		if firstVisit.IsZero() || f.VisitedAt.Before(firstVisit) {
-			firstVisit = f.VisitedAt
-		}
-		if latestVisit.IsZero() || f.VisitedAt.After(latestVisit) {
-			latestVisit = f.VisitedAt
-		}
-
+	for _, f := range footprints {
 		if f.CityCode != "" {
 			if item, exists := cityMap[f.CityCode]; exists {
 				item.VisitCount++
@@ -550,15 +566,6 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 				cityOrder = append(cityOrder, f.CityCode)
 			}
 		}
-	}
-
-	firstVisitStr := ""
-	latestVisitStr := ""
-	if !firstVisit.IsZero() {
-		firstVisitStr = firstVisit.Format("2006-01-02")
-	}
-	if !latestVisit.IsZero() {
-		latestVisitStr = latestVisit.Format("2006-01-02")
 	}
 
 	visitedCities := make([]ProvinceVisitedCity, 0, len(cityMap))
@@ -589,51 +596,16 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		populateEntryURLs(&entries[i])
 	}
 
-	type catItem struct {
-		Name   string `json:"name"`
-		Amount int64  `json:"amount"`
-	}
-
-	var ledgerSummary any
-	if middleware.IsAdmin(c) {
-		// 3. 关联该省份的消费账单光谱 (仅管理员下发 RC-81, RC-91)
+	// 3. 关联该省份的消费账单光谱 (仅管理员下发 RC-81, RC-91, RC-93)
+	ledgerSummary := buildDrawerLedgerSummary(middleware.IsAdmin(c), func() []models.Transaction {
 		var txs []models.Transaction
 		txQuery := db.DB.Where("city_code LIKE ?", provPrefix+"%")
 		if provShort != "" {
 			txQuery = db.DB.Where("city_code LIKE ? OR note LIKE ? OR title LIKE ?", provPrefix+"%", "%"+provShort+"%", "%"+provShort+"%")
 		}
 		txQuery.Find(&txs)
-
-		var totalSpent int64
-		categoryBreakdown := make(map[string]int64)
-		for _, tx := range txs {
-			if tx.Type == "expense" {
-				totalSpent += tx.Amount
-				categoryBreakdown[tx.Category] += tx.Amount
-			}
-		}
-
-		categories := make([]catItem, 0, len(categoryBreakdown))
-		for name, amt := range categoryBreakdown {
-			categories = append(categories, catItem{Name: name, Amount: amt})
-		}
-		sort.Slice(categories, func(i, j int) bool {
-			return categories[i].Amount > categories[j].Amount
-		})
-
-		ledgerSummary = gin.H{
-			"total_spent":       totalSpent,
-			"transaction_count": len(txs),
-			"categories":        categories,
-		}
-	} else {
-		// 访客模式财务隐私严格脱敏 (BE-14, RC-81, RC-91: 匿名访客不执行数据库拉取与聚合)
-		ledgerSummary = gin.H{
-			"total_spent":       0,
-			"transaction_count": 0,
-			"categories":        []catItem{},
-		}
-	}
+		return txs
+	})
 
 	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 	Success(c, gin.H{

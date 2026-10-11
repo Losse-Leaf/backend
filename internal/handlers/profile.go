@@ -37,14 +37,10 @@ func sanitizeEDCGear(raw string, isAdmin bool) any {
 	}
 	if isAdmin {
 		for i := range list {
+			// 兼容解析历史遗留旧字段并收敛为 price_cents / sold_price_cents (RC-79)
 			if _, hasCents := list[i]["sold_price_cents"]; !hasCents {
 				if sp, ok := list[i]["sold_price"]; ok {
 					list[i]["sold_price_cents"] = sp
-				}
-			}
-			if _, hasSp := list[i]["sold_price"]; !hasSp {
-				if spc, ok := list[i]["sold_price_cents"]; ok {
-					list[i]["sold_price"] = spc
 				}
 			}
 			if _, hasPriceCents := list[i]["price_cents"]; !hasPriceCents {
@@ -52,6 +48,8 @@ func sanitizeEDCGear(raw string, isAdmin bool) any {
 					list[i]["price_cents"] = p
 				}
 			}
+			delete(list[i], "price")
+			delete(list[i], "sold_price")
 		}
 		return list
 	}

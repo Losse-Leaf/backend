@@ -413,13 +413,34 @@ func VerifyPasscode(c *gin.Context) {
 	now := time.Now()
 	rawToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
 	tokenHash := HashToken(rawToken)
-	deviceID := fmt.Sprintf("dev_web_%s_%s", now.Format("20060102"), generateRandomHex(2))
-
 	deviceName := strings.TrimSpace(req.DeviceName)
 	if deviceName == "" {
 		deviceName = "Web 浏览器 · 主人密钥登录"
 	}
 
+	// RC-82: 检查是否已存在同平台同名的 Web 登录设备记录，避免同一浏览器重复登录无限累积记录
+	var existingDevice models.Device
+	if err := db.DB.Where("platform = ? AND name = ?", "web", deviceName).First(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
+		existingDevice.TokenHash = tokenHash
+		existingDevice.Status = "active"
+		existingDevice.LastActiveAt = now
+		if err := db.DB.Save(&existingDevice).Error; err != nil {
+			Error(c, http.StatusInternalServerError, "更新设备凭证失败: "+err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, Response{
+			Code:    http.StatusOK,
+			Message: "密钥验证通过，已授权以主人身份进入",
+			Data: gin.H{
+				"token":       rawToken,
+				"device_id":   existingDevice.DeviceID,
+				"device_name": existingDevice.Name,
+			},
+		})
+		return
+	}
+
+	deviceID := fmt.Sprintf("dev_web_%s_%s", now.Format("20060102"), generateRandomHex(2))
 	device := models.Device{
 		DeviceID:     deviceID,
 		Name:         deviceName,

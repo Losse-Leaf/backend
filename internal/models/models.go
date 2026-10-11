@@ -102,7 +102,7 @@ type CreditChannel struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GearItem 随身设备与固定资产模型 (RC-53, RG-19)
+// GearItem 随身设备与固定资产模型 (RC-53, RC-79)
 type GearItem struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
@@ -110,30 +110,23 @@ type GearItem struct {
 	Category       string `json:"category"`
 	Status         string `json:"status,omitempty"` // active | sold | 日常自用 | 已出二手
 	PriceCents     int64  `json:"price_cents,omitempty"`
-	Price          int64  `json:"price,omitempty"` // 兼容前端字段 (RG-19)
 	PurchaseDate   string `json:"purchase_date,omitempty"`
 	SoldPriceCents int64  `json:"sold_price_cents,omitempty"`
-	SoldPrice      int64  `json:"sold_price,omitempty"` // 兼容前端字段 (RG-19)
 	SoldDate       string `json:"sold_date,omitempty"`
 	Note           string `json:"note,omitempty"`
 	Link           string `json:"link,omitempty"`
 }
 
-// SiteConfig 站点全局与备案合规配置
+// SiteConfig 站点全局配置 (RC-80)
 type SiteConfig struct {
-	ID              uint      `gorm:"primaryKey" json:"id"`
-	SiteName        string    `json:"site_name"`
-	SiteSubtitle    string    `json:"site_subtitle,omitempty"`
-	CuratorName     string    `json:"curator_name,omitempty"`
-	DefaultLocation string    `json:"default_location,omitempty"`
-	SiteDesc        string    `json:"site_desc,omitempty"`
-	Domain          string    `json:"domain"`
-	ICPNumber       string    `json:"icp_number"`              // 备案号 (可选)
-	ICPLink         string    `json:"icp_link"`                // 备案链接 (可选)
-	PoliceNumber    string    `json:"police_number,omitempty"` // 公安联网备案号
-	PoliceCode      string    `json:"police_code,omitempty"`   // 公安备案编号
+	ID                   uint      `gorm:"primaryKey" json:"id"`
+	SiteName             string    `json:"site_name"`
+	SiteSubtitle         string    `json:"site_subtitle,omitempty"`
+	CuratorName          string    `json:"curator_name,omitempty"`
+	DefaultLocation      string    `json:"default_location,omitempty"`
+	SiteDesc             string    `json:"site_desc,omitempty"`
 	Initialized          bool      `gorm:"default:false" json:"initialized"`
-	MasterPasscode       string    `gorm:"size:128" json:"-"` // 主理人记忆口令哈希
+	MasterPasscode       string    `gorm:"size:128" json:"-"`                       // 主理人记忆口令哈希
 	InitialLiquidBalance int64     `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
@@ -216,7 +209,7 @@ type Wish struct {
 	DeletedAt      gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
-// Footprint 城市旅游足迹打卡表
+// Footprint 城市旅游足迹打卡表 (RC-78: 移除无调用方且泄露精确定位的经纬度)
 type Footprint struct {
 	ID          uint           `gorm:"primaryKey" json:"id"`
 	CityCode    string         `gorm:"size:12;index;not null" json:"city_code"` // 6 位行政区划代码，如杭州 330100
@@ -225,8 +218,6 @@ type Footprint struct {
 	Note        string         `gorm:"type:text" json:"note"`                   // 足迹随笔或简注
 	LifeEntryID *uint          `gorm:"index" json:"life_entry_id,omitempty"`    // 可选关联时间流条目
 	WishID      *uint          `gorm:"index" json:"wish_id,omitempty"`          // 可选关联溯源心愿
-	Latitude    float64        `json:"latitude,omitempty"`                      // GCJ-02 纬度
-	Longitude   float64        `json:"longitude,omitempty"`                     // GCJ-02 经度
 	Attachments []Attachment   `gorm:"foreignKey:FootprintID" json:"attachments"`
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`

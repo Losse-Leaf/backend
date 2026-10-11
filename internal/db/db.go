@@ -83,9 +83,6 @@ func seedData(database *gorm.DB) {
 			CuratorName:     "",
 			DefaultLocation: "",
 			SiteDesc:        "生活档案与时光手账，记录真实可感的日子。",
-			Domain:          "",
-			ICPNumber:       "",
-			ICPLink:         "",
 			Initialized:     false,
 		}
 		database.Create(&config)

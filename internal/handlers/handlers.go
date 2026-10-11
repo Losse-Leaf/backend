@@ -1190,9 +1190,6 @@ func GetConfigV1(c *gin.Context) {
 			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
 			CuratorName:     "",
 			DefaultLocation: "",
-			Domain:          "",
-			ICPNumber:       "",
-			ICPLink:         "",
 		}
 	}
 	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
@@ -1226,21 +1223,6 @@ func UpdateConfig(c *gin.Context) {
 	}
 	if req.SiteDesc != "" {
 		config.SiteDesc = strings.TrimSpace(req.SiteDesc)
-	}
-	if req.Domain != "" {
-		config.Domain = strings.TrimSpace(req.Domain)
-	}
-	if req.ICPNumber != "" {
-		config.ICPNumber = strings.TrimSpace(req.ICPNumber)
-	}
-	if req.ICPLink != "" {
-		config.ICPLink = strings.TrimSpace(req.ICPLink)
-	}
-	if req.PoliceNumber != "" {
-		config.PoliceNumber = strings.TrimSpace(req.PoliceNumber)
-	}
-	if req.PoliceCode != "" {
-		config.PoliceCode = strings.TrimSpace(req.PoliceCode)
 	}
 
 	if err := db.DB.Save(&config).Error; err != nil {

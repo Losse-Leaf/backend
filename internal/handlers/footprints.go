@@ -23,28 +23,24 @@ func populateFootprintURLs(f *models.Footprint) {
 
 // CreateFootprintRequest 录入足迹请求
 type CreateFootprintRequest struct {
-	CityCode      string  `json:"city_code" binding:"required"`
-	CityName      string  `json:"city_name" binding:"required"`
-	VisitedAt     string  `json:"visited_at" binding:"required"`
-	Note          string  `json:"note"`
-	LifeEntryID   *uint   `json:"life_entry_id"`
-	WishID        *uint   `json:"wish_id"`
-	Latitude      float64 `json:"latitude"`
-	Longitude     float64 `json:"longitude"`
-	AttachmentIDs []uint  `json:"attachment_ids"`
+	CityCode      string `json:"city_code" binding:"required"`
+	CityName      string `json:"city_name" binding:"required"`
+	VisitedAt     string `json:"visited_at" binding:"required"`
+	Note          string `json:"note"`
+	LifeEntryID   *uint  `json:"life_entry_id"`
+	WishID        *uint  `json:"wish_id"`
+	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
 // UpdateFootprintRequest 修改足迹请求
 type UpdateFootprintRequest struct {
-	CityCode      string  `json:"city_code"`
-	CityName      string  `json:"city_name"`
-	VisitedAt     string  `json:"visited_at"`
-	Note          string  `json:"note"`
-	LifeEntryID   *uint   `json:"life_entry_id"`
-	WishID        *uint   `json:"wish_id"`
-	Latitude      float64 `json:"latitude"`
-	Longitude     float64 `json:"longitude"`
-	AttachmentIDs []uint  `json:"attachment_ids"`
+	CityCode      string `json:"city_code"`
+	CityName      string `json:"city_name"`
+	VisitedAt     string `json:"visited_at"`
+	Note          string `json:"note"`
+	LifeEntryID   *uint  `json:"life_entry_id"`
+	WishID        *uint  `json:"wish_id"`
+	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
 // GetFootprints 列表查询足迹记录 (支持 city_code, year, since, ETag)
@@ -142,8 +138,6 @@ func CreateFootprint(c *gin.Context) {
 		Note:        strings.TrimSpace(req.Note),
 		LifeEntryID: req.LifeEntryID,
 		WishID:      req.WishID,
-		Latitude:    req.Latitude,
-		Longitude:   req.Longitude,
 	}
 
 	if err := db.DB.Create(&footprint).Error; err != nil {
@@ -194,12 +188,6 @@ func UpdateFootprint(c *gin.Context) {
 	}
 	footprint.LifeEntryID = req.LifeEntryID
 	footprint.WishID = req.WishID
-	if req.Latitude != 0 {
-		footprint.Latitude = req.Latitude
-	}
-	if req.Longitude != 0 {
-		footprint.Longitude = req.Longitude
-	}
 
 	if err := db.DB.Save(&footprint).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新足迹失败")
@@ -364,41 +352,42 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		populateEntryURLs(&entries[i])
 	}
 
-	// 3. 关联该城市的消费账单光谱
-	var txs []models.Transaction
-	txQuery := db.DB.Where("city_code = ?", cityCode)
-	if cityName != "" {
-		txQuery = db.DB.Where("city_code = ? OR note LIKE ? OR title LIKE ?", cityCode, "%"+cityName+"%", "%"+cityName+"%")
-	}
-	txQuery.Find(&txs)
-
-	var totalSpent int64
-	categoryBreakdown := make(map[string]int64)
-	for _, tx := range txs {
-		if tx.Type == "expense" {
-			totalSpent += tx.Amount
-			categoryBreakdown[tx.Category] += tx.Amount
-		}
-	}
-
 	type catItem struct {
 		Name   string `json:"name"`
 		Amount int64  `json:"amount"`
 	}
-	categories := make([]catItem, 0, len(categoryBreakdown))
-	for name, amt := range categoryBreakdown {
-		categories = append(categories, catItem{Name: name, Amount: amt})
-	}
 
 	var ledgerSummary any
 	if middleware.IsAdmin(c) {
+		// 3. 关联该城市的消费账单光谱 (仅管理员下发 RC-81)
+		var txs []models.Transaction
+		txQuery := db.DB.Where("city_code = ?", cityCode)
+		if cityName != "" {
+			txQuery = db.DB.Where("city_code = ? OR note LIKE ? OR title LIKE ?", cityCode, "%"+cityName+"%", "%"+cityName+"%")
+		}
+		txQuery.Find(&txs)
+
+		var totalSpent int64
+		categoryBreakdown := make(map[string]int64)
+		for _, tx := range txs {
+			if tx.Type == "expense" {
+				totalSpent += tx.Amount
+				categoryBreakdown[tx.Category] += tx.Amount
+			}
+		}
+
+		categories := make([]catItem, 0, len(categoryBreakdown))
+		for name, amt := range categoryBreakdown {
+			categories = append(categories, catItem{Name: name, Amount: amt})
+		}
+
 		ledgerSummary = gin.H{
 			"total_spent":       totalSpent,
 			"transaction_count": len(txs),
 			"categories":        categories,
 		}
 	} else {
-		// 访客模式财务隐私严格脱敏 (BE-14)
+		// 访客模式财务隐私严格脱敏 (BE-14, RC-81: 匿名访客不执行数据库全量拉取与内存聚合)
 		ledgerSummary = gin.H{
 			"total_spent":       0,
 			"transaction_count": 0,

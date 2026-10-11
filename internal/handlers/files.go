@@ -148,7 +148,7 @@ func isRegisteredObjectKey(cleanKey string) bool {
 	}
 	var profile models.CuratorProfile
 	if err := db.DB.Select("avatar_url").First(&profile).Error; err == nil && profile.AvatarURL != "" {
-		if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || strings.Contains(profile.AvatarURL, cleanKey) {
+		if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || profile.AvatarURL == cleanKey {
 			return true
 		}
 	}

@@ -2,8 +2,7 @@
 
 > **Living Archive API Hub · 统一数据中枢与 R2 媒体签名引擎**
 >
-> 组织主页: [https://github.com/Losse-Leaf](https://github.com/Losse-Leaf)  
-> 线上服务: [https://codeactivityhub.top](https://codeactivityhub.top)
+> 部署状态: 海外 VPS 独立部署（单二进制内嵌分发，生产域名待定）
 
 ---
 

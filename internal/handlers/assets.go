@@ -98,25 +98,31 @@ func calculateDaysUntilRepayment(repaymentDay int) int {
 }
 
 func loadProfileGear(profile *models.CuratorProfile) []models.GearItem {
-	var list []models.GearItem
 	raw := strings.TrimSpace(profile.EDCGear)
 	if raw == "" {
 		return []models.GearItem{}
 	}
-	_ = json.Unmarshal([]byte(raw), &list)
-	for i := range list {
-		if list[i].PriceCents == 0 && list[i].Price > 0 {
-			list[i].PriceCents = list[i].Price
+	// RC-79: 优先以 models.GearItem 反序列化 (单一事实来源 price_cents / sold_price_cents)，
+	// 历史 JSON 数据若仅存有旧字段 price / sold_price 则提供向下兼容解析
+	type legacyGearItem struct {
+		models.GearItem
+		Price     int64 `json:"price"`
+		SoldPrice int64 `json:"sold_price"`
+	}
+	var legacyList []legacyGearItem
+	if err := json.Unmarshal([]byte(raw), &legacyList); err != nil {
+		return []models.GearItem{}
+	}
+	list := make([]models.GearItem, len(legacyList))
+	for i, item := range legacyList {
+		gear := item.GearItem
+		if gear.PriceCents == 0 && item.Price > 0 {
+			gear.PriceCents = item.Price
 		}
-		if list[i].Price == 0 && list[i].PriceCents > 0 {
-			list[i].Price = list[i].PriceCents
+		if gear.SoldPriceCents == 0 && item.SoldPrice > 0 {
+			gear.SoldPriceCents = item.SoldPrice
 		}
-		if list[i].SoldPriceCents == 0 && list[i].SoldPrice > 0 {
-			list[i].SoldPriceCents = list[i].SoldPrice
-		}
-		if list[i].SoldPrice == 0 && list[i].SoldPriceCents > 0 {
-			list[i].SoldPrice = list[i].SoldPriceCents
-		}
+		list[i] = gear
 	}
 	return list
 }
@@ -150,18 +156,10 @@ func GetAssetsOverview(c *gin.Context) {
 		// 兼容识别后端标准 status="sold" 与前端中文 status="已出二手" (RG-19)
 		if g.Status == "sold" || g.Status == "已出二手" {
 			soldGearCount++
-			soldCents := g.SoldPriceCents
-			if soldCents == 0 && g.SoldPrice > 0 {
-				soldCents = g.SoldPrice
-			}
-			soldRecoveredValue += soldCents
+			soldRecoveredValue += g.SoldPriceCents
 		} else {
 			activeGearCount++
-			priceCents := g.PriceCents
-			if priceCents == 0 && g.Price > 0 {
-				priceCents = g.Price
-			}
-			activeGearValue += priceCents
+			activeGearValue += g.PriceCents
 		}
 	}
 
@@ -430,10 +428,9 @@ func AddGearAsset(c *gin.Context) {
 	Success(c, newGear)
 }
 
-// SellGearAssetRequest 设备转售出二手请求 (RC-53, RG-19)
+// SellGearAssetRequest 设备转售出二手请求 (RC-53, RC-79)
 type SellGearAssetRequest struct {
 	SoldPriceCents int64  `json:"sold_price_cents"` // 出手回血金额 (分)
-	SoldPrice      int64  `json:"sold_price"`       // 兼容前端字段 (分 RG-19)
 	SoldDate       string `json:"sold_date"`        // 转让日期 (YYYY-MM-DD)
 	Note           string `json:"note"`             // 出手备注
 }
@@ -447,9 +444,6 @@ func SellGearAsset(c *gin.Context) {
 		return
 	}
 	soldCents := req.SoldPriceCents
-	if soldCents <= 0 && req.SoldPrice > 0 {
-		soldCents = req.SoldPrice
-	}
 	if soldCents <= 0 {
 		Error(c, http.StatusBadRequest, "卖出回血金额必填")
 		return
@@ -482,7 +476,6 @@ func SellGearAsset(c *gin.Context) {
 
 	list[foundIdx].Status = "sold"
 	list[foundIdx].SoldPriceCents = soldCents
-	list[foundIdx].SoldPrice = soldCents
 	list[foundIdx].SoldDate = soldDate
 	if req.Note != "" {
 		if list[foundIdx].Note != "" {

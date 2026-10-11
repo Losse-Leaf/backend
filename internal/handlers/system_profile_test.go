@@ -407,5 +407,32 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 		if !strings.HasPrefix(res.Data.Token, "lldt_") || !strings.HasPrefix(res.Data.DeviceID, "dev_web_") || res.Data.DeviceName != "Safari · macOS" {
 			t.Fatalf("unexpected verify response: %+v", res.Data)
 		}
+		initialDeviceID := res.Data.DeviceID
+
+		// 8. 相同浏览器重复输入密钥登录，应复用既有设备记录，杜绝无界膨胀 (RC-82)
+		wSecond := httptest.NewRecorder()
+		reqSecond := httptest.NewRequest(http.MethodPost, "/api/v1/auth/verify", bytes.NewReader(b))
+		reqSecond.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wSecond, reqSecond)
+		if wSecond.Code != http.StatusOK {
+			t.Fatalf("expected 200 on repeated passcode verify, got %d", wSecond.Code)
+		}
+		var resSecond struct {
+			Data struct {
+				Token      string `json:"token"`
+				DeviceID   string `json:"device_id"`
+				DeviceName string `json:"device_name"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wSecond.Body.Bytes(), &resSecond)
+		if resSecond.Data.DeviceID != initialDeviceID {
+			t.Fatalf("expected reused device_id %s, got new device_id %s (RC-82)", initialDeviceID, resSecond.Data.DeviceID)
+		}
+
+		var devCount int64
+		db.DB.Model(&models.Device{}).Where("platform = ? AND name = ?", "web", "Safari · macOS").Count(&devCount)
+		if devCount != 1 {
+			t.Fatalf("expected exactly 1 device record for 'Safari · macOS', got %d (RC-82)", devCount)
+		}
 	})
 }

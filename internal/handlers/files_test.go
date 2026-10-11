@@ -257,7 +257,7 @@ func TestFilesHandler(t *testing.T) {
 
 		// Update profile with full presigned URL and verify it extracts clean relative path
 		updateReqWithFullURL := UpdateCuratorProfileRequest{
-			AvatarURL: "https://assets.codeactivityhub.top/avatar/user.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=987654",
+			AvatarURL: "https://media.example.com/avatar/user.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=987654",
 		}
 		body2, _ := json.Marshal(updateReqWithFullURL)
 		req2 := httptest.NewRequest(http.MethodPut, "/api/v1/profile", bytes.NewReader(body2))

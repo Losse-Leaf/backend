@@ -22,7 +22,7 @@ func TestStorageHelpers(t *testing.T) {
 			{"avatar/user.png", "avatar/user.png"},
 			{"/avatar/user.png", "avatar/user.png"},
 			{"entries/2026/10/09/uuid-shot.jpg", "entries/2026/10/09/uuid-shot.jpg"},
-			{"https://assets.codeactivityhub.top/avatar/user.png?X-Amz-Algorithm=AWS4", "avatar/user.png"},
+			{"https://media.example.com/avatar/user.png?X-Amz-Algorithm=AWS4", "avatar/user.png"},
 			{"https://images.unsplash.com/photo-12345?auto=format", "https://images.unsplash.com/photo-12345?auto=format"},
 		}
 

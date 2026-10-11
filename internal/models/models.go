@@ -102,13 +102,13 @@ type CreditChannel struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GearItem 随身设备与固定资产模型 (RC-53, RC-79)
+// GearItem 随身设备与固定资产模型 (RC-53, RC-79, RC-87)
 type GearItem struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	Spec           string `json:"spec,omitempty"`
 	Category       string `json:"category"`
-	Status         string `json:"status,omitempty"` // active | sold | 日常自用 | 已出二手
+	Status         string `json:"status,omitempty"` // active | sold (RC-90)
 	PriceCents     int64  `json:"price_cents,omitempty"`
 	PurchaseDate   string `json:"purchase_date,omitempty"`
 	SoldPriceCents int64  `json:"sold_price_cents,omitempty"`

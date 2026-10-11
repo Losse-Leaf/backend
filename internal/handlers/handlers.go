@@ -1179,7 +1179,7 @@ func GetGlobalStats(c *gin.Context) {
 }
 
 // ==========================================
-// 6. Legacy Compatible Routes (平滑兼容原有旧路由)
+// 6. Global Site Configuration & Health Routes (站点全局配置与健康探针 RC-90)
 
 
 func GetConfigV1(c *gin.Context) {

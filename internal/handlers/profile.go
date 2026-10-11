@@ -36,21 +36,6 @@ func sanitizeEDCGear(raw string, isAdmin bool) any {
 		return parseJSONOrRaw(raw)
 	}
 	if isAdmin {
-		for i := range list {
-			// 兼容解析历史遗留旧字段并收敛为 price_cents / sold_price_cents (RC-79)
-			if _, hasCents := list[i]["sold_price_cents"]; !hasCents {
-				if sp, ok := list[i]["sold_price"]; ok {
-					list[i]["sold_price_cents"] = sp
-				}
-			}
-			if _, hasPriceCents := list[i]["price_cents"]; !hasPriceCents {
-				if p, ok := list[i]["price"]; ok {
-					list[i]["price_cents"] = p
-				}
-			}
-			delete(list[i], "price")
-			delete(list[i], "sold_price")
-		}
 		return list
 	}
 	sanitized := make([]map[string]any, 0, len(list))
@@ -58,7 +43,7 @@ func sanitizeEDCGear(raw string, isAdmin bool) any {
 		clean := make(map[string]any)
 		for k, v := range item {
 			// 严格脱敏财务字段 (RC-53)
-			if k == "price_cents" || k == "sold_price_cents" || k == "price" || k == "sold_price" {
+			if k == "price_cents" || k == "sold_price_cents" {
 				continue
 			}
 			clean[k] = v

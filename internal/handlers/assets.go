@@ -102,27 +102,9 @@ func loadProfileGear(profile *models.CuratorProfile) []models.GearItem {
 	if raw == "" {
 		return []models.GearItem{}
 	}
-	// RC-79: 优先以 models.GearItem 反序列化 (单一事实来源 price_cents / sold_price_cents)，
-	// 历史 JSON 数据若仅存有旧字段 price / sold_price 则提供向下兼容解析
-	type legacyGearItem struct {
-		models.GearItem
-		Price     int64 `json:"price"`
-		SoldPrice int64 `json:"sold_price"`
-	}
-	var legacyList []legacyGearItem
-	if err := json.Unmarshal([]byte(raw), &legacyList); err != nil {
+	var list []models.GearItem
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
 		return []models.GearItem{}
-	}
-	list := make([]models.GearItem, len(legacyList))
-	for i, item := range legacyList {
-		gear := item.GearItem
-		if gear.PriceCents == 0 && item.Price > 0 {
-			gear.PriceCents = item.Price
-		}
-		if gear.SoldPriceCents == 0 && item.SoldPrice > 0 {
-			gear.SoldPriceCents = item.SoldPrice
-		}
-		list[i] = gear
 	}
 	return list
 }

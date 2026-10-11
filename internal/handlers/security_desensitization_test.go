@@ -540,18 +540,18 @@ func TestBE17_ETagRoleCacheIsolation(t *testing.T) {
 	}
 }
 
-// TestRG19_GearStatusAndPriceCompatibility 测试设备二手中文状态与 sold_price 字段兼容核算 (RG-19)
-func TestRG19_GearStatusAndPriceCompatibility(t *testing.T) {
+// TestGearStatusAndPriceOverview 测试设备在用与转售二手状态资产核算 (RC-87, RC-90)
+func TestGearStatusAndPriceOverview(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 
 	testMasterKey := "lldt_secret_rg19"
 	seedTestAdminDevice(testMasterKey)
 
-	// 模拟前端写入了 status: "已出二手" 和 sold_price (而非 sold_price_cents)
+	// 标准单一事实来源: status="active"/"sold", price_cents / sold_price_cents
 	rawGearJSON := `[
-		{"id":"g1","name":"MacBook Air M2","category":"计算设备","status":"日常自用","price_cents":799900},
-		{"id":"g2","name":"iPad mini 6","category":"计算设备","status":"已出二手","price_cents":379900,"sold_price":260000}
+		{"id":"g1","name":"MacBook Air M2","category":"计算设备","status":"active","price_cents":799900},
+		{"id":"g2","name":"iPad mini 6","category":"计算设备","status":"sold","price_cents":379900,"sold_price_cents":260000}
 	]`
 	db.DB.Create(&models.CuratorProfile{
 		Name:    "测试主理人",
@@ -576,11 +576,11 @@ func TestRG19_GearStatusAndPriceCompatibility(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
 	if resp.Data.GearSummary.ActiveCount != 1 || resp.Data.GearSummary.ActiveValue != 799900 {
-		t.Fatalf("RG-19 在用固资统计失真: active_count=%d, active_value=%d",
+		t.Fatalf("在用固资统计失真: active_count=%d, active_value=%d",
 			resp.Data.GearSummary.ActiveCount, resp.Data.GearSummary.ActiveValue)
 	}
 	if resp.Data.GearSummary.SoldCount != 1 || resp.Data.GearSummary.SoldRecoveredValue != 260000 {
-		t.Fatalf("RG-19 二手回血统计失真: sold_count=%d, sold_recovered=%d",
+		t.Fatalf("二手回血统计失真: sold_count=%d, sold_recovered=%d",
 			resp.Data.GearSummary.SoldCount, resp.Data.GearSummary.SoldRecoveredValue)
 	}
 }

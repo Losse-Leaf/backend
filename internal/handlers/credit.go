@@ -13,7 +13,87 @@ import (
 	"gorm.io/gorm"
 )
 
-// AssembleInstallmentTransaction 组装分期账单核心字段 (渠道默认 huabei、期数默认 12、还款日查渠道/默认 10)
+// CalculateElapsedInstallmentMonths 根据购买时间(occurredAt)与每月还款日(repaymentDay)，计算截至 now 已经历的还款期数与剩余期数
+func CalculateElapsedInstallmentMonths(occurredAt time.Time, totalMonths int, repaymentDay int, now time.Time) (paidMonths int, remainMonths int) {
+	if totalMonths <= 0 {
+		totalMonths = 12
+	}
+	if repaymentDay < 1 {
+		repaymentDay = 10
+	}
+	if repaymentDay > 31 {
+		repaymentDay = 31
+	}
+	if occurredAt.IsZero() {
+		return 0, totalMonths
+	}
+
+	loc := now.Location()
+	occInLoc := occurredAt.In(loc)
+	occY, occM, occD := occInLoc.Date()
+	purchaseDate := time.Date(occY, occM, occD, 0, 0, 0, 0, loc)
+
+	nowY, nowM, nowD := now.Date()
+	todayDate := time.Date(nowY, nowM, nowD, 0, 0, 0, 0, loc)
+
+	if !todayDate.After(purchaseDate) {
+		return 0, totalMonths
+	}
+
+	y, m := occY, occM
+	for paidMonths < totalMonths {
+		daysInMonth := time.Date(y, m+1, 0, 0, 0, 0, 0, loc).Day()
+		day := repaymentDay
+		if day > daysInMonth {
+			day = daysInMonth
+		}
+		repDate := time.Date(y, m, day, 0, 0, 0, 0, loc)
+		if repDate.After(todayDate) {
+			break
+		}
+		if repDate.After(purchaseDate) {
+			paidMonths++
+		}
+		m++
+		if m > 12 {
+			m = 1
+			y++
+		}
+	}
+
+	if paidMonths > totalMonths {
+		paidMonths = totalMonths
+	}
+	remainMonths = totalMonths - paidMonths
+	return paidMonths, remainMonths
+}
+
+// CalculateInstallmentAmounts 精确计算分期已还金额与剩余待还本金（消除整除尾差，保证 paidAmount + remainingDebt == totalAmount）
+func CalculateInstallmentAmounts(totalAmount int64, totalMonths int, monthlyPay int64, paidMonths int, remainMonths int) (paidAmount int64, remainingDebt int64) {
+	if totalAmount <= 0 {
+		return 0, 0
+	}
+	if totalMonths <= 0 {
+		totalMonths = 12
+	}
+	if monthlyPay <= 0 {
+		monthlyPay = totalAmount / int64(totalMonths)
+	}
+	if remainMonths <= 0 || paidMonths >= totalMonths {
+		return totalAmount, 0
+	}
+	if paidMonths <= 0 || remainMonths >= totalMonths {
+		return 0, totalAmount
+	}
+	paidAmount = int64(paidMonths) * monthlyPay
+	if paidAmount > totalAmount {
+		paidAmount = totalAmount
+	}
+	remainingDebt = totalAmount - paidAmount
+	return paidAmount, remainingDebt
+}
+
+// AssembleInstallmentTransaction 组装分期账单核心字段 (根据购买时间 OccurredAt 与渠道还款日自动推算剩余期数)
 func AssembleInstallmentTransaction(
 	tx *models.Transaction,
 	isInstallment bool,
@@ -57,22 +137,25 @@ func AssembleInstallmentTransaction(
 	}
 	tx.InstallmentMonthlyPay = mPay
 
-	rMonths := remainMonths
-	if rMonths <= 0 {
-		rMonths = months
-	}
-	tx.InstallmentRemainMonths = rMonths
-
 	rDay := repaymentDay
-	if rDay <= 0 {
-		var ch models.CreditChannel
-		if err := dbTx.Where("code = ?", chCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
+	var ch models.CreditChannel
+	if err := dbTx.Where("code = ?", chCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
+		if rDay <= 0 {
 			rDay = ch.RepaymentDay
-		} else {
-			rDay = 10
 		}
 	}
+	if rDay <= 0 {
+		rDay = 10
+	}
 	tx.RepaymentDay = rDay
+
+	// 根据购买时间 (tx.OccurredAt) 与每月还款日自动核算剩余期数
+	_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, months, rDay, time.Now())
+	if remainMonths <= 0 || remainMonths == months || remainMonths > autoRemain {
+		tx.InstallmentRemainMonths = autoRemain
+	} else {
+		tx.InstallmentRemainMonths = remainMonths
+	}
 }
 
 // CreditChannelRequest 信贷渠道新增与修改入参 (RC-53)
@@ -194,12 +277,25 @@ func UpdateCreditChannel(c *gin.Context) {
 		if err := tx.Save(&ch).Error; err != nil {
 			return err
 		}
+		targetCode := ch.Code
 		if codeChanged {
 			// 同步迁移既有分期账目的渠道归属，杜绝旧 Transaction 渠道归属断裂
 			if err := tx.Model(&models.Transaction{}).
 				Where("installment_channel_code = ?", oldCode).
 				Update("installment_channel_code", newCode).Error; err != nil {
 				return err
+			}
+			targetCode = newCode
+		}
+		// 同步更新该渠道下所有分期账目的还款日并按购买时间重算剩余期数
+		var relatedTxs []models.Transaction
+		if err := tx.Where("is_installment = ? AND installment_channel_code = ?", true, targetCode).Find(&relatedTxs).Error; err == nil {
+			now := time.Now()
+			for _, rtx := range relatedTxs {
+				_, autoRemain := CalculateElapsedInstallmentMonths(rtx.OccurredAt, rtx.InstallmentMonths, ch.RepaymentDay, now)
+				rtx.RepaymentDay = ch.RepaymentDay
+				rtx.InstallmentRemainMonths = autoRemain
+				_ = tx.Save(&rtx).Error
 			}
 		}
 		return nil

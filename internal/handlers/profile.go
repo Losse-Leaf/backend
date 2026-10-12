@@ -29,26 +29,20 @@ func parseJSONOrRaw(raw string) any {
 func sanitizeEDCGear(raw string, isAdmin bool) any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return []any{}
+		return []models.GearItem{}
 	}
-	var list []map[string]any
-	if err := json.Unmarshal([]byte(raw), &list); err != nil {
-		return parseJSONOrRaw(raw)
-	}
+	var dummy models.CuratorProfile
+	dummy.EDCGear = raw
+	list := loadProfileGear(&dummy)
 	if isAdmin {
 		return list
 	}
-	sanitized := make([]map[string]any, 0, len(list))
-	for _, item := range list {
-		clean := make(map[string]any)
-		for k, v := range item {
-			// 严格脱敏财务字段 (RC-53)
-			if k == "price_cents" || k == "sold_price_cents" {
-				continue
-			}
-			clean[k] = v
-		}
-		sanitized = append(sanitized, clean)
+	sanitized := make([]models.GearItem, len(list))
+	for i, g := range list {
+		// 访客严格脱敏财务字段 (RC-53)
+		g.PriceCents = 0
+		g.SoldPriceCents = 0
+		sanitized[i] = g
 	}
 	return sanitized
 }

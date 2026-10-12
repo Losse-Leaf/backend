@@ -19,8 +19,6 @@ import (
 	"gorm.io/gorm"
 )
 
-var startTime = time.Now()
-
 // 统一标准响应结构
 type Response struct {
 	Code    int         `json:"code"`
@@ -99,6 +97,15 @@ func populateEntryURLs(e *models.LifeEntry) {
 	} else {
 		e.Project = nil
 	}
+
+	if e.WishID != nil && *e.WishID > 0 {
+		var wish models.Wish
+		if db.DB.Where("id = ?", *e.WishID).Limit(1).Find(&wish).RowsAffected > 0 {
+			e.Wish = &wish
+		}
+	} else {
+		e.Wish = nil
+	}
 }
 
 // ==========================================
@@ -107,17 +114,17 @@ func populateEntryURLs(e *models.LifeEntry) {
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
-	Type          string `json:"type" binding:"required"` // life, thought, photo, project, collection
+	Type          string `json:"type" binding:"required"` // life, travel, project, wish
 	Title         string `json:"title"`
 	Content       string `json:"content" binding:"required"`
 	OccurredAt    string `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
 	Location      string `json:"location"`
-	Meta          string `json:"meta"`
-	Link          string `json:"link"`
 	Featured      bool   `json:"featured"`
 	CityCode      string `json:"city_code"`
 	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
+	WishID        *uint  `json:"wish_id"`
+	FootprintID   *uint  `json:"footprint_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
@@ -135,6 +142,17 @@ func CreateLifeEntry(c *gin.Context) {
 	location := strings.TrimSpace(req.Location)
 	cityCode := strings.TrimSpace(req.CityCode)
 	cityName := strings.TrimSpace(req.CityName)
+
+	// 若明确关联了某次旅程足迹 (FootprintID)，自动补齐该旅程的城市代码与名称
+	if req.FootprintID != nil && *req.FootprintID > 0 && cityCode == "" {
+		var fp models.Footprint
+		if err := db.DB.First(&fp, *req.FootprintID).Error; err == nil && fp.ID > 0 {
+			cityCode = fp.CityCode
+			if cityName == "" {
+				cityName = fp.CityName
+			}
+		}
+	}
 
 	if cityCode != "" {
 		if cityName == "" && location != "" {
@@ -162,16 +180,13 @@ func CreateLifeEntry(c *gin.Context) {
 				if location != "" {
 					existing.Location = location
 				}
-				if m := strings.TrimSpace(req.Meta); m != "" {
-					existing.Meta = m
-				}
-				if l := strings.TrimSpace(req.Link); l != "" {
-					existing.Link = l
-				}
 				existing.Featured = req.Featured
 				if cityCode != "" {
 					existing.CityCode = cityCode
 					existing.CityName = cityName
+				}
+				if req.FootprintID != nil {
+					existing.FootprintID = req.FootprintID
 				}
 				_ = db.DB.Save(&existing).Error
 				if len(req.AttachmentIDs) > 0 {
@@ -190,34 +205,38 @@ func CreateLifeEntry(c *gin.Context) {
 	}
 
 	entry := models.LifeEntry{
-		Type:       req.Type,
-		Title:      title,
-		Content:    content,
-		OccurredAt: occurred,
-		Location:   location,
-		Meta:       strings.TrimSpace(req.Meta),
-		Link:       strings.TrimSpace(req.Link),
-		Featured:   req.Featured,
-		CityCode:   cityCode,
-		CityName:   cityName,
-		ProjectID:  req.ProjectID,
+		Type:        req.Type,
+		Title:       title,
+		Content:     content,
+		OccurredAt:  occurred,
+		Location:    location,
+		Featured:    req.Featured,
+		CityCode:    cityCode,
+		CityName:    cityName,
+		ProjectID:   req.ProjectID,
+		WishID:      req.WishID,
+		FootprintID: req.FootprintID,
 	}
 
-	// 保存主体
-	if err := db.DB.Create(&entry).Error; err != nil {
+	// 事务内原子保存主体、关联附件与下渗足迹
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&entry).Error; err != nil {
+			return err
+		}
+		if len(req.AttachmentIDs) > 0 {
+			if err := tx.Model(&models.Attachment{}).
+				Where("id IN ?", req.AttachmentIDs).
+				Update("entry_id", entry.ID).Error; err != nil {
+				return err
+			}
+		}
+		syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx)
+		return nil
+	})
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "保存记录失败: "+err.Error())
 		return
 	}
-
-	// 关联已上传的附件
-	if len(req.AttachmentIDs) > 0 {
-		db.DB.Model(&models.Attachment{}).
-			Where("id IN ?", req.AttachmentIDs).
-			Update("entry_id", entry.ID)
-	}
-
-	// 主流自然下渗：当记录携带 city_code 时，自动点亮/同步对应城市足迹
-	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
 
 	// 重新加载逻辑外键关联
 	db.DB.First(&entry, entry.ID)
@@ -231,7 +250,7 @@ func CreateLifeEntry(c *gin.Context) {
 func GetLifeEntriesV1(c *gin.Context) {
 	entryType := c.Query("type")
 	year := c.Query("year")
-	category := c.Query("category") // 兼容 5 大核心视角 (daily, thought, project, collection, all)
+	category := c.Query("category") // 支持 4 大纯化核心形态视角 (daily, travel, project, wish, transaction, all)
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
@@ -270,17 +289,19 @@ func GetLifeEntriesV1(c *gin.Context) {
 		}
 	}
 
-	// 核心视角动态映射
+	// 核心视角动态映射 (4 大纯化形态: daily, travel, project, wish + transaction)
 	if category != "" && category != "all" {
 		switch category {
 		case "daily":
-			query = query.Where("type IN ('daily', 'life', 'coffee', 'place', 'moment')")
+			query = query.Where("type IN ('daily', 'life', 'thought', 'photo', 'coffee', 'moment', 'idea', 'note', 'essay')")
+		case "travel":
+			query = query.Where("type IN ('travel', 'place') OR (city_code != '' AND city_code IS NOT NULL)")
+		case "project":
+			query = query.Where("type IN ('project', 'code', 'craft') OR (project_id IS NOT NULL AND project_id > 0)")
+		case "wish", "collection":
+			query = query.Where("type IN ('wish', 'collection') OR (wish_id IS NOT NULL AND wish_id > 0)")
 		case "thought":
 			query = query.Where("type IN ('thought', 'idea', 'note', 'essay')")
-		case "project":
-			query = query.Where("type IN ('project', 'code', 'craft')")
-		case "collection":
-			query = query.Where("type IN ('collection', 'music', 'book', 'game', 'purchase', 'gear', 'movie')")
 		case "photo":
 			query = query.Where("type = 'photo'")
 		case "transaction":
@@ -353,12 +374,12 @@ type UpdateEntryRequest struct {
 	Content       string `json:"content"`
 	OccurredAt    string `json:"occurred_at"`
 	Location      string `json:"location"`
-	Meta          string `json:"meta"`
-	Link          string `json:"link"`
 	Featured      *bool  `json:"featured"`
 	CityCode      string `json:"city_code"`
 	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
+	WishID        *uint  `json:"wish_id"`
+	FootprintID   *uint  `json:"footprint_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
@@ -389,12 +410,6 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.Location != "" {
 		entry.Location = strings.TrimSpace(req.Location)
 	}
-	if req.Meta != "" {
-		entry.Meta = strings.TrimSpace(req.Meta)
-	}
-	if req.Link != "" {
-		entry.Link = strings.TrimSpace(req.Link)
-	}
 	if req.Featured != nil {
 		entry.Featured = *req.Featured
 	}
@@ -403,6 +418,18 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 	if req.CityName != "" {
 		entry.CityName = strings.TrimSpace(req.CityName)
+	}
+	if req.FootprintID != nil {
+		entry.FootprintID = req.FootprintID
+		if *req.FootprintID > 0 && entry.CityCode == "" {
+			var fp models.Footprint
+			if err := db.DB.First(&fp, *req.FootprintID).Error; err == nil && fp.ID > 0 {
+				entry.CityCode = fp.CityCode
+				if entry.CityName == "" {
+					entry.CityName = fp.CityName
+				}
+			}
+		}
 	}
 	if entry.CityCode != "" {
 		if entry.CityName == "" && entry.Location != "" {
@@ -415,6 +442,9 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.ProjectID != nil {
 		entry.ProjectID = req.ProjectID
 	}
+	if req.WishID != nil {
+		entry.WishID = req.WishID
+	}
 
 	if req.OccurredAt != "" {
 		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
@@ -422,28 +452,35 @@ func UpdateLifeEntry(c *gin.Context) {
 		}
 	}
 
-	if err := db.DB.Save(&entry).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新记录失败")
+	// 事务内原子保存记录、更新附件关联与下渗足迹
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&entry).Error; err != nil {
+			return err
+		}
+		if req.AttachmentIDs != nil {
+			// 解除未包含的附件
+			if err := tx.Model(&models.Attachment{}).
+				Where("entry_id = ? AND id NOT IN ?", entry.ID, req.AttachmentIDs).
+				Update("entry_id", nil).Error; err != nil {
+				return err
+			}
+
+			// 绑定新选中的附件
+			if len(req.AttachmentIDs) > 0 {
+				if err := tx.Model(&models.Attachment{}).
+					Where("id IN ?", req.AttachmentIDs).
+					Update("entry_id", entry.ID).Error; err != nil {
+					return err
+				}
+			}
+		}
+		syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx)
+		return nil
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "更新记录失败: "+err.Error())
 		return
 	}
-
-	// 更新关联附件
-	if req.AttachmentIDs != nil {
-		// 解除未包含的附件
-		db.DB.Model(&models.Attachment{}).
-			Where("entry_id = ? AND id NOT IN ?", entry.ID, req.AttachmentIDs).
-			Update("entry_id", nil)
-
-		// 绑定新选中的附件
-		if len(req.AttachmentIDs) > 0 {
-			db.DB.Model(&models.Attachment{}).
-				Where("id IN ?", req.AttachmentIDs).
-				Update("entry_id", entry.ID)
-		}
-	}
-
-	// 主流自然下渗：同步或点亮关联城市足迹
-	syncFootprintFromLifeEntry(&entry, req.AttachmentIDs)
 
 	db.DB.First(&entry, entry.ID)
 	populateEntryURLs(&entry)
@@ -661,15 +698,16 @@ func GetStorageStatus(c *gin.Context) {
 // ==========================================
 
 type TransactionRequest struct {
-	Amount                  int64  `json:"amount" binding:"required"` // 分
-	Type                    string `json:"type" binding:"required"`   // income, expense
-	Category                string `json:"category" binding:"required"`
-	Title                   string `json:"title"`
-	Note                    string `json:"note"`
-	PaymentMethod           string `json:"payment_method"`
-	WishID                  *uint  `json:"wish_id"`
-	CityCode                string `json:"city_code"`
-	OccurredAt              string `json:"occurred_at"`
+	Amount        int64  `json:"amount" binding:"required"` // 分
+	Type          string `json:"type" binding:"required"`   // income, expense
+	Category      string `json:"category" binding:"required"`
+	Title         string `json:"title"`
+	Note          string `json:"note"`
+	PaymentMethod string `json:"payment_method"`
+	WishID        *uint  `json:"wish_id"`
+	FootprintID   *uint  `json:"footprint_id"`
+	CityCode      string `json:"city_code"`
+	OccurredAt    string `json:"occurred_at"`
 	// 分期付款核心字段 (RC-53)
 	IsInstallment           bool   `json:"is_installment"`
 	InstallmentChannelCode  string `json:"installment_channel_code"`
@@ -679,9 +717,9 @@ type TransactionRequest struct {
 	InstallmentRemainMonths int    `json:"installment_remain_months"`
 	RepaymentDay            int    `json:"repayment_day"`
 	// 双向联动：记账大件同步收录至随身设备库 (RC-53)
-	LinkGearAsset           bool   `json:"link_gear_asset"`
-	GearCategory            string `json:"gear_category"`
-	GearSpec                string `json:"gear_spec"`
+	LinkGearAsset bool   `json:"link_gear_asset"`
+	GearCategory  string `json:"gear_category"`
+	GearSpec      string `json:"gear_spec"`
 }
 
 // CreateTransaction 记一笔 (支持分期付款与随身设备库双向绑定 RC-53)
@@ -702,9 +740,13 @@ func CreateTransaction(c *gin.Context) {
 		Note:          strings.TrimSpace(req.Note),
 		PaymentMethod: strings.TrimSpace(req.PaymentMethod),
 		WishID:        req.WishID,
+		FootprintID:   req.FootprintID,
 		CityCode:      strings.TrimSpace(req.CityCode),
 		OccurredAt:    occurred,
 	}
+
+	// 若选择了关联旅程 (FootprintID) 或带有城市代码，自动对齐城市并尝试归并到对应旅程
+	autoLinkTransactionFootprint(&tx)
 
 	if req.IsInstallment {
 		AssembleInstallmentTransaction(
@@ -828,6 +870,17 @@ func GetTransactions(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
+	for i := range txs {
+		if txs[i].IsInstallment {
+			_, autoRemain := CalculateElapsedInstallmentMonths(txs[i].OccurredAt, txs[i].InstallmentMonths, txs[i].RepaymentDay, now)
+			if txs[i].InstallmentRemainMonths > autoRemain {
+				txs[i].InstallmentRemainMonths = autoRemain
+				_ = db.DB.Save(&txs[i]).Error
+			}
+		}
+	}
+
 	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
 	var maxUpdated time.Time
 	for _, tx := range txs {
@@ -918,6 +971,13 @@ func UpdateTransaction(c *gin.Context) {
 	if req.WishID != nil {
 		tx.WishID = req.WishID
 	}
+	if req.FootprintID != nil {
+		if *req.FootprintID == 0 {
+			tx.FootprintID = nil
+		} else {
+			tx.FootprintID = req.FootprintID
+		}
+	}
 	if req.CityCode != "" {
 		tx.CityCode = strings.TrimSpace(req.CityCode)
 	}
@@ -928,6 +988,8 @@ func UpdateTransaction(c *gin.Context) {
 		}
 	}
 
+	autoLinkTransactionFootprint(&tx)
+
 	if req.IsInstallment {
 		tx.IsInstallment = true
 		if req.InstallmentChannelCode != "" {
@@ -935,19 +997,28 @@ func UpdateTransaction(c *gin.Context) {
 		}
 		if req.InstallmentTotalAmount > 0 {
 			tx.InstallmentTotalAmount = req.InstallmentTotalAmount
+		} else if tx.InstallmentTotalAmount <= 0 {
+			tx.InstallmentTotalAmount = tx.Amount
 		}
 		if req.InstallmentMonths > 0 {
 			tx.InstallmentMonths = req.InstallmentMonths
 		}
 		if req.InstallmentMonthlyPay > 0 {
 			tx.InstallmentMonthlyPay = req.InstallmentMonthlyPay
-		}
-		if req.InstallmentRemainMonths >= 0 {
-			tx.InstallmentRemainMonths = req.InstallmentRemainMonths
+		} else if tx.InstallmentMonths > 0 {
+			tx.InstallmentMonthlyPay = tx.InstallmentTotalAmount / int64(tx.InstallmentMonths)
 		}
 		if req.RepaymentDay >= 1 && req.RepaymentDay <= 31 {
 			tx.RepaymentDay = req.RepaymentDay
 		}
+		_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, tx.InstallmentMonths, tx.RepaymentDay, time.Now())
+		if req.InstallmentRemainMonths >= 0 && req.InstallmentRemainMonths <= autoRemain {
+			tx.InstallmentRemainMonths = req.InstallmentRemainMonths
+		} else {
+			tx.InstallmentRemainMonths = autoRemain
+		}
+	} else {
+		tx.IsInstallment = false
 	}
 
 	if err := db.DB.Save(&tx).Error; err != nil {
@@ -1029,32 +1100,36 @@ func CreateProject(c *gin.Context) {
 		p.Status = "Active"
 	}
 
-	if err := db.DB.Create(&p).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "创建项目失败")
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&p).Error; err != nil {
+			return err
+		}
+
+		// 伴生创建机制：在【造物】立项时自动伴生创建一条对应时间的一级记录写入主时间流 (保证事务原子性)
+		entryContent := p.Description
+		if entryContent == "" {
+			entryContent = p.Story
+		}
+		if entryContent == "" {
+			entryContent = p.Subtitle
+		}
+		if entryContent == "" {
+			entryContent = fmt.Sprintf("立项开启造物项目「%s」。", p.Title)
+		}
+		companionEntry := models.LifeEntry{
+			Type:       "project",
+			Title:      p.Title,
+			Content:    entryContent,
+			OccurredAt: time.Now(),
+			Featured:   p.Featured,
+			ProjectID:  &p.ID,
+		}
+		return tx.Create(&companionEntry).Error
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "创建项目及伴生记录失败: "+err.Error())
 		return
 	}
-
-	// 伴生创建机制：在【造物】立项时自动伴生创建一条对应时间的一级记录写入主时间流 (Record-First Architecture)
-	entryContent := p.Description
-	if entryContent == "" {
-		entryContent = p.Story
-	}
-	if entryContent == "" {
-		entryContent = p.Subtitle
-	}
-	if entryContent == "" {
-		entryContent = fmt.Sprintf("立项开启造物项目「%s」。", p.Title)
-	}
-	companionEntry := models.LifeEntry{
-		Type:       "project",
-		Title:      p.Title,
-		Content:    entryContent,
-		OccurredAt: time.Now(),
-		Link:       p.GithubURL,
-		Featured:   p.Featured,
-		ProjectID:  &p.ID,
-	}
-	_ = db.DB.Create(&companionEntry).Error
 	InvalidateStatsCache()
 
 	Success(c, p)
@@ -1202,38 +1277,45 @@ func UpdateProject(c *gin.Context) {
 		p.Order = *req.Order
 	}
 
-	if err := db.DB.Save(&p).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新项目失败: "+err.Error())
-		return
-	}
-
-	// 伴生创建机制：当造物项目更新进展手记 (story) 或状态变迁 (status) 时，自动伴生创建一条一级记录写入主时间流
-	storyChanged := req.Story != nil && p.Story != "" && p.Story != oldStory
-	statusChanged := req.Status != nil && p.Status != "" && p.Status != oldStatus
-	if storyChanged || statusChanged {
-		entryTitle := fmt.Sprintf("%s · 造物手记", p.Title)
-		if statusChanged && !storyChanged {
-			entryTitle = fmt.Sprintf("%s · 状态演进 (%s)", p.Title, p.Status)
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&p).Error; err != nil {
+			return err
 		}
-		entryContent := p.Story
-		if !storyChanged || entryContent == "" {
-			if p.Description != "" {
-				entryContent = p.Description
-			} else {
-				entryContent = fmt.Sprintf("造物项目「%s」进展更新，当前状态：%s。", p.Title, p.Status)
+
+		// 伴生创建机制：当造物项目更新进展手记 (story) 或状态变迁 (status) 时，自动伴生创建一条一级记录写入主时间流
+		storyChanged := req.Story != nil && p.Story != "" && p.Story != oldStory
+		statusChanged := req.Status != nil && p.Status != "" && p.Status != oldStatus
+		if storyChanged || statusChanged {
+			entryTitle := fmt.Sprintf("%s · 造物手记", p.Title)
+			if statusChanged && !storyChanged {
+				entryTitle = fmt.Sprintf("%s · 状态演进 (%s)", p.Title, p.Status)
+			}
+			entryContent := p.Story
+			if !storyChanged || entryContent == "" {
+				if p.Description != "" {
+					entryContent = p.Description
+				} else {
+					entryContent = fmt.Sprintf("造物项目「%s」进展更新，当前状态：%s。", p.Title, p.Status)
+				}
+			}
+			progressEntry := models.LifeEntry{
+				Type:       "project",
+				Title:      entryTitle,
+				Content:    entryContent,
+				OccurredAt: time.Now(),
+				ProjectID:  &p.ID,
+			}
+			if err := tx.Create(&progressEntry).Error; err != nil {
+				return err
 			}
 		}
-		progressEntry := models.LifeEntry{
-			Type:       "project",
-			Title:      entryTitle,
-			Content:    entryContent,
-			OccurredAt: time.Now(),
-			Link:       p.GithubURL,
-			ProjectID:  &p.ID,
-		}
-		_ = db.DB.Create(&progressEntry).Error
-		InvalidateStatsCache()
+		return nil
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "更新项目及伴生进展失败: "+err.Error())
+		return
 	}
+	InvalidateStatsCache()
 
 	Success(c, p)
 }
@@ -1250,18 +1332,28 @@ func DeleteProject(c *gin.Context) {
 	}
 
 	if purge {
-		if err := db.DB.Unscoped().Delete(&p).Error; err != nil {
+		err := db.DB.Transaction(func(tx *gorm.DB) error {
+			tx.Model(&models.LifeEntry{}).Where("project_id = ?", p.ID).Update("project_id", nil)
+			return tx.Unscoped().Delete(&p).Error
+		})
+		if err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
+		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
 
-	if err := db.DB.Delete(&p).Error; err != nil {
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		tx.Model(&models.LifeEntry{}).Where("project_id = ?", p.ID).Update("project_id", nil)
+		return tx.Delete(&p).Error
+	})
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	InvalidateStatsCache()
 	Success(c, gin.H{"id": id, "deleted": true})
 }
 

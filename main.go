@@ -119,6 +119,9 @@ func main() {
 		// 年度生活年鉴 (公开只读)
 		v1.GET("/almanac/summary", handlers.GetAnnualAlmanacSummary)
 
+		// 全局自定义分类字典 (公开只读)
+		v1.GET("/categories", handlers.GetCategories)
+
 		// === 管理员写权限受保护接口 ===
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
@@ -155,6 +158,12 @@ func main() {
 			write.POST("/credit-channels", handlers.CreateCreditChannel)
 			write.PUT("/credit-channels/:id", handlers.UpdateCreditChannel)
 			write.DELETE("/credit-channels/:id", handlers.DeleteCreditChannel)
+
+			// 用户自定义分类字典管理 (支出/收入/资产/支付方式/造物分类)
+			write.POST("/categories", handlers.CreateCategory)
+			write.PUT("/categories/:id", handlers.UpdateCategory)
+			write.DELETE("/categories/:id", handlers.DeleteCategory)
+			write.POST("/categories/reset", handlers.ResetCategories)
 
 			// Projects (项目与造物)
 			write.POST("/projects", handlers.CreateProject)

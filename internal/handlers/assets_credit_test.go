@@ -516,4 +516,30 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			t.Fatalf("wish4 transaction installment data incorrect: %+v", wish4Tx)
 		}
 	})
+
+	// 6. 分期负债按购买时间 (OccurredAt) 与每月还款日核算，且消除整除尾差
+	t.Run("Installment Liability Calculated By Purchase Date Without Rounding Drift", func(t *testing.T) {
+		loc := time.Local
+		purchaseTime := time.Date(2026, 6, 2, 0, 0, 0, 0, loc)
+		checkTime := time.Date(2026, 10, 12, 11, 15, 0, 0, loc)
+
+		// 6月2日购买，每月25日还款，截至10月12日已过 6/25, 7/25, 8/25, 9/25 共 4 期，剩余 8 期
+		paid, remain := CalculateElapsedInstallmentMonths(purchaseTime, 12, 25, checkTime)
+		if paid != 4 || remain != 8 {
+			t.Fatalf("expected paid=4, remain=8 for 2026-06-02 to 2026-10-12 (day 25), got paid=%d, remain=%d", paid, remain)
+		}
+
+		// 总额 916900 分 (¥9,169.00)，12期每期 76408 分：
+		// 0 期已还时，待还必须精确等于 916900 分（杜绝 76408*12=916896 导致少 4 分尾差）
+		paid0, debt0 := CalculateInstallmentAmounts(916900, 12, 76408, 0, 12)
+		if paid0 != 0 || debt0 != 916900 {
+			t.Fatalf("expected paid0=0, debt0=916900, got paid0=%d, debt0=%d", paid0, debt0)
+		}
+
+		// 4 期已还时，已还 = 4*76408 = 305632 分，剩余待还 = 916900 - 305632 = 611268 分 (¥6,112.68)
+		paid4, debt4 := CalculateInstallmentAmounts(916900, 12, 76408, 4, 8)
+		if paid4 != 305632 || debt4 != 611268 || (paid4+debt4) != 916900 {
+			t.Fatalf("expected paid4=305632, debt4=611268, got paid4=%d, debt4=%d", paid4, debt4)
+		}
+	})
 }

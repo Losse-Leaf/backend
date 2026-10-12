@@ -188,7 +188,7 @@ func GetWishByID(c *gin.Context) {
 	Success(c, w)
 }
 
-// CreateWish 新建心愿 (需管理员权限)
+// CreateWish 新建心愿 (需管理员权限，自动伴生创建一条 wish 类型的一级记录写入主时间流)
 func CreateWish(c *gin.Context) {
 	var req CreateWishRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -215,19 +215,57 @@ func CreateWish(c *gin.Context) {
 		TargetDate: targetDate,
 	}
 
-	if err := db.DB.Create(&wish).Error; err != nil {
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&wish).Error; err != nil {
+			return err
+		}
+
+		entryContent := wish.Note
+		if entryContent == "" {
+			if wish.Spec != "" {
+				entryContent = fmt.Sprintf("许下心愿「%s」（%s）。", wish.Title, wish.Spec)
+			} else {
+				entryContent = fmt.Sprintf("许下心愿「%s」，期待日后圆满归册。", wish.Title)
+			}
+		}
+
+		companionEntry := models.LifeEntry{
+			Type:       "wish",
+			Title:      "许下心愿 · " + wish.Title,
+			Content:    entryContent,
+			OccurredAt: time.Now(),
+			Location:   wish.CityName,
+			WishID:     &wish.ID,
+		}
+		if err := tx.Create(&companionEntry).Error; err != nil {
+			return err
+		}
+
+		wish.LifeEntryID = &companionEntry.ID
+		if err := tx.Save(&wish).Error; err != nil {
+			return err
+		}
+
+		if len(req.AttachmentIDs) > 0 {
+			if err := tx.Model(&models.Attachment{}).
+				Where("id IN ?", req.AttachmentIDs).
+				Updates(map[string]interface{}{
+					"wish_id":  wish.ID,
+					"entry_id": companionEntry.ID,
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "创建心愿失败: "+err.Error())
 		return
 	}
 
-	if len(req.AttachmentIDs) > 0 {
-		db.DB.Model(&models.Attachment{}).
-			Where("id IN ?", req.AttachmentIDs).
-			Update("wish_id", wish.ID)
-	}
-
 	db.DB.First(&wish, wish.ID)
 	populateWishURLs(&wish)
+	InvalidateStatsCache()
 
 	Success(c, wish)
 }
@@ -246,6 +284,8 @@ func UpdateWish(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
+
+	oldStatus := wish.Status
 
 	if req.Title != "" {
 		wish.Title = strings.TrimSpace(req.Title)
@@ -290,11 +330,11 @@ func UpdateWish(c *gin.Context) {
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		// 若通过直接更新状态标记心愿达成，自动伴生创建一条对应的一级记录 (Record-First Architecture，纳入同一事务)
-		if wish.Status == "fulfilled" && wish.LifeEntryID == nil {
-			entryType := "collection"
-			if wish.Kind == "travel" {
-				entryType = "life"
+		// 若通过直接更新状态标记心愿达成，自动伴生创建一条达成一级记录 (Record-First Architecture，纳入同一事务)
+		if wish.Status == "fulfilled" && oldStatus != "fulfilled" {
+			entryType := "wish"
+			if wish.Kind == "travel" && wish.CityCode != "" {
+				entryType = "travel"
 			}
 			fulfilledTime := time.Now()
 			if wish.FulfilledAt != nil {
@@ -312,6 +352,7 @@ func UpdateWish(c *gin.Context) {
 				Location:   wish.CityName,
 				CityCode:   wish.CityCode,
 				CityName:   wish.CityName,
+				WishID:     &wish.ID,
 			}
 			if err := tx.Create(&companionEntry).Error; err != nil {
 				return err
@@ -330,9 +371,15 @@ func UpdateWish(c *gin.Context) {
 				Update("wish_id", nil)
 
 			if len(req.AttachmentIDs) > 0 {
+				updates := map[string]interface{}{
+					"wish_id": wish.ID,
+				}
+				if wish.LifeEntryID != nil && *wish.LifeEntryID > 0 {
+					updates["entry_id"] = *wish.LifeEntryID
+				}
 				tx.Model(&models.Attachment{}).
 					Where("id IN ?", req.AttachmentIDs).
-					Update("wish_id", wish.ID)
+					Updates(updates)
 			}
 		}
 		return nil
@@ -404,12 +451,12 @@ func ResolveWish(c *gin.Context) {
 					content = fmt.Sprintf("理性拔草 · 释怀放下心愿「%s」", wish.Title)
 				}
 				entry := models.LifeEntry{
-					Type:       "reflection",
+					Type:       "wish",
 					Title:      "理性拔草 · " + wish.Title,
 					Content:    content,
 					OccurredAt: fulfilledAt,
-					CityCode:   wish.CityCode,
-					CityName:   wish.CityName,
+					Location:   wish.CityName,
+					WishID:     &wish.ID,
 				}
 				if err := tx.Create(&entry).Error; err != nil {
 					return err
@@ -418,7 +465,10 @@ func ResolveWish(c *gin.Context) {
 				if len(req.AttachmentIDs) > 0 {
 					tx.Model(&models.Attachment{}).
 						Where("id IN ?", req.AttachmentIDs).
-						Update("entry_id", entry.ID)
+						Updates(map[string]interface{}{
+							"wish_id":  wish.ID,
+							"entry_id": entry.ID,
+						})
 				}
 			}
 			return tx.Save(&wish).Error
@@ -512,9 +562,9 @@ func ResolveWish(c *gin.Context) {
 			if content == "" {
 				content = fmt.Sprintf("圆满达成心愿「%s」", actualTitle)
 			}
-			entryType := "collection"
-			if wish.Kind == "travel" {
-				entryType = "life"
+			entryType := "wish"
+			if wish.Kind == "travel" && req.CreateFootprint {
+				entryType = "travel"
 			}
 			entry := models.LifeEntry{
 				Type:       entryType,
@@ -524,6 +574,7 @@ func ResolveWish(c *gin.Context) {
 				Location:   wish.CityName,
 				CityCode:   wish.CityCode,
 				CityName:   wish.CityName,
+				WishID:     &wish.ID,
 			}
 			if err := tx.Create(&entry).Error; err != nil {
 				return err
@@ -533,7 +584,10 @@ func ResolveWish(c *gin.Context) {
 			if len(req.AttachmentIDs) > 0 {
 				tx.Model(&models.Attachment{}).
 					Where("id IN ?", req.AttachmentIDs).
-					Update("entry_id", entry.ID)
+					Updates(map[string]interface{}{
+						"wish_id":  wish.ID,
+						"entry_id": entry.ID,
+					})
 			}
 		}
 
@@ -597,6 +651,7 @@ func DeleteWish(c *gin.Context) {
 	if purge {
 		db.DB.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+		db.DB.Model(&models.LifeEntry{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		if err := db.DB.Unscoped().Delete(&w).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())

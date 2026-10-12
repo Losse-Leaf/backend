@@ -56,6 +56,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.Project{},
 		&models.Transaction{},
 		&models.CreditChannel{},
+		&models.CategoryOption{},
 		&models.SiteConfig{},
 		&models.Device{},
 		&models.PairTicket{},
@@ -71,6 +72,45 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	DB = database
 	seedData(database)
 	return database, nil
+}
+
+// DefaultCategoriesMap 系统预置的五大分类字典默认值
+var DefaultCategoriesMap = map[string][]string{
+	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "其他"},
+	"income":  {"工资收入", "二手回血", "稿酬设计", "投资理财", "礼金红包", "退款报销", "其他收入"},
+	"gear":    {"数码器材", "影像与暗房", "工作台与算力", "手冲咖啡工坊", "夜骑巡航", "纸笔与日常", "生活好物"},
+	"payment": {"微信支付", "支付宝", "银行卡", "现金", "其他"},
+	"project": {"开源项目", "独立开发", "硬件改造", "设计作品", "写作出版"},
+}
+
+// SeedDefaultCategories 为空态或指定 scope 补充预置分类字典
+func SeedDefaultCategories(database *gorm.DB, targetScope string, forceRestore bool) {
+	scopes := []string{"expense", "income", "gear", "payment", "project"}
+	for _, sc := range scopes {
+		if targetScope != "" && targetScope != sc {
+			continue
+		}
+		defaults := DefaultCategoriesMap[sc]
+		if !forceRestore {
+			var cnt int64
+			database.Model(&models.CategoryOption{}).Where("scope = ?", sc).Count(&cnt)
+			if cnt > 0 {
+				continue
+			}
+		}
+		for idx, name := range defaults {
+			var existing models.CategoryOption
+			err := database.Where("scope = ? AND name = ?", sc, name).First(&existing).Error
+			if err != nil {
+				database.Create(&models.CategoryOption{
+					Scope:     sc,
+					Name:      name,
+					SortOrder: (idx + 1) * 10,
+					IsBuiltin: true,
+				})
+			}
+		}
+	}
 }
 
 // seedData 初始化站点全局配置与主理人初始档案 (空态冷启动 RG-05, RC-50, RC-52, RC-53)
@@ -133,6 +173,9 @@ func seedData(database *gorm.DB) {
 			database.Create(&ch)
 		}
 	}
+
+	// 4. 初始化五大模块的默认分类字典
+	SeedDefaultCategories(database, "", false)
 
 	log.Println("Database schema and core configurations ready.")
 }

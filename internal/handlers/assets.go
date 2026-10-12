@@ -168,7 +168,6 @@ func GetAssetsOverview(c *gin.Context) {
 
 	var totalLiabilities int64
 	var monthlyLiabilities int64
-	var paidInstallmentTotal int64
 
 	// 加载所有信贷渠道配置
 	var channels []models.CreditChannel
@@ -193,31 +192,54 @@ func GetAssetsOverview(c *gin.Context) {
 		channelOrder = append(channelOrder, ch.Code)
 	}
 
-	for _, tx := range installmentTxs {
-		// 分期付款：已付期数 = 总期数 - 剩余期数
+	now := time.Now()
+	for i := range installmentTxs {
+		tx := &installmentTxs[i]
+		chCode := tx.InstallmentChannelCode
+		if chCode == "" {
+			chCode = "huabei"
+		}
+
+		repaymentDay := tx.RepaymentDay
+		if summary, exists := channelMap[chCode]; exists && summary.RepaymentDay > 0 {
+			repaymentDay = summary.RepaymentDay
+		}
+		if repaymentDay <= 0 {
+			repaymentDay = 10
+		}
+
+		// 根据购买时间 (tx.OccurredAt) 与渠道每月还款日自动核算已还期数与剩余期数
+		_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, tx.InstallmentMonths, repaymentDay, now)
+		needSave := false
+		if tx.InstallmentRemainMonths > autoRemain {
+			tx.InstallmentRemainMonths = autoRemain
+			needSave = true
+		}
+		if tx.RepaymentDay != repaymentDay {
+			tx.RepaymentDay = repaymentDay
+			needSave = true
+		}
+		if needSave {
+			_ = db.DB.Save(tx).Error
+		}
+
 		paidMonths := tx.InstallmentMonths - tx.InstallmentRemainMonths
 		if paidMonths < 0 {
 			paidMonths = 0
 		}
-		paidAmount := int64(paidMonths) * tx.InstallmentMonthlyPay
-		paidInstallmentTotal += paidAmount
+		totalAmount := tx.InstallmentTotalAmount
+		if totalAmount <= 0 {
+			totalAmount = tx.Amount
+		}
+		_, debt := CalculateInstallmentAmounts(totalAmount, tx.InstallmentMonths, tx.InstallmentMonthlyPay, paidMonths, tx.InstallmentRemainMonths)
 
 		// 剩余期数 > 0 计入待还负债
 		if tx.InstallmentRemainMonths > 0 {
-			debt := int64(tx.InstallmentRemainMonths) * tx.InstallmentMonthlyPay
 			totalLiabilities += debt
 			monthlyLiabilities += tx.InstallmentMonthlyPay
 
-			chCode := tx.InstallmentChannelCode
-			if chCode == "" {
-				chCode = "huabei"
-			}
 			summary, exists := channelMap[chCode]
 			if !exists {
-				repaymentDay := tx.RepaymentDay
-				if repaymentDay <= 0 {
-					repaymentDay = 10
-				}
 				summary = &ChannelLiabilitySummary{
 					ChannelCode:        chCode,
 					ChannelName:        chCode,
@@ -235,11 +257,11 @@ func GetAssetsOverview(c *gin.Context) {
 			summary.TotalDebt += debt
 			summary.MonthlyPay += tx.InstallmentMonthlyPay
 			summary.ActiveCount++
-			summary.Installments = append(summary.Installments, tx)
+			summary.Installments = append(summary.Installments, *tx)
 		}
 	}
 
-	liquidBalance := initialLiquid + totalIncome - nonInstallmentExpense - paidInstallmentTotal
+	liquidBalance := initialLiquid + totalIncome - nonInstallmentExpense
 
 	var channelLiabilities []ChannelLiabilitySummary
 	for _, code := range channelOrder {
@@ -313,7 +335,6 @@ type AddGearAssetRequest struct {
 	PurchaseDate           string `json:"purchase_date"`
 	PaymentMethod          string `json:"payment_method"`
 	Note                   string `json:"note"`
-	Link                   string `json:"link"`
 	CreateTransaction      bool   `json:"create_transaction"` // 默认支持同步生成支出流水
 	IsInstallment          bool   `json:"is_installment"`
 	InstallmentChannelCode string `json:"installment_channel_code"`
@@ -351,7 +372,6 @@ func AddGearAsset(c *gin.Context) {
 		PriceCents:   req.PriceCents,
 		PurchaseDate: purchaseDate,
 		Note:         strings.TrimSpace(req.Note),
-		Link:         strings.TrimSpace(req.Link),
 	}
 
 	list := loadProfileGear(&profile)
@@ -361,8 +381,8 @@ func AddGearAsset(c *gin.Context) {
 		return
 	}
 
-	// 若勾选了同步生成支出账单，且金额 > 0，自动生成流水
-	if req.CreateTransaction && req.PriceCents > 0 {
+	// 若勾选了同步生成支出账单或启用了分期购置，且金额 > 0，自动生成流水
+	if (req.CreateTransaction || req.IsInstallment) && req.PriceCents > 0 {
 		occurred, err := ParseFlexTime(purchaseDate)
 		if err != nil {
 			occurred = time.Now()
@@ -390,7 +410,7 @@ func AddGearAsset(c *gin.Context) {
 				req.PriceCents,
 				req.InstallmentMonths,
 				0,
-				req.InstallmentMonths,
+				0,
 				req.RepaymentDay,
 				db.DB,
 			)

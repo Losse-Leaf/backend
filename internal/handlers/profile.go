@@ -105,7 +105,6 @@ type UpdateCuratorProfileRequest struct {
 	Email       string `json:"email"`
 	Github      string `json:"github"`
 	SocialLinks any    `json:"social_links"`
-	EDCGear     any    `json:"edc_gear"`
 }
 
 // UpdateCuratorProfile 更新主理人档案 (需管理员/已配对凭据)
@@ -199,15 +198,7 @@ func UpdateCuratorProfile(c *gin.Context) {
 		}
 	}
 
-	if req.EDCGear != nil {
-		if str, ok := req.EDCGear.(string); ok {
-			profile.EDCGear = str
-		} else {
-			bytes, _ := json.Marshal(req.EDCGear)
-			profile.EDCGear = string(bytes)
-		}
-	}
-
+	// RC-132: edc_gear 仅由 /api/v1/assets/gear 三接口及心愿归册联动写入，PUT /profile 忽略该字段以杜绝双写互踩
 	profile.UpdatedAt = time.Now()
 
 	if err := db.DB.Save(&profile).Error; err != nil {

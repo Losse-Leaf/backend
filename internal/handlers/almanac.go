@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -14,13 +15,14 @@ import (
 
 // GetAnnualAlmanacSummary 年度生活年鉴聚合计算接口 (五幕叙事：岁月卷首 / 山川行迹 / 心愿圆满 / 浮光掠影 / 柴米油盐)
 func GetAnnualAlmanacSummary(c *gin.Context) {
-	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", time.Now().Year()))
+	nowBeijing := config.NowInBeijing()
+	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", nowBeijing.Year()))
 	year, err := strconv.Atoi(yearStr)
 	if err != nil || year < 1900 || year > 3000 {
-		year = time.Now().Year()
+		year = nowBeijing.Year()
 	}
 
-	startOfYear := time.Date(year, 1, 1, 0, 0, 0, 0, time.Local)
+	startOfYear := time.Date(year, 1, 1, 0, 0, 0, 0, config.BeijingLocation)
 	endOfYear := startOfYear.AddDate(1, 0, 0)
 
 	// 1. 第一幕：岁月卷首数据 (LifeEntries 聚合)
@@ -29,14 +31,13 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		Order("occurred_at ASC").
 		Find(&entries)
 
-	for i := range entries {
-		populateEntryURLs(&entries[i])
-	}
+	populateEntryURLsBatch(entries)
 
 	distinctDays := make(map[string]bool)
 	totalWords := 0
+	beijing := config.BeijingLocation
 	for _, e := range entries {
-		dStr := e.OccurredAt.Format("2006-01-02")
+		dStr := e.OccurredAt.In(beijing).Format("2006-01-02")
 		distinctDays[dStr] = true
 		totalWords += len([]rune(e.Content))
 	}
@@ -44,8 +45,8 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	firstDateStr := ""
 	lastDateStr := ""
 	if len(entries) > 0 {
-		firstDateStr = entries[0].OccurredAt.Format("2006-01-02")
-		lastDateStr = entries[len(entries)-1].OccurredAt.Format("2006-01-02")
+		firstDateStr = entries[0].OccurredAt.In(beijing).Format("2006-01-02")
+		lastDateStr = entries[len(entries)-1].OccurredAt.In(beijing).Format("2006-01-02")
 	}
 
 	// 2. 第二幕：山川行迹 (Footprints 聚合)
@@ -54,9 +55,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		Order("visited_at ASC").
 		Find(&footprints)
 
-	for i := range footprints {
-		populateFootprintURLs(&footprints[i])
-	}
+	populateFootprintURLsBatch(footprints)
 
 	yearCityMap := make(map[string]string)
 	for _, f := range footprints {
@@ -79,9 +78,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		Order("fulfilled_at ASC").
 		Find(&fulfilledWishes)
 
-	for i := range fulfilledWishes {
-		populateWishURLs(&fulfilledWishes[i])
-	}
+	populateWishURLsBatch(fulfilledWishes)
 
 	var wantingWishCount int64
 	db.DB.Model(&models.Wish{}).Where("status = ?", "wanting").Count(&wantingWishCount)
@@ -171,12 +168,11 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	txCount := len(txs)
 	finSpectrum := gin.H{
-		"total_income":        totalIncome,
-		"total_expense":       totalExpense,
-		"balance":             totalIncome - totalExpense,
-		"wish_expenses":       wishExpenses,
-		"wish_expense_ratio":  wishRatio,
-		"wish_spending_ratio": wishRatio * 100.0,
+		"total_income":       totalIncome,
+		"total_expense":      totalExpense,
+		"balance":            totalIncome - totalExpense,
+		"wish_expenses":      wishExpenses,
+		"wish_spending_ratio": wishRatio * 100.0, // 百分比，唯一权威键 (BE-38 去除同义双键)
 		"categories":          categories,
 	}
 
@@ -194,7 +190,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"total_expense":       0,
 			"balance":             0,
 			"wish_expenses":       0,
-			"wish_expense_ratio":  0.0,
 			"wish_spending_ratio": 0.0,
 			"categories":          []catItem{},
 		}

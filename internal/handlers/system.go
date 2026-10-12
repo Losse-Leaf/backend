@@ -427,7 +427,7 @@ func CreateUpdateNotice(c *gin.Context) {
 		return
 	}
 	if releasedAt == "" {
-		releasedAt = time.Now().Format("2006-01-02")
+		releasedAt = config.TodayInBeijing()
 	}
 
 	notice := models.UpdateNotice{

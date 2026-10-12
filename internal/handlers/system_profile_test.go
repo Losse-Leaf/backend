@@ -64,7 +64,7 @@ func seedTestAdminDevice(rawToken string) {
 		DeviceID:     "dev_web_test_" + generateRandomHex(2),
 		Name:         "测试管理员设备",
 		Platform:     "web",
-		TokenHash:    HashToken(rawToken),
+		TokenHash:    middleware.HashToken(rawToken),
 		Status:       "active",
 		PairedAt:     now,
 		LastActiveAt: now,

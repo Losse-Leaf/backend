@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -31,6 +31,39 @@ func populateWishURLs(w *models.Wish) {
 	}
 	for i := range w.Attachments {
 		w.Attachments[i].URL = storage.SignResourceURL(w.Attachments[i].ObjectKey)
+	}
+}
+
+// populateWishURLsBatch 批量填充一组心愿的参考图 (BE-30)
+func populateWishURLsBatch(wishes []models.Wish) {
+	if len(wishes) == 0 {
+		return
+	}
+	ids := make([]uint, 0, len(wishes))
+	for i := range wishes {
+		if wishes[i].ID > 0 {
+			ids = append(ids, wishes[i].ID)
+		}
+	}
+	attMap := make(map[uint][]models.Attachment)
+	if len(ids) > 0 {
+		var atts []models.Attachment
+		db.DB.Where("wish_id IN ?", ids).Order("id ASC").Find(&atts)
+		for _, att := range atts {
+			if att.WishID != nil {
+				attMap[*att.WishID] = append(attMap[*att.WishID], att)
+			}
+		}
+	}
+	for i := range wishes {
+		atts := attMap[wishes[i].ID]
+		if atts == nil {
+			atts = []models.Attachment{}
+		}
+		for j := range atts {
+			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
+		}
+		wishes[i].Attachments = atts
 	}
 }
 
@@ -129,8 +162,8 @@ func GetWishes(c *gin.Context) {
 	}
 
 	isAdmin := middleware.IsAdmin(c)
+	populateWishURLsBatch(wishes)
 	for i := range wishes {
-		populateWishURLs(&wishes[i])
 		// 访客模式财务隐私严格脱敏 (BE-14)
 		if !isAdmin {
 			wishes[i].ActualCost = 0
@@ -366,11 +399,16 @@ func UpdateWish(c *gin.Context) {
 		}
 
 		if req.AttachmentIDs != nil {
-			tx.Model(&models.Attachment{}).
-				Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
-				Update("wish_id", nil)
+			// 空数组语义 = 解除该心愿的全部参考图绑定
+			if len(req.AttachmentIDs) == 0 {
+				tx.Model(&models.Attachment{}).
+					Where("wish_id = ?", wish.ID).
+					Update("wish_id", nil)
+			} else {
+				tx.Model(&models.Attachment{}).
+					Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
+					Update("wish_id", nil)
 
-			if len(req.AttachmentIDs) > 0 {
 				updates := map[string]interface{}{
 					"wish_id": wish.ID,
 				}
@@ -533,24 +571,24 @@ func ResolveWish(c *gin.Context) {
 			gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
 			wish.GearID = &gearID
 
+			newGear := models.GearItem{
+				ID:           gearID,
+				Name:         gearName,
+				Spec:         wish.Spec,
+				Category:     "数码器材",
+				Status:       "active",
+				PriceCents:   req.ActualCost,
+				PurchaseDate: fulfilledAt.In(config.BeijingLocation).Format("2006-01-02"),
+				Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
+			}
+
+			// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)，写入仍在当前事务内保持原子
+			profileGearMu.Lock()
+			defer profileGearMu.Unlock()
 			var profile models.CuratorProfile
 			if err := tx.First(&profile).Error; err == nil {
-				newGear := models.GearItem{
-					ID:           gearID,
-					Name:         gearName,
-					Spec:         wish.Spec,
-					Category:     "数码器材",
-					Status:       "active",
-					PriceCents:   req.ActualCost,
-					PurchaseDate: fulfilledAt.Format("2006-01-02"),
-					Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
-				}
-				list := loadProfileGear(&profile)
-				list = append(list, newGear)
-				bytes, _ := json.Marshal(list)
-				profile.EDCGear = string(bytes)
-				profile.UpdatedAt = time.Now()
-				if err := tx.Save(&profile).Error; err != nil {
+				list := append(loadProfileGear(&profile), newGear)
+				if err := saveProfileGearWith(tx, &profile, list); err != nil {
 					return err
 				}
 			}

@@ -434,6 +434,14 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 	// 离线/本地环境兜底写入 data/uploads/<objectKey>
 	localBase := GetLocalUploadDir()
 	targetPath := filepath.Join(localBase, filepath.FromSlash(objectKey))
+	// 兜底断言：解析后的绝对路径必须仍在上传根目录内，杜绝任何越界写 (BE-22)
+	if absBase, err := filepath.Abs(localBase); err == nil {
+		if absTarget, err := filepath.Abs(targetPath); err == nil {
+			if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
+				return fmt.Errorf("对象路径越界，已拒绝写入: %s", objectKey)
+			}
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 		return fmt.Errorf("failed to create upload dir: %w", err)
 	}
@@ -452,6 +460,7 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 }
 
 // BuildSafeObjectKey 构建安全、合规的 R2 存储相对路径 Key (例如 avatar/user.png, entries/2026/10/09/uuid-file.png)
+// folder 与 customKey 一律做 Clean + 拒绝路径穿越字符，杜绝写出 data/uploads 之外 (BE-22)
 func BuildSafeObjectKey(folder, filename, customKey string) (string, error) {
 	customKey = strings.TrimSpace(customKey)
 	if customKey != "" {
@@ -464,7 +473,15 @@ func BuildSafeObjectKey(folder, filename, customKey string) (string, error) {
 
 	cleanName := sanitizeFilename(filename)
 	uid := uuid.New().String()[:8]
-	folder = strings.Trim(folder, "/\\")
+	folder = strings.TrimSpace(folder)
+	if folder != "" {
+		cleanFolder := path.Clean(strings.Trim(folder, "/\\"))
+		if cleanFolder == "." || cleanFolder == ".." ||
+			strings.Contains(cleanFolder, "..") || strings.HasPrefix(cleanFolder, "/") {
+			return "", errors.New("存储目录含有非法路径穿越字符")
+		}
+		folder = cleanFolder
+	}
 
 	if folder == "avatar" {
 		return fmt.Sprintf("avatar/%s-%s", uid, cleanName), nil

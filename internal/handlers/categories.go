@@ -1,10 +1,9 @@
 package handlers
 
 import (
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"loose-leaf/internal/db"
@@ -177,6 +176,9 @@ func cascadeRenameCategoryRecords(scope, oldName, newName string) {
 	case "project":
 		db.DB.Model(&models.Project{}).Where("category = ?", oldName).Update("category", newName)
 	case "gear":
+		// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
 		var profile models.CuratorProfile
 		if err := db.DB.First(&profile).Error; err == nil {
 			list := loadProfileGear(&profile)
@@ -188,17 +190,40 @@ func cascadeRenameCategoryRecords(scope, oldName, newName string) {
 				}
 			}
 			if changed {
-				if bytes, err := json.Marshal(list); err == nil {
-					profile.EDCGear = string(bytes)
-					profile.UpdatedAt = time.Now()
-					_ = db.DB.Save(&profile).Error
-				}
+				_ = saveProfileGear(&profile, list).Error
 			}
 		}
 	}
 }
 
-// DeleteCategory 删除分类项 (保证每个模块至少保留 1 个分类)
+// countCategoryRecordsInUse 统计某分类名被历史业务记录引用的条数 (BE-28)
+func countCategoryRecordsInUse(scope, name string) int64 {
+	var total int64
+	switch scope {
+	case "expense":
+		db.DB.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", name).Count(&total)
+	case "income":
+		db.DB.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", name).Count(&total)
+	case "payment":
+		db.DB.Model(&models.Transaction{}).Where("payment_method = ?", name).Count(&total)
+	case "project":
+		db.DB.Model(&models.Project{}).Where("category = ?", name).Count(&total)
+	case "gear":
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
+		var profile models.CuratorProfile
+		if err := db.DB.First(&profile).Error; err == nil {
+			for _, g := range loadProfileGear(&profile) {
+				if g.Category == name {
+					total++
+				}
+			}
+		}
+	}
+	return total
+}
+
+// DeleteCategory 删除分类项 (保证每个模块至少保留 1 个分类；存在历史引用时拒绝删除)
 func DeleteCategory(c *gin.Context) {
 	id := c.Param("id")
 	var item models.CategoryOption
@@ -211,6 +236,13 @@ func DeleteCategory(c *gin.Context) {
 	db.DB.Model(&models.CategoryOption{}).Where("scope = ?", item.Scope).Count(&count)
 	if count <= 1 {
 		Error(c, http.StatusBadRequest, "每个分类模块至少需要保留 1 个分类项")
+		return
+	}
+
+	// 仍被历史业务记录引用的分类不可删除，否则旧记录将残留孤儿分类名 (BE-28)
+	if used := countCategoryRecordsInUse(item.Scope, item.Name); used > 0 {
+		Error(c, http.StatusBadRequest,
+			fmt.Sprintf("「%s」仍被 %d 条历史记录引用，请先将其重命名为其他分类以完成迁移", item.Name, used))
 		return
 	}
 

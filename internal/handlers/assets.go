@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ChannelLiabilitySummary 信贷渠道负债聚合摘要 (RC-53)
@@ -48,7 +51,7 @@ type AssetsOverviewResponse struct {
 	ChannelLiabilities   []ChannelLiabilitySummary  `json:"channel_liabilities"`    // 信贷渠道明细与独立还款日倒计时
 }
 
-// calculateDaysUntilRepayment 计算距离每月独立还款日的天数倒计时
+// calculateDaysUntilRepayment 计算距离每月独立还款日的天数倒计时（按北京时间计算 RC-134）
 func calculateDaysUntilRepayment(repaymentDay int) int {
 	if repaymentDay < 1 {
 		repaymentDay = 1
@@ -56,7 +59,7 @@ func calculateDaysUntilRepayment(repaymentDay int) int {
 	if repaymentDay > 31 {
 		repaymentDay = 31
 	}
-	now := time.Now()
+	now := config.NowInBeijing()
 	year, month, day := now.Date()
 
 	// 限制当月最大天数（防范二月或小月越界）
@@ -97,6 +100,10 @@ func calculateDaysUntilRepayment(repaymentDay int) int {
 	return diff
 }
 
+// profileGearMu 串行化 CuratorProfile.EDCGear 同一行 JSON 列的「读-改-写」，
+// 杜绝并发录入设备 / 记账联动建资产 / 心愿归册建资产互相覆盖丢条目 (BE-34)
+var profileGearMu sync.Mutex
+
 func loadProfileGear(profile *models.CuratorProfile) []models.GearItem {
 	raw := strings.TrimSpace(profile.EDCGear)
 	if raw == "" {
@@ -109,14 +116,34 @@ func loadProfileGear(profile *models.CuratorProfile) []models.GearItem {
 	return list
 }
 
-func saveProfileGear(profile *models.CuratorProfile, list []models.GearItem) error {
+func saveProfileGearWith(dbTx *gorm.DB, profile *models.CuratorProfile, list []models.GearItem) error {
 	bytes, err := json.Marshal(list)
 	if err != nil {
 		return err
 	}
 	profile.EDCGear = string(bytes)
-	profile.UpdatedAt = time.Now()
-	return db.DB.Save(profile).Error
+	profile.UpdatedAt = config.NowInBeijing()
+	return dbTx.Save(profile).Error
+}
+
+func saveProfileGear(profile *models.CuratorProfile, list []models.GearItem) error {
+	return saveProfileGearWith(db.DB, profile, list)
+}
+
+// mutateProfileGear 在进程级互斥锁内完成 EDCGear 的读-改-写（事务外场景的统一入口）
+func mutateProfileGear(mutate func([]models.GearItem) ([]models.GearItem, error)) error {
+	profileGearMu.Lock()
+	defer profileGearMu.Unlock()
+
+	var profile models.CuratorProfile
+	if err := db.DB.First(&profile).Error; err != nil {
+		return err
+	}
+	list, err := mutate(loadProfileGear(&profile))
+	if err != nil {
+		return err
+	}
+	return saveProfileGear(&profile, list)
 }
 
 // GetAssetsOverview 资产管理大盘看板 (RC-53)
@@ -135,8 +162,7 @@ func GetAssetsOverview(c *gin.Context) {
 	soldRecoveredValue := int64(0)
 
 	for _, g := range gearList {
-		// 兼容识别后端标准 status="sold" 与前端中文 status="已出二手" (RG-19)
-		if g.Status == "sold" || g.Status == "已出二手" {
+		if g.Status == "sold" {
 			soldGearCount++
 			soldRecoveredValue += g.SoldPriceCents
 		} else {
@@ -192,7 +218,8 @@ func GetAssetsOverview(c *gin.Context) {
 		channelOrder = append(channelOrder, ch.Code)
 	}
 
-	now := time.Now()
+	// 分期剩余期数按当前时间即时推算展示，不落库 (BE-24：GET 保持只读语义)
+	now := config.NowInBeijing()
 	for i := range installmentTxs {
 		tx := &installmentTxs[i]
 		chCode := tx.InstallmentChannelCode
@@ -208,20 +235,12 @@ func GetAssetsOverview(c *gin.Context) {
 			repaymentDay = 10
 		}
 
-		// 根据购买时间 (tx.OccurredAt) 与渠道每月还款日自动核算已还期数与剩余期数
+		// 根据购买时间 (tx.OccurredAt) 与渠道每月还款日自动核算已还期数与剩余期数（仅内存校正，不落库）
 		_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, tx.InstallmentMonths, repaymentDay, now)
-		needSave := false
 		if tx.InstallmentRemainMonths > autoRemain {
 			tx.InstallmentRemainMonths = autoRemain
-			needSave = true
 		}
-		if tx.RepaymentDay != repaymentDay {
-			tx.RepaymentDay = repaymentDay
-			needSave = true
-		}
-		if needSave {
-			_ = db.DB.Save(tx).Error
-		}
+		tx.RepaymentDay = repaymentDay
 
 		paidMonths := tx.InstallmentMonths - tx.InstallmentRemainMonths
 		if paidMonths < 0 {
@@ -359,7 +378,7 @@ func AddGearAsset(c *gin.Context) {
 
 	purchaseDate := strings.TrimSpace(req.PurchaseDate)
 	if purchaseDate == "" {
-		purchaseDate = time.Now().Format("2006-01-02")
+		purchaseDate = config.TodayInBeijing()
 	}
 
 	gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
@@ -374,9 +393,9 @@ func AddGearAsset(c *gin.Context) {
 		Note:         strings.TrimSpace(req.Note),
 	}
 
-	list := loadProfileGear(&profile)
-	list = append(list, newGear)
-	if err := saveProfileGear(&profile, list); err != nil {
+	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
+		return append(list, newGear), nil
+	}); err != nil {
 		Error(c, http.StatusInternalServerError, "保存设备资产失败: "+err.Error())
 		return
 	}
@@ -452,38 +471,38 @@ func SellGearAsset(c *gin.Context) {
 		return
 	}
 
-	list := loadProfileGear(&profile)
-	foundIdx := -1
-	for i, g := range list {
-		if g.ID == gearID {
-			foundIdx = i
-			break
-		}
-	}
-
-	if foundIdx == -1 {
-		Error(c, http.StatusNotFound, "设备不存在")
-		return
-	}
-
 	soldDate := strings.TrimSpace(req.SoldDate)
 	if soldDate == "" {
-		soldDate = time.Now().Format("2006-01-02")
+		soldDate = config.TodayInBeijing()
 	}
 
-	list[foundIdx].Status = "sold"
-	list[foundIdx].SoldPriceCents = soldCents
-	list[foundIdx].SoldDate = soldDate
-	if req.Note != "" {
-		if list[foundIdx].Note != "" {
-			list[foundIdx].Note += " | " + strings.TrimSpace(req.Note)
-		} else {
-			list[foundIdx].Note = strings.TrimSpace(req.Note)
+	var soldGear models.GearItem
+	found := false
+	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
+		for i := range list {
+			if list[i].ID == gearID {
+				list[i].Status = "sold"
+				list[i].SoldPriceCents = soldCents
+				list[i].SoldDate = soldDate
+				if req.Note != "" {
+					if list[i].Note != "" {
+						list[i].Note += " | " + strings.TrimSpace(req.Note)
+					} else {
+						list[i].Note = strings.TrimSpace(req.Note)
+					}
+				}
+				soldGear = list[i]
+				found = true
+				return list, nil
+			}
 		}
-	}
-
-	if err := saveProfileGear(&profile, list); err != nil {
-		Error(c, http.StatusInternalServerError, "更新设备状态失败: "+err.Error())
+		return nil, fmt.Errorf("设备不存在")
+	}); err != nil {
+		if !found {
+			Error(c, http.StatusNotFound, "设备不存在")
+		} else {
+			Error(c, http.StatusInternalServerError, "更新设备状态失败: "+err.Error())
+		}
 		return
 	}
 
@@ -497,7 +516,7 @@ func SellGearAsset(c *gin.Context) {
 		Amount:        soldCents,
 		Type:          "income",
 		Category:      "二手回血",
-		Title:         "设备转售回血: " + list[foundIdx].Name,
+		Title:         "设备转售回血: " + soldGear.Name,
 		Note:          fmt.Sprintf("设备出二手流转回血 (%s)", strings.TrimSpace(req.Note)),
 		PaymentMethod: "二手转让",
 		OccurredAt:    occurred,
@@ -507,37 +526,28 @@ func SellGearAsset(c *gin.Context) {
 		return
 	}
 
-	Success(c, list[foundIdx])
+	Success(c, soldGear)
 }
 
 // DeleteGearAsset 从设备库中物理删除设备单品 (RC-53)
 func DeleteGearAsset(c *gin.Context) {
 	gearID := c.Param("id")
 
-	var profile models.CuratorProfile
-	if err := db.DB.First(&profile).Error; err != nil {
-		Error(c, http.StatusNotFound, "主理人档案尚未初始化")
-		return
-	}
-
-	list := loadProfileGear(&profile)
-	foundIdx := -1
-	for i, g := range list {
-		if g.ID == gearID {
-			foundIdx = i
-			break
+	found := false
+	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
+		for i := range list {
+			if list[i].ID == gearID {
+				found = true
+				return append(list[:i], list[i+1:]...), nil
+			}
 		}
-	}
-
-	if foundIdx == -1 {
-		Error(c, http.StatusNotFound, "设备不存在")
-		return
-	}
-
-	// 移除该项
-	list = append(list[:foundIdx], list[foundIdx+1:]...)
-	if err := saveProfileGear(&profile, list); err != nil {
-		Error(c, http.StatusInternalServerError, "删除设备失败: "+err.Error())
+		return nil, fmt.Errorf("设备不存在")
+	}); err != nil {
+		if !found {
+			Error(c, http.StatusNotFound, "设备不存在")
+		} else {
+			Error(c, http.StatusInternalServerError, "删除设备失败: "+err.Error())
+		}
 		return
 	}
 

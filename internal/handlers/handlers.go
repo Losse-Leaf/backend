@@ -43,10 +43,12 @@ func Error(c *gin.Context, status int, message string) {
 }
 
 // ParseFlexTime 弹性解析前端传入的各种时间格式 (含 HTML5 datetime-local 标准格式 YYYY-MM-DDTHH:mm)
+// 时区契约 (RC-134)：无时区后缀的串一律按中国北京时间解释；带偏移/RFC3339 串按自身偏移解析。
+// 返回值统一携带 +08:00 偏移，JSON 序列化为 "2026-10-09T14:20:00+08:00"，前端按北京时间展示零漂移。
 func ParseFlexTime(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return time.Now(), nil
+		return config.NowInBeijing(), nil
 	}
 	layouts := []string{
 		time.RFC3339,
@@ -59,11 +61,11 @@ func ParseFlexTime(s string) (time.Time, error) {
 		"2006.01.02",
 	}
 	for _, l := range layouts {
-		if t, err := time.ParseInLocation(l, s, time.Local); err == nil {
+		if t, err := time.ParseInLocation(l, s, config.BeijingLocation); err == nil {
 			return t, nil
 		}
 	}
-	return time.Now(), fmt.Errorf("unable to parse time string: %s", s)
+	return config.NowInBeijing(), fmt.Errorf("unable to parse time string: %s", s)
 }
 
 // populateAttachmentURLs 填充附件的动态临时预签名访问 URL (默认 30 分钟有效)
@@ -105,6 +107,83 @@ func populateEntryURLs(e *models.LifeEntry) {
 		}
 	} else {
 		e.Wish = nil
+	}
+}
+
+// populateEntryURLsBatch 批量填充一组条目的附件、项目与心愿关联 (BE-30)
+// 列表接口不再逐条查询：附件 / 项目 / 心愿各一次 IN 查询后在内存关联
+func populateEntryURLsBatch(entries []models.LifeEntry) {
+	if len(entries) == 0 {
+		return
+	}
+
+	entryIDs := make([]uint, 0, len(entries))
+	projectIDs := make([]uint, 0, len(entries))
+	wishIDs := make([]uint, 0, len(entries))
+	for i := range entries {
+		if entries[i].ID > 0 {
+			entryIDs = append(entryIDs, entries[i].ID)
+		}
+		if entries[i].ProjectID != nil && *entries[i].ProjectID > 0 {
+			projectIDs = append(projectIDs, *entries[i].ProjectID)
+		}
+		if entries[i].WishID != nil && *entries[i].WishID > 0 {
+			wishIDs = append(wishIDs, *entries[i].WishID)
+		}
+	}
+
+	attMap := make(map[uint][]models.Attachment)
+	if len(entryIDs) > 0 {
+		var atts []models.Attachment
+		db.DB.Where("entry_id IN ?", entryIDs).Order("id ASC").Find(&atts)
+		for _, att := range atts {
+			if att.EntryID != nil {
+				attMap[*att.EntryID] = append(attMap[*att.EntryID], att)
+			}
+		}
+	}
+
+	projMap := make(map[uint]models.Project)
+	if len(projectIDs) > 0 {
+		var projs []models.Project
+		db.DB.Where("id IN ?", projectIDs).Find(&projs)
+		for _, p := range projs {
+			projMap[p.ID] = p
+		}
+	}
+
+	wishMap := make(map[uint]models.Wish)
+	if len(wishIDs) > 0 {
+		var wishes []models.Wish
+		db.DB.Where("id IN ?", wishIDs).Find(&wishes)
+		for _, w := range wishes {
+			wishMap[w.ID] = w
+		}
+	}
+
+	for i := range entries {
+		e := &entries[i]
+		atts := attMap[e.ID]
+		if atts == nil {
+			atts = []models.Attachment{}
+		}
+		e.Attachments = populateAttachmentURLs(atts)
+
+		e.Project = nil
+		if e.ProjectID != nil && *e.ProjectID > 0 {
+			if p, ok := projMap[*e.ProjectID]; ok {
+				proj := p
+				e.Project = &proj
+			}
+		}
+
+		e.Wish = nil
+		if e.WishID != nil && *e.WishID > 0 {
+			if w, ok := wishMap[*e.WishID]; ok {
+				wish := w
+				e.Wish = &wish
+			}
+		}
 	}
 }
 
@@ -283,29 +362,25 @@ func GetLifeEntriesV1(c *gin.Context) {
 	}
 	if year != "" && year != "all" {
 		if y, err := strconv.Atoi(year); err == nil && y > 1900 && y < 3000 {
-			startOfYear := time.Date(y, 1, 1, 0, 0, 0, 0, time.Local)
-			endOfYear := time.Date(y+1, 1, 1, 0, 0, 0, 0, time.Local)
+			startOfYear := time.Date(y, 1, 1, 0, 0, 0, 0, config.BeijingLocation)
+			endOfYear := time.Date(y+1, 1, 1, 0, 0, 0, 0, config.BeijingLocation)
 			query = query.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear)
 		}
 	}
 
-	// 核心视角动态映射 (4 大纯化形态: daily, travel, project, wish + transaction)
+	// 核心视角动态映射 (4 大纯化形态: daily, travel, project, wish + transaction；RC-128 收敛后旧类型值已不存在，兼容分支移除)
 	if category != "" && category != "all" {
 		switch category {
 		case "daily":
-			query = query.Where("type IN ('daily', 'life', 'thought', 'photo', 'coffee', 'moment', 'idea', 'note', 'essay')")
+			query = query.Where("type = ?", "life")
 		case "travel":
-			query = query.Where("type IN ('travel', 'place') OR (city_code != '' AND city_code IS NOT NULL)")
+			query = query.Where("type = ? OR (city_code != '' AND city_code IS NOT NULL)", "travel")
 		case "project":
-			query = query.Where("type IN ('project', 'code', 'craft') OR (project_id IS NOT NULL AND project_id > 0)")
-		case "wish", "collection":
-			query = query.Where("type IN ('wish', 'collection') OR (wish_id IS NOT NULL AND wish_id > 0)")
-		case "thought":
-			query = query.Where("type IN ('thought', 'idea', 'note', 'essay')")
-		case "photo":
-			query = query.Where("type = 'photo'")
+			query = query.Where("type = ? OR (project_id IS NOT NULL AND project_id > 0)", "project")
+		case "wish":
+			query = query.Where("type = ? OR (wish_id IS NOT NULL AND wish_id > 0)", "wish")
 		case "transaction":
-			query = query.Where("type = 'transaction'")
+			query = query.Where("type = ?", "transaction")
 		}
 	}
 
@@ -319,9 +394,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 		return
 	}
 
-	for i := range entries {
-		populateEntryURLs(&entries[i])
-	}
+	populateEntryURLsBatch(entries)
 
 	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
 	var maxUpdated time.Time
@@ -458,15 +531,21 @@ func UpdateLifeEntry(c *gin.Context) {
 			return err
 		}
 		if req.AttachmentIDs != nil {
-			// 解除未包含的附件
-			if err := tx.Model(&models.Attachment{}).
-				Where("entry_id = ? AND id NOT IN ?", entry.ID, req.AttachmentIDs).
-				Update("entry_id", nil).Error; err != nil {
-				return err
-			}
-
-			// 绑定新选中的附件
-			if len(req.AttachmentIDs) > 0 {
+			// 空数组语义 = 解除该条目的全部附件绑定（不可退化为 NOT IN 空集，那样解绑一条都不发生）
+			if len(req.AttachmentIDs) == 0 {
+				if err := tx.Model(&models.Attachment{}).
+					Where("entry_id = ?", entry.ID).
+					Update("entry_id", nil).Error; err != nil {
+					return err
+				}
+			} else {
+				// 解除未包含的附件
+				if err := tx.Model(&models.Attachment{}).
+					Where("entry_id = ? AND id NOT IN ?", entry.ID, req.AttachmentIDs).
+					Update("entry_id", nil).Error; err != nil {
+					return err
+				}
+				// 绑定新选中的附件
 				if err := tx.Model(&models.Attachment{}).
 					Where("id IN ?", req.AttachmentIDs).
 					Update("entry_id", entry.ID).Error; err != nil {
@@ -515,8 +594,19 @@ func DeleteLifeEntry(c *gin.Context) {
 					tx.Model(&att).Update("entry_id", nil)
 				}
 			}
-			if err := tx.Unscoped().Where("life_entry_id = ?", entry.ID).Delete(&models.Footprint{}).Error; err != nil {
-				return err
+			// 仅删除由该条目首生、且无其他条目经 footprint_id 引用的足迹 (RC-25 共享引用保护)
+			var bornFps []models.Footprint
+			tx.Where("life_entry_id = ?", entry.ID).Find(&bornFps)
+			for _, fp := range bornFps {
+				var refCount int64
+				tx.Model(&models.LifeEntry{}).
+					Where("footprint_id = ? AND id != ?", fp.ID, entry.ID).
+					Count(&refCount)
+				if refCount == 0 {
+					if err := tx.Unscoped().Delete(&models.Footprint{}, fp.ID).Error; err != nil {
+						return err
+					}
+				}
 			}
 			tx.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
 			return tx.Unscoped().Delete(&entry).Error
@@ -535,7 +625,21 @@ func DeleteLifeEntry(c *gin.Context) {
 		if err := tx.Delete(&entry).Error; err != nil {
 			return err
 		}
-		return tx.Where("life_entry_id = ?", entry.ID).Delete(&models.Footprint{}).Error
+		// 仅软删除由该条目首生、且无其他存活条目经 footprint_id 引用的足迹
+		var bornFps []models.Footprint
+		tx.Where("life_entry_id = ?", entry.ID).Find(&bornFps)
+		for _, fp := range bornFps {
+			var refCount int64
+			tx.Model(&models.LifeEntry{}).
+				Where("footprint_id = ? AND id != ?", fp.ID, entry.ID).
+				Count(&refCount)
+			if refCount == 0 {
+				if err := tx.Delete(&models.Footprint{}, fp.ID).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
@@ -770,28 +874,25 @@ func CreateTransaction(c *gin.Context) {
 
 	// 路径 B：记账大件同步收录至随身设备库 (RC-53)
 	if req.LinkGearAsset {
-		var profile models.CuratorProfile
-		if err := db.DB.First(&profile).Error; err == nil {
-			gearCategory := strings.TrimSpace(req.GearCategory)
-			if gearCategory == "" {
-				gearCategory = tx.Category
-			}
-			newGear := models.GearItem{
-				ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
-				Name:         tx.Title,
-				Spec:         strings.TrimSpace(req.GearSpec),
-				Category:     gearCategory,
-				Status:       "active",
-				PriceCents:   tx.Amount,
-				PurchaseDate: tx.OccurredAt.Format("2006-01-02"),
-				Note:         tx.Note,
-			}
-			list := loadProfileGear(&profile)
-			list = append(list, newGear)
-			if err := saveProfileGear(&profile, list); err != nil {
-				Error(c, http.StatusInternalServerError, "记账成功但收录设备资产失败: "+err.Error())
-				return
-			}
+		gearCategory := strings.TrimSpace(req.GearCategory)
+		if gearCategory == "" {
+			gearCategory = tx.Category
+		}
+		newGear := models.GearItem{
+			ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
+			Name:         tx.Title,
+			Spec:         strings.TrimSpace(req.GearSpec),
+			Category:     gearCategory,
+			Status:       "active",
+			PriceCents:   tx.Amount,
+			PurchaseDate: tx.OccurredAt.In(config.BeijingLocation).Format("2006-01-02"),
+			Note:         tx.Note,
+		}
+		if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
+			return append(list, newGear), nil
+		}); err != nil {
+			Error(c, http.StatusInternalServerError, "记账成功但收录设备资产失败: "+err.Error())
+			return
 		}
 	}
 
@@ -844,12 +945,12 @@ func GetTransactions(c *gin.Context) {
 			if monthStr != "" {
 				m, err := strconv.Atoi(monthStr)
 				if err == nil {
-					start := time.Date(y, time.Month(m), 1, 0, 0, 0, 0, time.Local)
+					start := time.Date(y, time.Month(m), 1, 0, 0, 0, 0, config.BeijingLocation)
 					end := start.AddDate(0, 1, 0)
 					query = query.Where("occurred_at >= ? AND occurred_at < ?", start, end)
 				}
 			} else {
-				start := time.Date(y, 1, 1, 0, 0, 0, 0, time.Local)
+				start := time.Date(y, 1, 1, 0, 0, 0, 0, config.BeijingLocation)
 				end := start.AddDate(1, 0, 0)
 				query = query.Where("occurred_at >= ? AND occurred_at < ?", start, end)
 			}
@@ -857,6 +958,9 @@ func GetTransactions(c *gin.Context) {
 	}
 
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
+	if limit > 1000 {
+		limit = 1000 // 钳制上限，防止超大 limit 整表载入内存 (BE-27)
+	}
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -870,13 +974,13 @@ func GetTransactions(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
+	// 分期剩余期数按当前时间即时推算展示，不落库 (BE-24：GET 保持只读语义，避免扰动 ETag/304 与并发竞态)
+	now := config.NowInBeijing()
 	for i := range txs {
 		if txs[i].IsInstallment {
 			_, autoRemain := CalculateElapsedInstallmentMonths(txs[i].OccurredAt, txs[i].InstallmentMonths, txs[i].RepaymentDay, now)
 			if txs[i].InstallmentRemainMonths > autoRemain {
 				txs[i].InstallmentRemainMonths = autoRemain
-				_ = db.DB.Save(&txs[i]).Error
 			}
 		}
 	}
@@ -917,7 +1021,7 @@ func GetTransactionSummary(c *gin.Context) {
 	y, _ := strconv.Atoi(yearStr)
 	m, _ := strconv.Atoi(monthStr)
 
-	start := time.Date(y, time.Month(m), 1, 0, 0, 0, 0, time.Local)
+	start := time.Date(y, time.Month(m), 1, 0, 0, 0, 0, config.BeijingLocation)
 	end := start.AddDate(0, 1, 0)
 
 	var txs []models.Transaction
@@ -1153,7 +1257,11 @@ func GetProjectsV1(c *gin.Context) {
 		}
 	}
 
-	if limit, err := strconv.Atoi(c.Query("limit")); err == nil && limit > 0 {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
+	if limit > 1000 {
+		limit = 1000 // 钳制上限，防止超大 limit 整表载入内存 (BE-27)
+	}
+	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
@@ -1202,9 +1310,7 @@ func GetProjectByID(c *gin.Context) {
 	// 同时拉取关联该项目的 Life Entries
 	var entries []models.LifeEntry
 	db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC").Find(&entries)
-	for i := range entries {
-		populateEntryURLs(&entries[i])
-	}
+	populateEntryURLsBatch(entries)
 
 	Success(c, gin.H{
 		"project": p,
@@ -1388,17 +1494,16 @@ func GetGlobalStats(c *gin.Context) {
 	var totalEntries int64
 	db.DB.Model(&models.LifeEntry{}).Count(&totalEntries)
 
+	// 照片数：按 MIME 前缀统计图片附件（RC-128 四维收敛后不再存在 type='photo' 的条目，死分支已移除）
 	var totalPhotos int64
-	db.DB.Model(&models.Attachment{}).Count(&totalPhotos)
-	if totalPhotos == 0 {
-		db.DB.Model(&models.LifeEntry{}).Where("type = 'photo'").Count(&totalPhotos)
-	}
+	db.DB.Model(&models.Attachment{}).Where("mime_type LIKE ?", "image/%").Count(&totalPhotos)
 
 	var totalProjects int64
 	db.DB.Model(&models.Project{}).Count(&totalProjects)
 
-	// 当月支出
-	start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local)
+	// 当月支出（按北京时间月份边界计算 RC-134）
+	nowBeijing := now.In(config.BeijingLocation)
+	start := time.Date(nowBeijing.Year(), nowBeijing.Month(), 1, 0, 0, 0, 0, config.BeijingLocation)
 	end := start.AddDate(0, 1, 0)
 
 	var monthExpense int64
@@ -1417,8 +1522,8 @@ func GetGlobalStats(c *gin.Context) {
 		"total_photos":   totalPhotos,
 		"total_projects": totalProjects,
 		"month_expense":  monthExpense,
-		"current_year":   now.Year(),
-		"current_month":  int(now.Month()),
+		"current_year":   nowBeijing.Year(),
+		"current_month":  int(nowBeijing.Month()),
 	}
 
 	statsCacheMutex.Lock()

@@ -65,7 +65,11 @@ func populateProfileData(p *models.CuratorProfile, isAdmin bool) {
 	if githubVal, ok := socialMap["github"].(string); ok {
 		p.Github = strings.TrimSpace(githubVal)
 	}
-	socialMap["email"] = p.Email
+	// 隐私分级：GitHub 为公开展示链接，邮箱属联系方式，仅管理员可见 (BE-39)
+	if !isAdmin {
+		p.Email = ""
+		socialMap["email"] = ""
+	}
 	socialMap["github"] = p.Github
 	p.SocialData = socialMap
 
@@ -131,19 +135,20 @@ func UpdateCuratorProfile(c *gin.Context) {
 		return ok
 	}
 
-	if req.Name != "" {
+	// 字段语义统一为 PATCH：请求携带该 key 即按其值写入（空串 = 清空），不再与 name 耦合 (BE-35)
+	if req.Name != "" || hasKey("name") {
 		profile.Name = strings.TrimSpace(req.Name)
 	}
-	if req.Title != "" || (hasKey("title") && req.Name != "") {
+	if req.Title != "" || hasKey("title") {
 		profile.Title = strings.TrimSpace(req.Title)
 	}
-	if req.Bio != "" || (hasKey("bio") && req.Name != "") {
+	if req.Bio != "" || hasKey("bio") {
 		profile.Bio = strings.TrimSpace(req.Bio)
 	}
-	if req.Location != "" || (hasKey("location") && req.Name != "") {
+	if req.Location != "" || hasKey("location") {
 		profile.Location = strings.TrimSpace(req.Location)
 	}
-	if req.CurrentCity != "" || (hasKey("current_city") && req.Name != "") {
+	if req.CurrentCity != "" || hasKey("current_city") {
 		profile.CurrentCity = strings.TrimSpace(req.CurrentCity)
 	}
 
@@ -159,15 +164,15 @@ func UpdateCuratorProfile(c *gin.Context) {
 		profile.AvatarURL = storage.ExtractObjectKey(avatarCandidate)
 	}
 
-	if req.Motto != "" || (hasKey("motto") && req.Name != "") {
+	if req.Motto != "" || hasKey("motto") {
 		profile.Motto = strings.TrimSpace(req.Motto)
 	}
-	if req.Manifesto != "" || (hasKey("manifesto") && req.Name != "") {
+	if req.Manifesto != "" || hasKey("manifesto") {
 		profile.Manifesto = strings.TrimSpace(req.Manifesto)
 	}
 
 	// 合并 social_links 与顶层 email / github 字段 (RG-09)
-	if req.SocialLinks != nil || req.Email != "" || req.Github != "" || (hasKey("email") && req.Name != "") || (hasKey("github") && req.Name != "") {
+	if req.SocialLinks != nil || hasKey("email") || hasKey("github") {
 		socialMap := parseSocialMap(profile.SocialLinks)
 		if req.SocialLinks != nil {
 			switch v := req.SocialLinks.(type) {
@@ -187,10 +192,10 @@ func UpdateCuratorProfile(c *gin.Context) {
 				}
 			}
 		}
-		if req.Email != "" || (hasKey("email") && req.Name != "") {
+		if req.Email != "" || hasKey("email") {
 			socialMap["email"] = strings.TrimSpace(req.Email)
 		}
-		if req.Github != "" || (hasKey("github") && req.Name != "") {
+		if req.Github != "" || hasKey("github") {
 			socialMap["github"] = strings.TrimSpace(req.Github)
 		}
 		if bytes, err := json.Marshal(socialMap); err == nil {

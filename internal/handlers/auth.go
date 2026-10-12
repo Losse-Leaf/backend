@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -23,12 +23,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// HashToken 计算 Token 的 SHA-256 哈希字符串，数据库仅存储哈希
-func HashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
+// generateRandomHex 生成 n 字节随机十六进制串
 func generateRandomHex(n int) string {
 	bytes := make([]byte, n)
 	if _, err := rand.Read(bytes); err != nil {
@@ -163,6 +158,15 @@ func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window tim
 			valid = append(valid, t)
 		}
 	}
+	// 窗口内已无有效尝试时回收该 IP 的键，避免 map 随不同 IP 无界增长 (BE-33)
+	if len(valid) == 0 {
+		delete(l.attempts, ip)
+		if len(valid) >= maxAttempts {
+			return false
+		}
+		l.attempts[ip] = append(valid, now)
+		return true
+	}
 	if len(valid) >= maxAttempts {
 		l.attempts[ip] = valid
 		return false
@@ -237,13 +241,9 @@ func ConfirmPairing(c *gin.Context) {
 		}
 
 		if matchedTicket == nil {
-			for i := range activeTickets {
-				activeTickets[i].FailedAttempts++
-				if activeTickets[i].FailedAttempts >= 5 {
-					activeTickets[i].Used = true
-				}
-				db.DB.Save(&activeTickets[i])
-			}
+			// 纯 PIN 握手无法定位工单，不做跨工单累加 (BE-26)：
+			// 否则 5 次错误 PIN 即可作废系统内全部有效工单，形成拒绝服务。
+			// 防爆破由 ConfirmPairing 入口的 IP 级限速 (30 次/分钟) 兜底。
 			Error(c, http.StatusBadRequest, "配对 PIN 码错误或工单无效")
 			return
 		}
@@ -258,7 +258,7 @@ func ConfirmPairing(c *gin.Context) {
 	dateTag := now.Format("20060102")
 	deviceID := fmt.Sprintf("dev_%s_%s_%s", platform, dateTag, generateRandomHex(2))
 	rawDeviceToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
-	tokenHash := HashToken(rawDeviceToken)
+	tokenHash := middleware.HashToken(rawDeviceToken)
 
 	deviceName := strings.TrimSpace(req.DeviceName)
 	if deviceName == "" {
@@ -296,7 +296,7 @@ func ConfirmPairing(c *gin.Context) {
 					DeviceID:     fmt.Sprintf("dev_web_%s_%s", dateTag, generateRandomHex(2)),
 					Name:         fmt.Sprintf("Web 浏览器 · 伴生授权 (%s)", deviceName),
 					Platform:     "web",
-					TokenHash:    HashToken(webCompanionToken),
+					TokenHash:    middleware.HashToken(webCompanionToken),
 					Status:       "active",
 					PairedAt:     now,
 					LastActiveAt: now,
@@ -475,7 +475,7 @@ func CheckPasscode(passcode, hashed string) bool {
 	if strings.HasPrefix(hashed, "$2a$") || strings.HasPrefix(hashed, "$2b$") {
 		return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(passcode)) == nil
 	}
-	inputHash := HashToken(passcode)
+	inputHash := middleware.HashToken(passcode)
 	return subtle.ConstantTimeCompare([]byte(inputHash), []byte(hashed)) == 1
 }
 
@@ -523,7 +523,7 @@ func VerifyPasscode(c *gin.Context) {
 
 	now := time.Now()
 	rawToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
-	tokenHash := HashToken(rawToken)
+	tokenHash := middleware.HashToken(rawToken)
 	deviceName := strings.TrimSpace(req.DeviceName)
 	if deviceName == "" {
 		deviceName = "Web 浏览器 · 主人密钥登录"

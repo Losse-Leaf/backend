@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -96,6 +97,87 @@ func populateFootprintURLs(f *models.Footprint) {
 	for i := range f.Attachments {
 		f.Attachments[i].URL = storage.SignResourceURL(f.Attachments[i].ObjectKey)
 	}
+}
+
+// populateFootprintURLsBatch 批量填充一组旅程的相片与关联动态计数 (BE-30)
+func populateFootprintURLsBatch(footprints []models.Footprint) {
+	if len(footprints) == 0 {
+		return
+	}
+
+	fpIDs := make([]uint, 0, len(footprints))
+	fpSet := make(map[uint]*models.Footprint, len(footprints))
+	entryCount := make(map[uint]int, len(footprints))
+	for i := range footprints {
+		if footprints[i].ID > 0 {
+			fpIDs = append(fpIDs, footprints[i].ID)
+			fpSet[footprints[i].ID] = &footprints[i]
+		}
+	}
+
+	entryCountByFP := make(map[uint]int)
+	entryFP := make(map[uint]uint)
+	if len(fpIDs) > 0 {
+		type entryRef struct {
+			ID          uint
+			FootprintID *uint
+		}
+		var refs []entryRef
+		db.DB.Model(&models.LifeEntry{}).
+			Select("id, footprint_id").
+			Where("footprint_id IN ?", fpIDs).
+			Scan(&refs)
+		for _, r := range refs {
+			if r.FootprintID != nil {
+				entryCountByFP[*r.FootprintID]++
+				entryFP[r.ID] = *r.FootprintID
+			}
+		}
+	}
+
+	attByFP := make(map[uint][]models.Attachment)
+	if len(fpIDs) > 0 {
+		entryIDs := make([]uint, 0, len(entryFP))
+		for eid := range entryFP {
+			entryIDs = append(entryIDs, eid)
+		}
+		var atts []models.Attachment
+		if len(entryIDs) > 0 {
+			db.DB.Where("footprint_id IN ? OR entry_id IN ?", fpIDs, entryIDs).Order("id ASC").Find(&atts)
+		} else {
+			db.DB.Where("footprint_id IN ?", fpIDs).Order("id ASC").Find(&atts)
+		}
+		for _, att := range atts {
+			switch {
+			case att.FootprintID != nil:
+				attByFP[*att.FootprintID] = append(attByFP[*att.FootprintID], att)
+			case att.EntryID != nil:
+				if fid, ok := entryFP[*att.EntryID]; ok {
+					attByFP[fid] = append(attByFP[fid], att)
+				}
+			}
+		}
+	}
+
+	for i := range footprints {
+		f := &footprints[i]
+		// 首生条目也计入关联动态数（与单条版 populateFootprintURLs 保持同一口径）
+		if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
+			entryCount[f.ID] = entryCountByFP[f.ID] + 1
+		} else {
+			entryCount[f.ID] = entryCountByFP[f.ID]
+		}
+		f.EntriesCount = entryCount[f.ID]
+		atts := attByFP[f.ID]
+		if atts == nil {
+			atts = []models.Attachment{}
+		}
+		for j := range atts {
+			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
+		}
+		f.Attachments = atts
+	}
+	_ = fpSet
 }
 
 // populateFootprintExpenseStats 为单次旅程计算关联的花销笔数与总额 (仅管理员可见)
@@ -348,7 +430,7 @@ func GetFootprints(c *gin.Context) {
 
 	if yearStr != "" {
 		if y, err := strconv.Atoi(yearStr); err == nil && y > 1900 && y < 3000 {
-			start := time.Date(y, 1, 1, 0, 0, 0, 0, time.Local)
+			start := time.Date(y, 1, 1, 0, 0, 0, 0, config.BeijingLocation)
 			end := start.AddDate(1, 0, 0)
 			query = query.Where("visited_at >= ? AND visited_at < ?", start, end)
 		}
@@ -361,8 +443,8 @@ func GetFootprints(c *gin.Context) {
 	}
 
 	isAdmin := middleware.IsAdmin(c)
+	populateFootprintURLsBatch(footprints)
 	for i := range footprints {
-		populateFootprintURLs(&footprints[i])
 		populateFootprintExpenseStats(&footprints[i], isAdmin)
 	}
 
@@ -629,11 +711,16 @@ func UpdateFootprint(c *gin.Context) {
 	}
 
 	if req.AttachmentIDs != nil {
-		db.DB.Model(&models.Attachment{}).
-			Where("footprint_id = ? AND id NOT IN ?", footprint.ID, req.AttachmentIDs).
-			Update("footprint_id", nil)
+		// 空数组语义 = 解除该旅程的全部相片绑定
+		if len(req.AttachmentIDs) == 0 {
+			db.DB.Model(&models.Attachment{}).
+				Where("footprint_id = ?", footprint.ID).
+				Update("footprint_id", nil)
+		} else {
+			db.DB.Model(&models.Attachment{}).
+				Where("footprint_id = ? AND id NOT IN ?", footprint.ID, req.AttachmentIDs).
+				Update("footprint_id", nil)
 
-		if len(req.AttachmentIDs) > 0 {
 			updates := map[string]interface{}{
 				"footprint_id": footprint.ID,
 			}
@@ -668,6 +755,8 @@ func DeleteFootprint(c *gin.Context) {
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
 			tx.Model(&models.Attachment{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			tx.Model(&models.Wish{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
+			// 共享引用保护：先摘除所有条目对该旅程的引用，再删除首生条目 (BE-25)
+			tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
 				if err := tx.Unscoped().Where("id = ?", *f.LifeEntryID).Delete(&models.LifeEntry{}).Error; err != nil {
 					return err
@@ -686,6 +775,8 @@ func DeleteFootprint(c *gin.Context) {
 
 	// 软删除足迹并同步软删除伴生 LifeEntry (BE-05)
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 共享引用保护：其余条目不应指向已软删旅程 (BE-25)
+		tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 		if err := tx.Delete(&f).Error; err != nil {
 			return err
 		}
@@ -714,64 +805,44 @@ type AtlasCitySummary struct {
 }
 
 // GetFootprintsAtlas 获取全国足迹汇总 (按市级汇总去过的城市、次数与首次/最近日期)
+// 聚合下沉至 SQL GROUP BY，不再全表载入内存 (BE-31)
 func GetFootprintsAtlas(c *gin.Context) {
-	var footprints []models.Footprint
-	db.DB.Order("visited_at ASC").Find(&footprints)
+	var totalFootprints int64
+	db.DB.Model(&models.Footprint{}).Count(&totalFootprints)
 
-	type cityAgg struct {
-		cityCode  string
-		cityName  string
-		count     int
-		firstDate time.Time
-		lastDate  time.Time
+	type cityAggRow struct {
+		CityCode string
+		CityName string
+		VisitCnt int64
+		FirstAt  string
+		LatestAt string
 	}
+	var rows []cityAggRow
+	db.DB.Model(&models.Footprint{}).
+		Select("city_code, MAX(city_name) AS city_name, COUNT(*) AS visit_cnt, MIN(visited_at) AS first_at, MAX(visited_at) AS latest_at").
+		Group("city_code").
+		Order("latest_at DESC, first_at DESC, city_code ASC").
+		Scan(&rows)
 
-	cityMap := make(map[string]*cityAgg)
-	for _, f := range footprints {
-		agg, ok := cityMap[f.CityCode]
-		if !ok {
-			cityMap[f.CityCode] = &cityAgg{
-				cityCode:  f.CityCode,
-				cityName:  f.CityName,
-				count:     1,
-				firstDate: f.VisitedAt,
-				lastDate:  f.VisitedAt,
-			}
-		} else {
-			agg.count++
-			if f.VisitedAt.Before(agg.firstDate) {
-				agg.firstDate = f.VisitedAt
-			}
-			if f.VisitedAt.After(agg.lastDate) {
-				agg.lastDate = f.VisitedAt
-			}
+	cities := make([]AtlasCitySummary, 0, len(rows))
+	for _, r := range rows {
+		cityName := strings.TrimSpace(r.CityName)
+		if cityName == "" {
+			cityName = r.CityCode
 		}
-	}
-
-	cities := make([]AtlasCitySummary, 0, len(cityMap))
-	for _, agg := range cityMap {
+		firstAt, _ := ParseFlexTime(r.FirstAt)
+		latestAt, _ := ParseFlexTime(r.LatestAt)
 		cities = append(cities, AtlasCitySummary{
-			CityCode:        agg.cityCode,
-			CityName:        agg.cityName,
-			VisitCount:      agg.count,
-			FirstVisitedAt:  agg.firstDate.Format("2006-01-02"),
-			LatestVisitedAt: agg.lastDate.Format("2006-01-02"),
+			CityCode:        r.CityCode,
+			CityName:        cityName,
+			VisitCount:      int(r.VisitCnt),
+			FirstVisitedAt:  firstAt.In(config.BeijingLocation).Format("2006-01-02"),
+			LatestVisitedAt: latestAt.In(config.BeijingLocation).Format("2006-01-02"),
 		})
 	}
 
-	// 稳定排序：按最近到访时间倒序，其次按首访时间倒序、城市代码升序，彻底消除 map 乱序导致的抖动
-	sort.Slice(cities, func(i, j int) bool {
-		if cities[i].LatestVisitedAt != cities[j].LatestVisitedAt {
-			return cities[i].LatestVisitedAt > cities[j].LatestVisitedAt
-		}
-		if cities[i].FirstVisitedAt != cities[j].FirstVisitedAt {
-			return cities[i].FirstVisitedAt > cities[j].FirstVisitedAt
-		}
-		return cities[i].CityCode < cities[j].CityCode
-	})
-
 	Success(c, gin.H{
-		"total_footprints": len(footprints),
+		"total_footprints": totalFootprints,
 		"total_cities":     len(cities),
 		"cities":           cities,
 	})
@@ -807,10 +878,10 @@ func processDrawerFootprints(footprints []models.Footprint, isAdmin bool) (strin
 
 	firstVisitStr, latestVisitStr := "", ""
 	if !firstVisit.IsZero() {
-		firstVisitStr = firstVisit.Format("2006-01-02")
+		firstVisitStr = firstVisit.In(config.BeijingLocation).Format("2006-01-02")
 	}
 	if !latestVisit.IsZero() {
-		latestVisitStr = latestVisit.Format("2006-01-02")
+		latestVisitStr = latestVisit.In(config.BeijingLocation).Format("2006-01-02")
 	}
 	return firstVisitStr, latestVisitStr, fpIDs
 }
@@ -895,9 +966,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		entries = []models.LifeEntry{}
 	}
 
-	for i := range entries {
-		populateEntryURLs(&entries[i])
-	}
+	populateEntryURLsBatch(entries)
 
 	// 3. 关联该城市及旅程的消费账单光谱 (仅管理员查询聚合 RC-81, BE-14)
 	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {

@@ -36,10 +36,18 @@ type FileUploadResult struct {
 	AttachmentID     uint   `json:"attachment_id"`     // 已持久化的关联附件 ID (便于 LifeEntry 快速关联)
 }
 
+// allowedUploadFolders 统一文件直传允许的归类目录白名单 (与 docs/backend.md §四.5 路径约定一致)
+var allowedUploadFolders = map[string]bool{
+	"entries": true,
+	"avatar":  true,
+	"covers":  true,
+	"audio":   true,
+}
+
 // UnifiedUploadFile 统一文件直传接口 (支持 multipart/form-data)
 // 接收参数：
 //   - file: 物理文件 (必填)
-//   - folder: 目标目录 (可选，如 avatar, entries, photos，默认为 entries)
+//   - folder: 目标目录 (可选，取值 entries / avatar / covers / audio，默认 entries)
 //   - key / object_key: 自定义相对路径 (可选，如 avatar/user.png)
 func UnifiedUploadFile(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
@@ -61,7 +69,12 @@ func UnifiedUploadFile(c *gin.Context) {
 		customKey = strings.TrimSpace(c.PostForm("object_key"))
 	}
 
-	// 净化并构建规范的存储桶相对路径
+	// 净化并构建规范的存储桶相对路径 (folder 仅允许白名单目录，杜绝任意子目录写入 BE-22)
+	folder = strings.TrimSpace(folder)
+	if !allowedUploadFolders[folder] {
+		Error(c, http.StatusBadRequest, "不支持的存储归类目录 (可选值: entries, avatar, covers, audio)")
+		return
+	}
 	objectKey, err := storage.BuildSafeObjectKey(folder, fileHeader.Filename, customKey)
 	if err != nil {
 		Error(c, http.StatusBadRequest, "对象相对路径无效: "+err.Error())

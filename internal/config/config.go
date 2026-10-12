@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type R2Config struct {
@@ -27,6 +28,21 @@ var AppConfig Config
 
 // Version 应用程序版本号，在构建时通过 -ldflags 注入 (RC-66)
 var Version = "dev"
+
+// BeijingLocation 全项目统一时区基准：中国北京时间 (UTC+8, 固定偏移，不依赖系统 tzdata) (RC-134)
+// 部署目标为海外 VPS (系统时区通常为 UTC)，所有「无时区后缀」输入一律按北京时间解释，
+// 所有年月日边界计算一律以北京时间切分，保证跨时区部署下时间显示零漂移。
+var BeijingLocation = time.FixedZone("CST", 8*3600)
+
+// NowInBeijing 返回当前时刻的北京时间表示
+func NowInBeijing() time.Time {
+	return time.Now().In(BeijingLocation)
+}
+
+// TodayInBeijing 返回北京时间当天日期 (YYYY-MM-DD)
+func TodayInBeijing() string {
+	return NowInBeijing().Format("2006-01-02")
+}
 
 // loadDotEnv 轻量读取当前工作目录或 backend/ 下的 .env 文件
 func loadDotEnv() {

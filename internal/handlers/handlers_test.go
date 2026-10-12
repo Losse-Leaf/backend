@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/models"
 )
 
 func TestParseFlexTime(t *testing.T) {
@@ -84,7 +86,7 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 
 	// 1. Create entry for 2026
 	req2026 := CreateEntryRequest{
-		Type:       "thought",
+		Type:       "life",
 		Title:      "2026 Thought",
 		Content:    "Thinking in 2026",
 		OccurredAt: "2026-05-20T10:00:00Z",
@@ -113,7 +115,7 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 
 	// 2. Create entry for 2025
 	req2025 := CreateEntryRequest{
-		Type:       "photo",
+		Type:       "life",
 		Title:      "2025 Photo",
 		Content:    "Photo taken in 2025",
 		OccurredAt: "2025-11-11T12:00:00Z",
@@ -152,15 +154,26 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 		t.Errorf("expected 1 entry for 2025, got %v", data2025["total"])
 	}
 
-	// 5. Query with category=photo
+	// 5. Query with category=daily (RC-128 四母体收敛后 daily 视角 = type=life；旧 photo 类型兼容分支已移除)
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?category=photo", nil)
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?category=daily", nil)
 	r.ServeHTTP(w, req)
 	var queryPhotoResp map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &queryPhotoResp)
 	dataPhoto := queryPhotoResp["data"].(map[string]interface{})
-	if int(dataPhoto["total"].(float64)) != 1 {
-		t.Errorf("expected 1 photo entry, got %v", dataPhoto["total"])
+	if int(dataPhoto["total"].(float64)) != 2 {
+		t.Errorf("expected 2 life entries, got %v", dataPhoto["total"])
+	}
+
+	// 5b. 已移除的 photo 类型视角不再作为兼容分支存在 (BE-36)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?category=photo", nil)
+	r.ServeHTTP(w, req)
+	var queryLegacyResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &queryLegacyResp)
+	dataLegacy := queryLegacyResp["data"].(map[string]interface{})
+	if int(dataLegacy["total"].(float64)) != 2 {
+		t.Errorf("expected legacy category filter to be a no-op (all 2 entries), got %v", dataLegacy["total"])
 	}
 
 	// 6. Check stats
@@ -173,8 +186,26 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 	if int(statsData["total_entries"].(float64)) != 2 {
 		t.Errorf("expected total_entries=2, got %v", statsData["total_entries"])
 	}
-	if int(statsData["total_photos"].(float64)) != 1 {
-		t.Errorf("expected total_photos=1, got %v", statsData["total_photos"])
+	// total_photos 口径为 image/* 附件数 (BE-29)，先补一张图片附件与一张非图片附件
+	entryID := uint(0)
+	var entryRow models.LifeEntry
+	if err := db.DB.Order("id ASC").First(&entryRow).Error; err == nil {
+		entryID = entryRow.ID
+	}
+	if entryID > 0 {
+		db.DB.Create(&models.Attachment{EntryID: &entryID, ObjectKey: "entries/test/photo.png", OriginalFilename: "photo.png", MimeType: "image/png", Size: 1024})
+		db.DB.Create(&models.Attachment{EntryID: &entryID, ObjectKey: "entries/test/note.pdf", OriginalFilename: "note.pdf", MimeType: "application/pdf", Size: 2048})
+	}
+
+	InvalidateStatsCache() // 统计接口有 30 秒内存缓存，二次断言前主动失效
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	r.ServeHTTP(w, req)
+	var statsResp2 map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &statsResp2)
+	statsData2 := statsResp2["data"].(map[string]interface{})
+	if int(statsData2["total_photos"].(float64)) != 1 {
+		t.Errorf("expected total_photos=1 (image/* only), got %v", statsData2["total_photos"])
 	}
 }
 

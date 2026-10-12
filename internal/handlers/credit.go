@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -28,7 +29,8 @@ func CalculateElapsedInstallmentMonths(occurredAt time.Time, totalMonths int, re
 		return 0, totalMonths
 	}
 
-	loc := now.Location()
+	// 全项目时区基准为中国北京时间 (RC-134)，还款日切分不随部署机时区漂移
+	loc := config.BeijingLocation
 	occInLoc := occurredAt.In(loc)
 	occY, occM, occD := occInLoc.Date()
 	purchaseDate := time.Date(occY, occM, occD, 0, 0, 0, 0, loc)

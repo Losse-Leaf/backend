@@ -146,7 +146,9 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("4b. Brute-force PIN protection invalidates ticket after 5 failed attempts", func(t *testing.T) {
+	// BE-26：纯 PIN 握手不定位工单，故错误 PIN 不再跨工单累加（否则 5 次错误即可作废全部工单形成 DoS）。
+	// 防爆破改由 ConfirmPairing 入口的 IP 级限速（30 次/分钟）兜底；带 ticket 的握手仍按工单计次作废。
+	t.Run("4b. Pure-PIN failures do not invalidate other tickets (rate-limit is the brute-force guard)", func(t *testing.T) {
 		ticket3 := models.PairTicket{
 			Ticket:    "pair_tk_bruteforce_test",
 			PinCode:   "999111",
@@ -155,11 +157,8 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 		db.DB.Create(&ticket3)
 
-		// 5 次错误 PIN 尝试
 		for i := 0; i < 5; i++ {
-			badPayload := ConfirmPairingRequest{
-				PinCode: "000000",
-			}
+			badPayload := ConfirmPairingRequest{PinCode: "000000"}
 			body, _ := json.Marshal(badPayload)
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -170,24 +169,52 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			}
 		}
 
-		// 检查数据库中该工单已被废弃
 		var checkTk models.PairTicket
 		db.DB.Where("ticket = ?", ticket3.Ticket).First(&checkTk)
-		if !checkTk.Used || checkTk.FailedAttempts != 5 {
-			t.Fatalf("expected ticket to be marked used with failed_attempts=5, got used=%v, failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
+		if checkTk.Used || checkTk.FailedAttempts != 0 {
+			t.Fatalf("pure-PIN failures must not void tickets, got used=%v failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
 		}
 
-		// 第 6 次即便输入正确 PIN，也无法配对成功
-		correctPayload := ConfirmPairingRequest{
-			PinCode: "999111",
-		}
+		// 正确 PIN 仍可正常配对（工单未被误伤）
+		correctPayload := ConfirmPairingRequest{PinCode: "999111"}
 		body, _ := json.Marshal(correctPayload)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for invalidated ticket even with correct pin, got %d", w.Code)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for correct pin after failed attempts, got %d: %s", w.Code, w.Body.String())
+		}
+
+		// 清理本子测试新建的设备，避免影响后续设备计数断言
+		db.DB.Where("platform = ?", "device").Delete(&models.Device{})
+	})
+
+	t.Run("4c. Ticket-scoped handshake still counts failures and voids ticket after 5 attempts", func(t *testing.T) {
+		ticket4 := models.PairTicket{
+			Ticket:    "pair_tk_scoped_test",
+			PinCode:   "999222",
+			ExpiresAt: time.Now().Add(5 * time.Minute),
+			Used:      false,
+		}
+		db.DB.Create(&ticket4)
+
+		for i := 0; i < 5; i++ {
+			badPayload := ConfirmPairingRequest{Ticket: ticket4.Ticket, PinCode: "000000"}
+			body, _ := json.Marshal(badPayload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for incorrect pin attempt %d, got %d", i+1, w.Code)
+			}
+		}
+
+		var checkTk models.PairTicket
+		db.DB.Where("ticket = ?", ticket4.Ticket).First(&checkTk)
+		if !checkTk.Used || checkTk.FailedAttempts != 5 {
+			t.Fatalf("expected scoped ticket used=true failed_attempts=5, got used=%v failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
 		}
 	})
 

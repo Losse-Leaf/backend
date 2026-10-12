@@ -19,11 +19,8 @@ func HashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func hashToken(token string) string {
-	return HashToken(token)
-}
-
-// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer 与 X-Device-Token)
+// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer, X-Device-Token 与 X-Admin-Key 请求头)
+// 安全规范：严禁通过 URL Query 参数传递 Token，防止凭据泄露至访问日志、反代日志与 Referer
 func ExtractToken(c *gin.Context) string {
 	authHeader := c.GetHeader("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
@@ -35,7 +32,7 @@ func ExtractToken(c *gin.Context) string {
 	if t := strings.TrimSpace(c.GetHeader("X-Admin-Key")); t != "" {
 		return t
 	}
-	return strings.TrimSpace(c.Query("admin_key"))
+	return ""
 }
 
 // isSystemInitialized 检查系统是否已完成初次装帧并绑定激活首台设备 (BE-18, BE-19)

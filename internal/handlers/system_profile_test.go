@@ -255,8 +255,8 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 		if cfg.Initialized {
 			t.Fatalf("BE-19 violation: SiteConfig.Initialized must remain false before device pairing confirmation")
 		}
-		if cfg.MasterPasscode != HashToken("my-secret-passcode") {
-			t.Fatalf("expected SHA-256 hashed master_passcode in DB")
+		if !CheckPasscode("my-secret-passcode", cfg.MasterPasscode) {
+			t.Fatalf("expected valid bcrypt hashed master_passcode in DB")
 		}
 
 		// 验证 BE-20 散页纸墨风二维码配色 (#181716 墨色与 #F9F8F5 暖纸背景)
@@ -273,6 +273,24 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 		r0, g0, b0, _ := img.At(0, 0).RGBA()
 		if uint8(r0>>8) != 249 || uint8(g0>>8) != 248 || uint8(b0>>8) != 245 {
 			t.Fatalf("BE-20 QR background color mismatch: got RGB(%d,%d,%d), expected RGB(249,248,245)", r0>>8, g0>>8, b0>>8)
+		}
+	})
+
+	t.Run("3b. Re-bootstrap during unactivated pairing window is forbidden (403)", func(t *testing.T) {
+		reqBody := BootstrapRequest{
+			CuratorName:     "Attacker",
+			Location:        "Anywhere",
+			MasterPasscode:  "attacker-secret",
+			ConfirmPasscode: "attacker-secret",
+		}
+		body, _ := json.Marshal(reqBody)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/system/bootstrap", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for bootstrap during unactivated pairing window, got %d", w.Code)
 		}
 	})
 
@@ -517,8 +535,8 @@ func TestSystemUpdateCheckAndUpdateNotices(t *testing.T) {
 			Data UpdateCheckResponse `json:"data"`
 		}
 		_ = json.Unmarshal(w404.Body.Bytes(), &res404)
-		if res404.Data.HasUpdate || res404.Data.LatestVersion != "" || res404.Data.CheckError != "" {
-			t.Fatalf("unexpected 404 fallback response: %+v", res404.Data)
+		if res404.Data.HasUpdate || res404.Data.LatestVersion != "" || res404.Data.CheckError == "" {
+			t.Fatalf("expected 404 to report informative check_error, got: %+v", res404.Data)
 		}
 
 		// (b) 200 newer version + 1h cache hit

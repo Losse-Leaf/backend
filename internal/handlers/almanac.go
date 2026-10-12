@@ -14,8 +14,6 @@ import (
 
 // GetAnnualAlmanacSummary 年度生活年鉴聚合计算接口 (五幕叙事：岁月卷首 / 山川行迹 / 心愿圆满 / 浮光掠影 / 柴米油盐)
 func GetAnnualAlmanacSummary(c *gin.Context) {
-	ensureEntryFootprintsSynced()
-
 	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", time.Now().Year()))
 	year, err := strconv.Atoi(yearStr)
 	if err != nil || year < 1900 || year > 3000 {
@@ -124,9 +122,9 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		}
 	}
 
-	// 截取最多 24 张精选照片作为长胶卷
+	// 截取最多 24 张精选照片作为长胶卷（优先展示最新的精选胶片）
 	if len(filmGallery) > 24 {
-		filmGallery = filmGallery[:24]
+		filmGallery = filmGallery[len(filmGallery)-24:]
 	}
 
 	if footprints == nil {
@@ -202,12 +200,36 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		}
 	}
 
-	// 组装年鉴信封 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17)
+	// 组装年鉴信封 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17，同时纳入内容更新指纹)
 	role := "guest"
 	if isAdmin {
 		role = "admin"
 	}
-	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%s"`, year, len(entries), len(txs), role)
+	var maxUpdated time.Time
+	for _, e := range entries {
+		if e.UpdatedAt.After(maxUpdated) {
+			maxUpdated = e.UpdatedAt
+		}
+	}
+	for _, f := range footprints {
+		if f.UpdatedAt.After(maxUpdated) {
+			maxUpdated = f.UpdatedAt
+		}
+	}
+	for _, w := range fulfilledWishes {
+		if w.UpdatedAt.After(maxUpdated) {
+			maxUpdated = w.UpdatedAt
+		}
+	}
+	if isAdmin {
+		for _, tx := range txs {
+			if tx.UpdatedAt.After(maxUpdated) {
+				maxUpdated = tx.UpdatedAt
+			}
+		}
+	}
+
+	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%d-%s"`, year, len(entries), len(txs), maxUpdated.UnixMilli(), role)
 	c.Header("ETag", etag)
 	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
 
@@ -217,29 +239,23 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	}
 
 	atlasPayload := gin.H{
-		"total_cities":   len(citiesVisited),
-		"cities":         citiesVisited,
-		"cities_visited": citiesVisited,
-		"footprints":     footprints,
+		"total_cities": len(citiesVisited),
+		"cities":       citiesVisited,
+		"footprints":   footprints,
 	}
 	wishesPayload := gin.H{
-		"fulfilled_wishes":   fulfilledWishes,
-		"wishes":             fulfilledWishes,
-		"fulfilled_count":    len(fulfilledWishes),
-		"total_wish_budget":  totalWishBudget,
-		"total_budget":       totalWishBudget,
-		"total_wish_actual":  totalWishActual,
-		"total_actual":       totalWishActual,
-		"wanting_wish_count": wantingWishCount,
-		"wanting_count":      wantingWishCount,
+		"wishes":          fulfilledWishes,
+		"fulfilled_count": len(fulfilledWishes),
+		"wanting_count":   wantingWishCount,
+		"total_budget":    totalWishBudget,
+		"total_actual":    totalWishActual,
 	}
 	highlightsPayload := gin.H{
-		"spring":       springHighlight,
-		"summer":       summerHighlight,
-		"autumn":       autumnHighlight,
-		"winter":       winterHighlight,
-		"film_gallery": filmGallery,
-		"photos":       filmGallery,
+		"spring": springHighlight,
+		"summer": summerHighlight,
+		"autumn": autumnHighlight,
+		"winter": winterHighlight,
+		"photos": filmGallery,
 	}
 
 	Success(c, gin.H{
@@ -248,20 +264,15 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"total_entries":    len(entries),
 			"total_words":      totalWords,
 			"active_days":      len(distinctDays),
-			"distinct_days":    len(distinctDays),
 			"first_date":       firstDateStr,
 			"last_date":        lastDateStr,
 			"wishes_fulfilled": len(fulfilledWishes),
 			"cities_visited":   len(citiesVisited),
 			"tx_count":         txCount,
 		},
-		"atlas_journey":      atlasPayload,
-		"atlas":              atlasPayload,
-		"wishes_milestones":  wishesPayload,
-		"wishes":             wishesPayload,
-		"life_highlights":    highlightsPayload,
-		"highlights":         highlightsPayload,
-		"financial_spectrum": finSpectrum,
-		"finances":           finSpectrum,
+		"atlas":      atlasPayload,
+		"wishes":     wishesPayload,
+		"highlights": highlightsPayload,
+		"finances":   finSpectrum,
 	})
 }

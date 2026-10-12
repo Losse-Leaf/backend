@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +55,10 @@ func BootstrapSystem(c *gin.Context) {
 		Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
 		return
 	}
+	if strings.TrimSpace(cfg.MasterPasscode) != "" {
+		Error(c, http.StatusForbidden, "自留地已设定管理员密钥，配对激活前禁止覆盖初始化")
+		return
+	}
 
 	var req BootstrapRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -84,7 +89,12 @@ func BootstrapSystem(c *gin.Context) {
 	}
 	cfg.CuratorName = curatorName
 	cfg.DefaultLocation = location
-	cfg.MasterPasscode = HashToken(masterPasscode)
+	hashedPasscode, err := HashPasscode(masterPasscode)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "加密管理员密钥失败: "+err.Error())
+		return
+	}
+	cfg.MasterPasscode = hashedPasscode
 	cfg.Initialized = false
 	cfg.UpdatedAt = time.Now()
 	if err := db.DB.Save(&cfg).Error; err != nil {
@@ -273,6 +283,9 @@ func CheckSystemUpdate(c *gin.Context) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "Loose-Leaf-Backend")
+	if ghToken := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); ghToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ghToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -289,7 +302,7 @@ func CheckSystemUpdate(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	// 首发空 Release 兜底：若仓库尚未发布任何 Release（GitHub 返回 404），返回 latest_version: ""、has_update: false 且不报 check_error
+	// 若仓库未发布 Release 或已转为私有仓库（未认证下 GitHub 均返回 404），给出明确提示而非静默吞下
 	if resp.StatusCode == http.StatusNotFound {
 		result := UpdateCheckResponse{
 			CurrentVersion: currentVer,
@@ -298,6 +311,7 @@ func CheckSystemUpdate(c *gin.Context) {
 			ReleaseURL:     defaultReleaseURL,
 			PublishedAt:    "",
 			CheckedAt:      nowStr,
+			CheckError:     "未检测到 Release 发行版（若仓库已设为私有，请配置 GITHUB_TOKEN 进行鉴权）",
 		}
 		updateCheckMu.Lock()
 		cachedUpdateCheck = &result

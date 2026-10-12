@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"loose-leaf/internal/db"
@@ -110,6 +111,35 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 on update credit channel, got %d", w.Code)
+		}
+
+		// 1.4b 修改渠道 code 并同步迁移关联账目
+		db.DB.Create(&models.Transaction{
+			Title:                  "招行买书",
+			Amount:                 20000,
+			Type:                   "expense",
+			IsInstallment:          true,
+			InstallmentChannelCode: "cmb_card",
+			OccurredAt:             time.Now(),
+		})
+		updateCodePayload := CreditChannelRequest{
+			Code:         "cmb_visa",
+			Name:         "招行经典白 VISA",
+			RepaymentDay: 18,
+		}
+		body, _ = json.Marshal(updateCodePayload)
+		w = httptest.NewRecorder()
+		req, _ = http.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/credit-channels/%d", createdID), bytes.NewBuffer(body))
+		req.Header.Set("Authorization", "Bearer "+testMasterKey)
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 updating channel code: %d", w.Code)
+		}
+		var checkTx models.Transaction
+		db.DB.Where("title = ?", "招行买书").First(&checkTx)
+		if checkTx.InstallmentChannelCode != "cmb_visa" {
+			t.Fatalf("expected transaction channel code to be migrated to cmb_visa, got %s", checkTx.InstallmentChannelCode)
 		}
 
 		// 1.5 尝试删除内置渠道（应该被拒绝 400）

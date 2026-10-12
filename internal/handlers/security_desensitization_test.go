@@ -314,15 +314,15 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 				Prologue struct {
 					TxCount int `json:"tx_count"`
 				} `json:"prologue"`
-				WishesMilestones struct {
-					TotalWishActual int64         `json:"total_wish_actual"`
-					FulfilledWishes []models.Wish `json:"fulfilled_wishes"`
-				} `json:"wishes_milestones"`
-				FinancialSpectrum struct {
+				Wishes struct {
+					TotalActual int64         `json:"total_actual"`
+					Wishes      []models.Wish `json:"wishes"`
+				} `json:"wishes"`
+				Finances struct {
 					TotalIncome  int64 `json:"total_income"`
 					TotalExpense int64 `json:"total_expense"`
 					Balance      int64 `json:"balance"`
-				} `json:"financial_spectrum"`
+				} `json:"finances"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &almanacResp)
@@ -330,18 +330,18 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		if almanacResp.Data.Prologue.TxCount != 0 {
 			t.Fatalf("BE-14 年鉴访客模式 Prologue 泄露 tx_count: %d", almanacResp.Data.Prologue.TxCount)
 		}
-		if almanacResp.Data.WishesMilestones.TotalWishActual != 0 {
-			t.Fatalf("BE-14 年鉴访客模式 Milestones 泄露 total_wish_actual: %d", almanacResp.Data.WishesMilestones.TotalWishActual)
+		if almanacResp.Data.Wishes.TotalActual != 0 {
+			t.Fatalf("BE-14 年鉴访客模式 Wishes 泄露 total_actual: %d", almanacResp.Data.Wishes.TotalActual)
 		}
-		for _, wItem := range almanacResp.Data.WishesMilestones.FulfilledWishes {
+		for _, wItem := range almanacResp.Data.Wishes.Wishes {
 			if wItem.ActualCost != 0 || wItem.TransactionID != nil || wItem.GearID != nil {
 				t.Fatalf("BE-14 年鉴访客模式心愿明细泄露财务: actual_cost=%d", wItem.ActualCost)
 			}
 		}
-		if almanacResp.Data.FinancialSpectrum.TotalIncome != 0 ||
-			almanacResp.Data.FinancialSpectrum.TotalExpense != 0 ||
-			almanacResp.Data.FinancialSpectrum.Balance != 0 {
-			t.Fatalf("BE-14 年鉴访客模式 FinancialSpectrum 泄露金额: %+v", almanacResp.Data.FinancialSpectrum)
+		if almanacResp.Data.Finances.TotalIncome != 0 ||
+			almanacResp.Data.Finances.TotalExpense != 0 ||
+			almanacResp.Data.Finances.Balance != 0 {
+			t.Fatalf("BE-14 年鉴访客模式 Finances 泄露金额: %+v", almanacResp.Data.Finances)
 		}
 
 		// 管理员视角
@@ -357,20 +357,20 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 				Prologue struct {
 					TxCount int `json:"tx_count"`
 				} `json:"prologue"`
-				FinancialSpectrum struct {
+				Finances struct {
 					TotalIncome  int64 `json:"total_income"`
 					TotalExpense int64 `json:"total_expense"`
 					Balance      int64 `json:"balance"`
-				} `json:"financial_spectrum"`
+				} `json:"finances"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(wAdmin.Body.Bytes(), &adminAlmanacResp)
 		if adminAlmanacResp.Data.Prologue.TxCount == 0 {
 			t.Fatalf("BE-14 管理员年鉴 tx_count 应大于 0")
 		}
-		if adminAlmanacResp.Data.FinancialSpectrum.TotalIncome != 80000 ||
-			adminAlmanacResp.Data.FinancialSpectrum.TotalExpense != 12800 {
-			t.Fatalf("BE-14 管理员年鉴财务金额不正确: %+v", adminAlmanacResp.Data.FinancialSpectrum)
+		if adminAlmanacResp.Data.Finances.TotalIncome != 80000 ||
+			adminAlmanacResp.Data.Finances.TotalExpense != 12800 {
+			t.Fatalf("BE-14 管理员年鉴财务金额不正确: %+v", adminAlmanacResp.Data.Finances)
 		}
 	})
 }
@@ -587,10 +587,10 @@ func TestBE17_ETagRoleCacheIsolation(t *testing.T) {
 		Data map[string]interface{} `json:"data"`
 	}
 	_ = json.Unmarshal(wAdminAlm.Body.Bytes(), &almBody)
-	// 验证 RG-17 双键兼容存在
-	for _, key := range []string{"atlas", "atlas_journey", "wishes", "wishes_milestones", "highlights", "life_highlights", "finances", "financial_spectrum"} {
+	// 验证年鉴统一规范字段
+	for _, key := range []string{"atlas", "wishes", "highlights", "finances"} {
 		if _, exists := almBody.Data[key]; !exists {
-			t.Fatalf("RG-17 年鉴响应缺失兼容字段: %s", key)
+			t.Fatalf("年鉴响应缺失字段: %s", key)
 		}
 	}
 }

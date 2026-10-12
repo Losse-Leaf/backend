@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"loose-leaf/internal/db"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	qrcode "github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -140,9 +142,44 @@ type ConfirmPairingRequest struct {
 	DeviceModel string `json:"device_model"`
 }
 
+type ipAttemptTracker struct {
+	sync.Mutex
+	attempts map[string][]time.Time
+}
+
+var pairLimiter = &ipAttemptTracker{
+	attempts: make(map[string][]time.Time),
+}
+
+func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window time.Duration) bool {
+	l.Lock()
+	defer l.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-window)
+	times := l.attempts[ip]
+	valid := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= maxAttempts {
+		l.attempts[ip] = valid
+		return false
+	}
+	valid = append(valid, now)
+	l.attempts[ip] = valid
+	return true
+}
+
 // ConfirmPairing 新设备提交 Ticket 或 PIN 码完成握手，获取永久 Device Token；
 // 若当前系统尚未初始化 (initialized == false)，在同一事务中将 initialized 置为 true (BE-19)
 func ConfirmPairing(c *gin.Context) {
+	if !pairLimiter.checkRateLimit(c.ClientIP(), 30, time.Minute) {
+		Error(c, http.StatusTooManyRequests, "配对请求过于频繁，请稍后再试")
+		return
+	}
+
 	var req ConfirmPairingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数不合法")
@@ -159,16 +196,59 @@ func ConfirmPairing(c *gin.Context) {
 
 	now := time.Now()
 	var ticket models.PairTicket
-	query := db.DB.Where("used = ? AND expires_at > ?", false, now)
-	if ticketVal != "" {
-		query = query.Where("ticket = ?", ticketVal)
-	} else {
-		query = query.Where("pin_code = ?", pinVal)
-	}
 
-	if err := query.First(&ticket).Error; err != nil {
-		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
-		return
+	if ticketVal != "" {
+		if err := db.DB.Where("ticket = ?", ticketVal).First(&ticket).Error; err != nil {
+			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+			return
+		}
+		if ticket.Used || now.After(ticket.ExpiresAt) {
+			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+			return
+		}
+		if ticket.FailedAttempts >= 5 {
+			Error(c, http.StatusBadRequest, "配对工单尝试次数过多已作废，请重新发起配对")
+			return
+		}
+		if pinVal != "" && subtle.ConstantTimeCompare([]byte(ticket.PinCode), []byte(pinVal)) != 1 {
+			ticket.FailedAttempts++
+			if ticket.FailedAttempts >= 5 {
+				ticket.Used = true
+			}
+			db.DB.Save(&ticket)
+			Error(c, http.StatusBadRequest, "配对 PIN 码错误")
+			return
+		}
+	} else {
+		// 纯 PIN 握手防爆破 (最多 5 次错误尝试后作废)
+		var activeTickets []models.PairTicket
+		db.DB.Where("used = ? AND expires_at > ? AND failed_attempts < 5", false, now).Find(&activeTickets)
+		if len(activeTickets) == 0 {
+			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+			return
+		}
+
+		var matchedTicket *models.PairTicket
+		for i := range activeTickets {
+			if subtle.ConstantTimeCompare([]byte(activeTickets[i].PinCode), []byte(pinVal)) == 1 {
+				matchedTicket = &activeTickets[i]
+				break
+			}
+		}
+
+		if matchedTicket == nil {
+			for i := range activeTickets {
+				activeTickets[i].FailedAttempts++
+				if activeTickets[i].FailedAttempts >= 5 {
+					activeTickets[i].Used = true
+				}
+				db.DB.Save(&activeTickets[i])
+			}
+			Error(c, http.StatusBadRequest, "配对 PIN 码错误或工单无效")
+			return
+		}
+
+		ticket = *matchedTicket
 	}
 
 	platform := strings.ToLower(strings.TrimSpace(req.Platform))
@@ -384,8 +464,32 @@ type VerifyPasscodeRequest struct {
 	DeviceName string `json:"device_name"`
 }
 
-// VerifyPasscode 校验 SQLite site_configs.master_passcode 的 SHA-256 哈希，签发独立 Web 设备凭证 (BE-18)
+// HashPasscode 使用 bcrypt 进行加盐慢哈希加密 (杜绝彩虹表与硬件离线爆破)
+func HashPasscode(passcode string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(passcode), bcrypt.DefaultCost)
+	return string(bytes), err
+}
+
+// CheckPasscode 校验密码：优先匹配 bcrypt，并向下兼容旧有裸 SHA-256 哈希
+func CheckPasscode(passcode, hashed string) bool {
+	if strings.HasPrefix(hashed, "$2a$") || strings.HasPrefix(hashed, "$2b$") {
+		return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(passcode)) == nil
+	}
+	inputHash := HashToken(passcode)
+	return subtle.ConstantTimeCompare([]byte(inputHash), []byte(hashed)) == 1
+}
+
+var verifyPasscodeLimiter = &ipAttemptTracker{
+	attempts: make(map[string][]time.Time),
+}
+
+// VerifyPasscode 校验 site_configs.master_passcode 的哈希（bcrypt / SHA-256），限速防爆破并签发 Web 设备凭据 (BE-18)
 func VerifyPasscode(c *gin.Context) {
+	if !verifyPasscodeLimiter.checkRateLimit(c.ClientIP(), 5, time.Minute) {
+		Error(c, http.StatusTooManyRequests, "密码尝试过于频繁，请稍后再试")
+		return
+	}
+
 	var req VerifyPasscodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请输入管理员密钥")
@@ -404,10 +508,17 @@ func VerifyPasscode(c *gin.Context) {
 		return
 	}
 
-	inputHash := HashToken(inputPasscode)
-	if subtle.ConstantTimeCompare([]byte(inputHash), []byte(cfg.MasterPasscode)) != 1 {
+	if !CheckPasscode(inputPasscode, cfg.MasterPasscode) {
 		Error(c, http.StatusUnauthorized, "管理员密钥不正确，请重新输入")
 		return
+	}
+
+	// 渐进式平滑升级：旧有 SHA-256 密码在首次验证成功后自动升级为 bcrypt 加盐慢哈希
+	if !strings.HasPrefix(cfg.MasterPasscode, "$2a$") && !strings.HasPrefix(cfg.MasterPasscode, "$2b$") {
+		if newBcryptHash, err := HashPasscode(inputPasscode); err == nil {
+			cfg.MasterPasscode = newBcryptHash
+			db.DB.Model(&cfg).Update("master_passcode", newBcryptHash)
+		}
 	}
 
 	now := time.Now()

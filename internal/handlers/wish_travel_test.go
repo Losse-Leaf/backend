@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/models"
 )
 
 func TestWishAndTravelModules(t *testing.T) {
@@ -206,6 +208,7 @@ func TestWishAndTravelModules(t *testing.T) {
 	t.Run("Record-First Companion Creation and Natural Infiltration", func(t *testing.T) {
 		r.POST("/api/v1/entries", CreateLifeEntry)
 		r.PUT("/api/v1/entries/:id", UpdateLifeEntry)
+		r.DELETE("/api/v1/entries/:id", DeleteLifeEntry)
 		r.GET("/api/v1/entries", GetLifeEntriesV1)
 		r.POST("/api/v1/projects", CreateProject)
 		r.PUT("/api/v1/projects/:id", UpdateProject)
@@ -322,6 +325,100 @@ func TestWishAndTravelModules(t *testing.T) {
 		_ = json.Unmarshal(wJdzDrawer.Body.Bytes(), &jdzDrawerResp)
 		if jdzDrawerResp.Data.CityName != "景德镇市" || jdzDrawerResp.Data.VisitStats.TotalVisits < 1 {
 			t.Fatalf("expected natural infiltration to light up 景德镇市 (360200), got %+v", jdzDrawerResp.Data)
+		}
+	})
+
+	t.Run("4. Bi-directional soft delete synchronization between Entry and Footprint", func(t *testing.T) {
+		// Direction 1: Soft delete Entry -> Infiltrated Footprint is soft deleted
+		entryPayload := map[string]interface{}{
+			"type":        "life",
+			"title":       "姑苏游记",
+			"content":     "游览平江路与拙政园",
+			"city_code":   "320500",
+			"city_name":   "苏州市",
+			"occurred_at": "2026-05-01 10:00:00",
+		}
+		entryBody, _ := json.Marshal(entryPayload)
+		wEntry := httptest.NewRecorder()
+		reqEntry, _ := http.NewRequest(http.MethodPost, "/api/v1/entries", bytes.NewBuffer(entryBody))
+		reqEntry.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wEntry, reqEntry)
+		if wEntry.Code != http.StatusOK {
+			t.Fatalf("failed to create entry: %d", wEntry.Code)
+		}
+		var createdEntry struct {
+			Data struct {
+				ID uint `json:"id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wEntry.Body.Bytes(), &createdEntry)
+
+		// 检查下渗足迹存在
+		var fp苏州 models.Footprint
+		if err := db.DB.Where("life_entry_id = ?", createdEntry.Data.ID).First(&fp苏州).Error; err != nil {
+			t.Fatalf("expected infiltrated footprint for Suzhou, got error: %v", err)
+		}
+
+		// 软删 Entry
+		wDelEntry := httptest.NewRecorder()
+		reqDelEntry, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("/api/v1/entries/%d", createdEntry.Data.ID), nil)
+		r.ServeHTTP(wDelEntry, reqDelEntry)
+		if wDelEntry.Code != http.StatusOK {
+			t.Fatalf("failed to delete entry: %d", wDelEntry.Code)
+		}
+
+		// 验证下渗足迹也被软删
+		var checkFP models.Footprint
+		if err := db.DB.Where("id = ?", fp苏州.ID).First(&checkFP).Error; err == nil {
+			t.Fatalf("expected infiltrated footprint to be soft-deleted, but it was found")
+		}
+		var unscopedFP models.Footprint
+		if err := db.DB.Unscoped().Where("id = ?", fp苏州.ID).First(&unscopedFP).Error; err != nil || unscopedFP.DeletedAt.Valid == false {
+			t.Fatalf("expected footprint to exist in unscoped with deleted_at set")
+		}
+
+		// Direction 2: Soft delete Footprint -> Companion Entry is soft deleted
+		fpPayload := CreateFootprintRequest{
+			CityCode:  "420100",
+			CityName:  "武汉市",
+			VisitedAt: "2026-06-01 12:00:00",
+			Note:      "黄鹤楼远眺长江",
+		}
+		fpBody, _ := json.Marshal(fpPayload)
+		wFP := httptest.NewRecorder()
+		reqFP, _ := http.NewRequest(http.MethodPost, "/api/v1/footprints", bytes.NewBuffer(fpBody))
+		reqFP.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(wFP, reqFP)
+		if wFP.Code != http.StatusOK {
+			t.Fatalf("failed to create footprint: %d", wFP.Code)
+		}
+		var createdFP struct {
+			Data struct {
+				ID          uint  `json:"id"`
+				LifeEntryID *uint `json:"life_entry_id"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(wFP.Body.Bytes(), &createdFP)
+		if createdFP.Data.LifeEntryID == nil {
+			t.Fatalf("expected companion life_entry_id")
+		}
+
+		// 软删 Footprint
+		wDelFP := httptest.NewRecorder()
+		reqDelFP, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("/api/v1/footprints/%d", createdFP.Data.ID), nil)
+		r.ServeHTTP(wDelFP, reqDelFP)
+		if wDelFP.Code != http.StatusOK {
+			t.Fatalf("failed to delete footprint: %d", wDelFP.Code)
+		}
+
+		// 验证伴生 Entry 也被软删
+		var checkEntry models.LifeEntry
+		if err := db.DB.Where("id = ?", *createdFP.Data.LifeEntryID).First(&checkEntry).Error; err == nil {
+			t.Fatalf("expected companion entry to be soft-deleted, but it was found")
+		}
+		var unscopedEntry models.LifeEntry
+		if err := db.DB.Unscoped().Where("id = ?", *createdFP.Data.LifeEntryID).First(&unscopedEntry).Error; err != nil || unscopedEntry.DeletedAt.Valid == false {
+			t.Fatalf("expected companion entry to exist in unscoped with deleted_at set")
 		}
 	})
 }

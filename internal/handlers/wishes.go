@@ -289,50 +289,57 @@ func UpdateWish(c *gin.Context) {
 		wish.FulfilledAt = &now
 	}
 
-	// 若通过直接更新状态标记心愿达成，自动伴生创建一条对应的一级记录 (Record-First Architecture)
-	if wish.Status == "fulfilled" && wish.LifeEntryID == nil {
-		entryType := "collection"
-		if wish.Kind == "travel" {
-			entryType = "life"
-		}
-		fulfilledTime := time.Now()
-		if wish.FulfilledAt != nil {
-			fulfilledTime = *wish.FulfilledAt
-		}
-		entryContent := strings.TrimSpace(wish.Note)
-		if entryContent == "" {
-			entryContent = fmt.Sprintf("圆满达成心愿「%s」", wish.Title)
-		}
-		companionEntry := models.LifeEntry{
-			Type:       entryType,
-			Title:      "心愿达成 · " + wish.Title,
-			Content:    entryContent,
-			OccurredAt: fulfilledTime,
-			Location:   wish.CityName,
-			CityCode:   wish.CityCode,
-			CityName:   wish.CityName,
-		}
-		if err := db.DB.Create(&companionEntry).Error; err == nil && companionEntry.ID > 0 {
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 若通过直接更新状态标记心愿达成，自动伴生创建一条对应的一级记录 (Record-First Architecture，纳入同一事务)
+		if wish.Status == "fulfilled" && wish.LifeEntryID == nil {
+			entryType := "collection"
+			if wish.Kind == "travel" {
+				entryType = "life"
+			}
+			fulfilledTime := time.Now()
+			if wish.FulfilledAt != nil {
+				fulfilledTime = *wish.FulfilledAt
+			}
+			entryContent := strings.TrimSpace(wish.Note)
+			if entryContent == "" {
+				entryContent = fmt.Sprintf("圆满达成心愿「%s」", wish.Title)
+			}
+			companionEntry := models.LifeEntry{
+				Type:       entryType,
+				Title:      "心愿达成 · " + wish.Title,
+				Content:    entryContent,
+				OccurredAt: fulfilledTime,
+				Location:   wish.CityName,
+				CityCode:   wish.CityCode,
+				CityName:   wish.CityName,
+			}
+			if err := tx.Create(&companionEntry).Error; err != nil {
+				return err
+			}
 			wish.LifeEntryID = &companionEntry.ID
-			syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs)
+			syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs, tx)
 		}
-	}
 
-	if err := db.DB.Save(&wish).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新心愿失败")
+		if err := tx.Save(&wish).Error; err != nil {
+			return err
+		}
+
+		if req.AttachmentIDs != nil {
+			tx.Model(&models.Attachment{}).
+				Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
+				Update("wish_id", nil)
+
+			if len(req.AttachmentIDs) > 0 {
+				tx.Model(&models.Attachment{}).
+					Where("id IN ?", req.AttachmentIDs).
+					Update("wish_id", wish.ID)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "更新心愿事务执行失败: "+err.Error())
 		return
-	}
-
-	if req.AttachmentIDs != nil {
-		db.DB.Model(&models.Attachment{}).
-			Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
-			Update("wish_id", nil)
-
-		if len(req.AttachmentIDs) > 0 {
-			db.DB.Model(&models.Attachment{}).
-				Where("id IN ?", req.AttachmentIDs).
-				Update("wish_id", wish.ID)
-		}
 	}
 
 	db.DB.First(&wish, wish.ID)
@@ -447,30 +454,18 @@ func ResolveWish(c *gin.Context) {
 			}
 
 			if req.IsInstallment {
-				newTx.IsInstallment = true
-				newTx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
-				if newTx.InstallmentChannelCode == "" {
-					newTx.InstallmentChannelCode = "huabei"
-				}
-				newTx.InstallmentTotalAmount = req.ActualCost
-				months := req.InstallmentMonths
-				if months <= 0 {
-					months = 12
-				}
-				newTx.InstallmentMonths = months
-				newTx.InstallmentMonthlyPay = req.ActualCost / int64(months)
-				newTx.InstallmentRemainMonths = months
-
-				rDay := req.RepaymentDay
-				if rDay <= 0 {
-					var ch models.CreditChannel
-					if err := tx.Where("code = ?", newTx.InstallmentChannelCode).First(&ch).Error; err == nil {
-						rDay = ch.RepaymentDay
-					} else {
-						rDay = 10
-					}
-				}
-				newTx.RepaymentDay = rDay
+				AssembleInstallmentTransaction(
+					&newTx,
+					req.IsInstallment,
+					req.InstallmentChannelCode,
+					req.ActualCost,
+					req.ActualCost,
+					req.InstallmentMonths,
+					0,
+					req.InstallmentMonths,
+					req.RepaymentDay,
+					tx,
+				)
 			}
 
 			if err := tx.Create(&newTx).Error; err != nil {
@@ -485,7 +480,7 @@ func ResolveWish(c *gin.Context) {
 			if gearName == "" {
 				gearName = wish.Title
 			}
-			gearID := fmt.Sprintf("gear_%d", time.Now().UnixNano())
+			gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
 			wish.GearID = &gearID
 
 			var profile models.CuratorProfile
@@ -505,7 +500,9 @@ func ResolveWish(c *gin.Context) {
 				bytes, _ := json.Marshal(list)
 				profile.EDCGear = string(bytes)
 				profile.UpdatedAt = time.Now()
-				_ = tx.Save(&profile).Error
+				if err := tx.Save(&profile).Error; err != nil {
+					return err
+				}
 			}
 		}
 
@@ -540,8 +537,8 @@ func ResolveWish(c *gin.Context) {
 			}
 		}
 
-		// 联动 4: 足迹打卡 (travel 专属)
-		if (req.CreateFootprint || req.CreateLifeEntry) && wish.Kind == "travel" && wish.CityCode != "" {
+		// 联动 4: 足迹打卡 (travel 专属，仅当用户明确勾选 CreateFootprint 时生成)
+		if req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "" {
 			cityName := wish.CityName
 			if cityName == "" {
 				cityName = "旅行目的地"

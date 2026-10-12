@@ -10,7 +10,70 @@ import (
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
+
+// AssembleInstallmentTransaction 组装分期账单核心字段 (渠道默认 huabei、期数默认 12、还款日查渠道/默认 10)
+func AssembleInstallmentTransaction(
+	tx *models.Transaction,
+	isInstallment bool,
+	channelCode string,
+	totalAmount int64,
+	fallbackTotal int64,
+	months int,
+	monthlyPay int64,
+	remainMonths int,
+	repaymentDay int,
+	dbTx *gorm.DB,
+) {
+	if !isInstallment || tx == nil {
+		return
+	}
+	if dbTx == nil {
+		dbTx = db.DB
+	}
+
+	tx.IsInstallment = true
+	chCode := strings.TrimSpace(channelCode)
+	if chCode == "" {
+		chCode = "huabei"
+	}
+	tx.InstallmentChannelCode = chCode
+
+	total := totalAmount
+	if total <= 0 {
+		total = fallbackTotal
+	}
+	tx.InstallmentTotalAmount = total
+
+	if months <= 0 {
+		months = 12
+	}
+	tx.InstallmentMonths = months
+
+	mPay := monthlyPay
+	if mPay <= 0 && months > 0 {
+		mPay = total / int64(months)
+	}
+	tx.InstallmentMonthlyPay = mPay
+
+	rMonths := remainMonths
+	if rMonths <= 0 {
+		rMonths = months
+	}
+	tx.InstallmentRemainMonths = rMonths
+
+	rDay := repaymentDay
+	if rDay <= 0 {
+		var ch models.CreditChannel
+		if err := dbTx.Where("code = ?", chCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
+			rDay = ch.RepaymentDay
+		} else {
+			rDay = 10
+		}
+	}
+	tx.RepaymentDay = rDay
+}
 
 // CreditChannelRequest 信贷渠道新增与修改入参 (RC-53)
 type CreditChannelRequest struct {
@@ -111,9 +174,12 @@ func UpdateCreditChannel(c *gin.Context) {
 		ch.Color = strings.TrimSpace(req.Color)
 	}
 
+	oldCode := ch.Code
+	codeChanged := false
+	newCode := ""
 	// 如果是非内置渠道，允许更新 code（若传入且不重复）
 	if !ch.IsBuiltin && strings.TrimSpace(req.Code) != "" && strings.TrimSpace(req.Code) != ch.Code {
-		newCode := strings.TrimSpace(req.Code)
+		newCode = strings.TrimSpace(req.Code)
 		var count int64
 		db.DB.Model(&models.CreditChannel{}).Where("code = ? AND id != ?", newCode, ch.ID).Count(&count)
 		if count > 0 {
@@ -121,9 +187,24 @@ func UpdateCreditChannel(c *gin.Context) {
 			return
 		}
 		ch.Code = newCode
+		codeChanged = true
 	}
 
-	if err := db.DB.Save(&ch).Error; err != nil {
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&ch).Error; err != nil {
+			return err
+		}
+		if codeChanged {
+			// 同步迁移既有分期账目的渠道归属，杜绝旧 Transaction 渠道归属断裂
+			if err := tx.Model(&models.Transaction{}).
+				Where("installment_channel_code = ?", oldCode).
+				Update("installment_channel_code", newCode).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "更新信贷渠道失败: "+err.Error())
 		return
 	}

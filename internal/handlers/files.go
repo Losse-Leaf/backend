@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	_ "golang.org/x/image/webp"
+
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -130,19 +132,14 @@ func UnifiedUploadFile(c *gin.Context) {
 	})
 }
 
-// isRegisteredObjectKey 检查 objectKey 是否属于数据库中已登记的合法附件或主理人媒体 (BE-21)
+// isRegisteredObjectKey 检查 objectKey 是否属于数据库中已登记的合法生效附件或主理人媒体 (BE-21)
+// 访客权限收敛：仅放行已绑定至存活 (未软删) 的 LifeEntry, Wish 或 Footprint 的附件，以及主理人头像
 func isRegisteredObjectKey(cleanKey string) bool {
 	if cleanKey == "" || db.DB == nil {
 		return false
 	}
 
-	// 1. 检查 attachments 附件表
-	var count int64
-	if err := db.DB.Model(&models.Attachment{}).Where("object_key = ?", cleanKey).Count(&count).Error; err == nil && count > 0 {
-		return true
-	}
-
-	// 2. 检查主理人头像 (包含默认 avatar/user.png 与自定义头像相对路径)
+	// 1. 检查主理人头像 (包含默认 avatar/user.png 与自定义头像相对路径)
 	if cleanKey == "avatar/user.png" {
 		return true
 	}
@@ -150,6 +147,31 @@ func isRegisteredObjectKey(cleanKey string) bool {
 	if err := db.DB.Select("avatar_url").First(&profile).Error; err == nil && profile.AvatarURL != "" {
 		if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || profile.AvatarURL == cleanKey {
 			return true
+		}
+	}
+
+	// 2. 检查 attachments 附件表：必须绑定在有效、未软删除的实体上
+	var atts []models.Attachment
+	if err := db.DB.Where("object_key = ?", cleanKey).Find(&atts).Error; err == nil && len(atts) > 0 {
+		for _, att := range atts {
+			if att.EntryID != nil && *att.EntryID > 0 {
+				var count int64
+				if err := db.DB.Model(&models.LifeEntry{}).Where("id = ?", *att.EntryID).Count(&count).Error; err == nil && count > 0 {
+					return true
+				}
+			}
+			if att.WishID != nil && *att.WishID > 0 {
+				var count int64
+				if err := db.DB.Model(&models.Wish{}).Where("id = ?", *att.WishID).Count(&count).Error; err == nil && count > 0 {
+					return true
+				}
+			}
+			if att.FootprintID != nil && *att.FootprintID > 0 {
+				var count int64
+				if err := db.DB.Model(&models.Footprint{}).Where("id = ?", *att.FootprintID).Count(&count).Error; err == nil && count > 0 {
+					return true
+				}
+			}
 		}
 	}
 

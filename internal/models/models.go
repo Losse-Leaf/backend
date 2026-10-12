@@ -175,6 +175,7 @@ type PairTicket struct {
 	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
 	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
 	WebToken       string     `gorm:"size:128" json:"-"`                         // 首次装帧伴生 Web 设备 Token (单次读取 BE-19)
+	FailedAttempts int        `gorm:"default:0" json:"failed_attempts"`          // 握手失败计数
 	ExpiresAt      time.Time  `gorm:"index;not null" json:"expires_at"`
 	Used           bool       `gorm:"index;default:false" json:"used"`
 	UsedAt         *time.Time `json:"used_at,omitempty"`

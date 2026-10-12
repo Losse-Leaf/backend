@@ -99,8 +99,11 @@ func TestFilesHandler(t *testing.T) {
 	})
 
 	t.Run("Batch sign files", func(t *testing.T) {
-		// 注册一条合法的附件记录 (BE-21)
+		// 注册一条合法的生效附件记录 (绑定至未删除的 Entry) (BE-21)
+		var testEntry models.LifeEntry
+		db.DB.FirstOrCreate(&testEntry, models.LifeEntry{Title: "Test Live Entry"})
 		db.DB.Create(&models.Attachment{
+			EntryID:          &testEntry.ID,
 			ObjectKey:        "entries/2026/10/09/sample.jpg",
 			OriginalFilename: "sample.jpg",
 			MimeType:         "image/jpeg",
@@ -171,6 +174,36 @@ func TestFilesHandler(t *testing.T) {
 
 		if adminW.Code != http.StatusOK {
 			t.Fatalf("expected 200 for authenticated admin signing, got %d: %s", adminW.Code, adminW.Body.String())
+		}
+
+		// 4. 已解绑附件 (entry_id/wish_id/footprint_id 均为 nil) 访客禁止签名 (403)
+		unboundKey := "entries/2026/10/09/unbound_photo.jpg"
+		db.DB.Create(&models.Attachment{
+			ObjectKey: unboundKey,
+		})
+		unboundReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unboundKey, nil)
+		unboundW := httptest.NewRecorder()
+		r.ServeHTTP(unboundW, unboundReq)
+		if unboundW.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for unbound attachment, got %d", unboundW.Code)
+		}
+
+		// 5. 软删除实体的关联附件，访客禁止签名 (403)
+		deletedEntry := models.LifeEntry{Title: "Deleted Entry"}
+		db.DB.Create(&deletedEntry)
+		softDelKey := "entries/2026/10/09/soft_deleted_parent.jpg"
+		db.DB.Create(&models.Attachment{
+			EntryID:   &deletedEntry.ID,
+			ObjectKey: softDelKey,
+		})
+		// 软删除该 Entry
+		db.DB.Delete(&deletedEntry)
+
+		softDelReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+softDelKey, nil)
+		softDelW := httptest.NewRecorder()
+		r.ServeHTTP(softDelW, softDelReq)
+		if softDelW.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for attachment of soft-deleted entry, got %d", softDelW.Code)
 		}
 	})
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,6 +48,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
+	handlers.EnsureEntryFootprintsSynced()
 
 	// 3. 生产模式或开发模式
 	if os.Getenv("GIN_MODE") == "release" {
@@ -61,9 +63,13 @@ func main() {
 		r = gin.Default()
 	}
 
-	// 4. CORS 跨域配置
+	// 4. CORS 跨域配置 (支持环境变量 CORS_ALLOWED_ORIGINS 精确限制来源)
 	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowAllOrigins = true
+	if allowedOrigins := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS")); allowedOrigins != "" {
+		corsConfig.AllowOrigins = strings.Split(allowedOrigins, ",")
+	} else {
+		corsConfig.AllowAllOrigins = true
+	}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization", "X-Admin-Key", "X-Device-Token"}
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	r.Use(cors.New(corsConfig))
@@ -204,8 +210,8 @@ func main() {
 		Addr:              ":" + port,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       120 * time.Second, // 支持 50MB 媒体文件在有限带宽下的平稳上传
+		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

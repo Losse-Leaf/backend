@@ -16,6 +16,7 @@ import (
 	"loose-leaf/internal/storage"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 var startTime = time.Now()
@@ -463,34 +464,47 @@ func DeleteLifeEntry(c *gin.Context) {
 	}
 
 	if purge {
-		// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）
-		var atts []models.Attachment
-		db.DB.Where("entry_id = ?", entry.ID).Find(&atts)
-		for _, att := range atts {
-			if att.WishID == nil && att.FootprintID == nil {
-				if att.ObjectKey != "" {
-					_ = storage.DeleteObject(att.ObjectKey)
+		err := db.DB.Transaction(func(tx *gorm.DB) error {
+			// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）
+			var atts []models.Attachment
+			tx.Where("entry_id = ?", entry.ID).Find(&atts)
+			for _, att := range atts {
+				if att.WishID == nil && att.FootprintID == nil {
+					if att.ObjectKey != "" {
+						_ = storage.DeleteObject(att.ObjectKey)
+					}
+					tx.Unscoped().Delete(&att)
+				} else {
+					tx.Model(&att).Update("entry_id", nil)
 				}
-				db.DB.Unscoped().Delete(&att)
-			} else {
-				db.DB.Model(&att).Update("entry_id", nil)
 			}
-		}
-		db.DB.Model(&models.Footprint{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
-		db.DB.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
-		if err := db.DB.Unscoped().Delete(&entry).Error; err != nil {
+			if err := tx.Unscoped().Where("life_entry_id = ?", entry.ID).Delete(&models.Footprint{}).Error; err != nil {
+				return err
+			}
+			tx.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
+			return tx.Unscoped().Delete(&entry).Error
+		})
+		if err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
+		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
 
-	// 软删除落库，支持多端增量同步感知与离线仲裁 (BE-05)
-	if err := db.DB.Delete(&entry).Error; err != nil {
+	// 软删除落库，支持多端增量同步感知与离线仲裁，并同步软删除下渗足迹 (BE-05)
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&entry).Error; err != nil {
+			return err
+		}
+		return tx.Where("life_entry_id = ?", entry.ID).Delete(&models.Footprint{}).Error
+	})
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	InvalidateStatsCache()
 
 	Success(c, gin.H{"id": id, "deleted": true})
 }
@@ -513,10 +527,10 @@ func PresignUpload(c *gin.Context) {
 		return
 	}
 
-	// 大小限制：单文件最大 20MB
-	maxSize := int64(20 * 1024 * 1024)
+	// 大小限制：单文件最大 50MB (与直传接口保持一致)
+	maxSize := int64(50 * 1024 * 1024)
 	if req.Size > maxSize {
-		Error(c, http.StatusBadRequest, "文件过大，单张图片不能超过 20MB")
+		Error(c, http.StatusBadRequest, "文件过大，单文件上传限制 50MB")
 		return
 	}
 
@@ -557,6 +571,15 @@ func CompleteUpload(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "缺少 object_key")
 		return
+	}
+
+	// 消费并校验 upload_id 与目标资源路径特征，杜绝凭据越权
+	cleanUploadID := strings.TrimSpace(req.UploadID)
+	if cleanUploadID != "" && len(cleanUploadID) >= 8 {
+		if !strings.Contains(req.ObjectKey, cleanUploadID[:8]) {
+			Error(c, http.StatusBadRequest, "上传凭证 upload_id 与目标资源路径不匹配")
+			return
+		}
 	}
 
 	// 如果 R2 已配置，验证对象确实存在于存储桶中
@@ -620,9 +643,17 @@ func CleanupUpload(c *gin.Context) {
 	Success(c, gin.H{"cleaned_count": cleaned})
 }
 
-// GetStorageStatus 获取 R2 配置状态
+// GetStorageStatus 获取 R2 配置状态 (非管理员脱敏敏感桶名与节点)
 func GetStorageStatus(c *gin.Context) {
-	Success(c, storage.GetStorageStatus())
+	status := storage.GetStorageStatus()
+	if !middleware.IsAdmin(c) {
+		Success(c, gin.H{
+			"provider":   status["provider"],
+			"configured": status["configured"],
+		})
+		return
+	}
+	Success(c, status)
 }
 
 // ==========================================
@@ -676,42 +707,18 @@ func CreateTransaction(c *gin.Context) {
 	}
 
 	if req.IsInstallment {
-		tx.IsInstallment = true
-		tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
-		if tx.InstallmentChannelCode == "" {
-			tx.InstallmentChannelCode = "huabei"
-		}
-		total := req.InstallmentTotalAmount
-		if total <= 0 {
-			total = req.Amount
-		}
-		tx.InstallmentTotalAmount = total
-		months := req.InstallmentMonths
-		if months <= 0 {
-			months = 12
-		}
-		tx.InstallmentMonths = months
-		monthlyPay := req.InstallmentMonthlyPay
-		if monthlyPay <= 0 {
-			monthlyPay = total / int64(months)
-		}
-		tx.InstallmentMonthlyPay = monthlyPay
-		remainMonths := req.InstallmentRemainMonths
-		if remainMonths <= 0 {
-			remainMonths = months
-		}
-		tx.InstallmentRemainMonths = remainMonths
-
-		rDay := req.RepaymentDay
-		if rDay <= 0 {
-			var ch models.CreditChannel
-			if err := db.DB.Where("code = ?", tx.InstallmentChannelCode).First(&ch).Error; err == nil {
-				rDay = ch.RepaymentDay
-			} else {
-				rDay = 10
-			}
-		}
-		tx.RepaymentDay = rDay
+		AssembleInstallmentTransaction(
+			&tx,
+			req.IsInstallment,
+			req.InstallmentChannelCode,
+			req.InstallmentTotalAmount,
+			req.Amount,
+			req.InstallmentMonths,
+			req.InstallmentMonthlyPay,
+			req.InstallmentRemainMonths,
+			req.RepaymentDay,
+			db.DB,
+		)
 	}
 
 	if err := db.DB.Create(&tx).Error; err != nil {
@@ -728,7 +735,7 @@ func CreateTransaction(c *gin.Context) {
 				gearCategory = tx.Category
 			}
 			newGear := models.GearItem{
-				ID:           fmt.Sprintf("gear_%d", time.Now().UnixNano()),
+				ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
 				Name:         tx.Title,
 				Spec:         strings.TrimSpace(req.GearSpec),
 				Category:     gearCategory,
@@ -739,7 +746,10 @@ func CreateTransaction(c *gin.Context) {
 			}
 			list := loadProfileGear(&profile)
 			list = append(list, newGear)
-			_ = saveProfileGear(&profile, list)
+			if err := saveProfileGear(&profile, list); err != nil {
+				Error(c, http.StatusInternalServerError, "记账成功但收录设备资产失败: "+err.Error())
+				return
+			}
 		}
 	}
 
@@ -755,7 +765,10 @@ func CreateTransaction(c *gin.Context) {
 				if wish.ActualCost == 0 {
 					wish.ActualCost = tx.Amount
 				}
-				_ = db.DB.Save(&wish).Error
+				if err := db.DB.Save(&wish).Error; err != nil {
+					Error(c, http.StatusInternalServerError, "记账成功但关联心愿状态更新失败: "+err.Error())
+					return
+				}
 			}
 		}
 	}

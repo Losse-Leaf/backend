@@ -145,17 +145,30 @@ func GetAssetsOverview(c *gin.Context) {
 		}
 	}
 
-	// 查询全部流水，核算流动可用余额与待还信贷 (纳入初始流动现金基准 BE-15)
-	var txs []models.Transaction
-	db.DB.Find(&txs)
-
 	var siteCfg models.SiteConfig
 	db.DB.Limit(1).Find(&siteCfg)
 	initialLiquid := siteCfg.InitialLiquidBalance
 
-	liquidBalance := initialLiquid
+	// 使用 SQL 聚合计算收入与非分期支出总额，杜绝全表 Transaction 加载进内存
+	var totalIncome int64
+	db.DB.Model(&models.Transaction{}).
+		Where("type = 'income'").
+		Select("COALESCE(SUM(amount), 0)").
+		Scan(&totalIncome)
+
+	var nonInstallmentExpense int64
+	db.DB.Model(&models.Transaction{}).
+		Where("type = 'expense' AND (is_installment = ? OR is_installment IS NULL)", false).
+		Select("COALESCE(SUM(amount), 0)").
+		Scan(&nonInstallmentExpense)
+
+	// 仅查询分期账目进行分期还款核算与信贷渠道聚合
+	var installmentTxs []models.Transaction
+	db.DB.Where("type = 'expense' AND is_installment = ?", true).Find(&installmentTxs)
+
 	var totalLiabilities int64
 	var monthlyLiabilities int64
+	var paidInstallmentTotal int64
 
 	// 加载所有信贷渠道配置
 	var channels []models.CreditChannel
@@ -180,59 +193,53 @@ func GetAssetsOverview(c *gin.Context) {
 		channelOrder = append(channelOrder, ch.Code)
 	}
 
-	for _, tx := range txs {
-		if tx.Type == "income" {
-			liquidBalance += tx.Amount
-		} else if tx.Type == "expense" {
-			if !tx.IsInstallment {
-				liquidBalance -= tx.Amount
-			} else {
-				// 分期付款：已付期数 = 总期数 - 剩余期数
-				paidMonths := tx.InstallmentMonths - tx.InstallmentRemainMonths
-				if paidMonths < 0 {
-					paidMonths = 0
-				}
-				paidAmount := int64(paidMonths) * tx.InstallmentMonthlyPay
-				liquidBalance -= paidAmount
+	for _, tx := range installmentTxs {
+		// 分期付款：已付期数 = 总期数 - 剩余期数
+		paidMonths := tx.InstallmentMonths - tx.InstallmentRemainMonths
+		if paidMonths < 0 {
+			paidMonths = 0
+		}
+		paidAmount := int64(paidMonths) * tx.InstallmentMonthlyPay
+		paidInstallmentTotal += paidAmount
 
-				// 剩余期数 > 0 计入待还负债
-				if tx.InstallmentRemainMonths > 0 {
-					debt := int64(tx.InstallmentRemainMonths) * tx.InstallmentMonthlyPay
-					totalLiabilities += debt
-					monthlyLiabilities += tx.InstallmentMonthlyPay
+		// 剩余期数 > 0 计入待还负债
+		if tx.InstallmentRemainMonths > 0 {
+			debt := int64(tx.InstallmentRemainMonths) * tx.InstallmentMonthlyPay
+			totalLiabilities += debt
+			monthlyLiabilities += tx.InstallmentMonthlyPay
 
-					chCode := tx.InstallmentChannelCode
-					if chCode == "" {
-						chCode = "huabei"
-					}
-					summary, exists := channelMap[chCode]
-					if !exists {
-						repaymentDay := tx.RepaymentDay
-						if repaymentDay <= 0 {
-							repaymentDay = 10
-						}
-						summary = &ChannelLiabilitySummary{
-							ChannelCode:        chCode,
-							ChannelName:        chCode,
-							RepaymentDay:       repaymentDay,
-							Color:              "var(--accent-warm)",
-							TotalDebt:          0,
-							MonthlyPay:         0,
-							DaysUntilRepayment: calculateDaysUntilRepayment(repaymentDay),
-							ActiveCount:        0,
-							Installments:       make([]models.Transaction, 0),
-						}
-						channelMap[chCode] = summary
-						channelOrder = append(channelOrder, chCode)
-					}
-					summary.TotalDebt += debt
-					summary.MonthlyPay += tx.InstallmentMonthlyPay
-					summary.ActiveCount++
-					summary.Installments = append(summary.Installments, tx)
-				}
+			chCode := tx.InstallmentChannelCode
+			if chCode == "" {
+				chCode = "huabei"
 			}
+			summary, exists := channelMap[chCode]
+			if !exists {
+				repaymentDay := tx.RepaymentDay
+				if repaymentDay <= 0 {
+					repaymentDay = 10
+				}
+				summary = &ChannelLiabilitySummary{
+					ChannelCode:        chCode,
+					ChannelName:        chCode,
+					RepaymentDay:       repaymentDay,
+					Color:              "var(--accent-warm)",
+					TotalDebt:          0,
+					MonthlyPay:         0,
+					DaysUntilRepayment: calculateDaysUntilRepayment(repaymentDay),
+					ActiveCount:        0,
+					Installments:       make([]models.Transaction, 0),
+				}
+				channelMap[chCode] = summary
+				channelOrder = append(channelOrder, chCode)
+			}
+			summary.TotalDebt += debt
+			summary.MonthlyPay += tx.InstallmentMonthlyPay
+			summary.ActiveCount++
+			summary.Installments = append(summary.Installments, tx)
 		}
 	}
+
+	liquidBalance := initialLiquid + totalIncome - nonInstallmentExpense - paidInstallmentTotal
 
 	var channelLiabilities []ChannelLiabilitySummary
 	for _, code := range channelOrder {
@@ -334,7 +341,7 @@ func AddGearAsset(c *gin.Context) {
 		purchaseDate = time.Now().Format("2006-01-02")
 	}
 
-	gearID := fmt.Sprintf("gear_%d", time.Now().UnixNano())
+	gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
 	newGear := models.GearItem{
 		ID:           gearID,
 		Name:         strings.TrimSpace(req.Name),
@@ -375,36 +382,24 @@ func AddGearAsset(c *gin.Context) {
 		}
 
 		if req.IsInstallment {
-			tx.IsInstallment = true
-			tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
-			if tx.InstallmentChannelCode == "" {
-				tx.InstallmentChannelCode = "huabei"
-			}
-			tot := req.InstallmentTotalAmount
-			if tot <= 0 {
-				tot = req.PriceCents
-			}
-			tx.InstallmentTotalAmount = tot
-			months := req.InstallmentMonths
-			if months <= 0 {
-				months = 12
-			}
-			tx.InstallmentMonths = months
-			tx.InstallmentMonthlyPay = tot / int64(months)
-			tx.InstallmentRemainMonths = months
-			rDay := req.RepaymentDay
-			if rDay <= 0 {
-				var ch models.CreditChannel
-				if err := db.DB.Where("code = ?", tx.InstallmentChannelCode).First(&ch).Error; err == nil {
-					rDay = ch.RepaymentDay
-				} else {
-					rDay = 10
-				}
-			}
-			tx.RepaymentDay = rDay
+			AssembleInstallmentTransaction(
+				&tx,
+				req.IsInstallment,
+				req.InstallmentChannelCode,
+				req.InstallmentTotalAmount,
+				req.PriceCents,
+				req.InstallmentMonths,
+				0,
+				req.InstallmentMonths,
+				req.RepaymentDay,
+				db.DB,
+			)
 		}
 
-		_ = db.DB.Create(&tx)
+		if err := db.DB.Create(&tx).Error; err != nil {
+			Error(c, http.StatusInternalServerError, "设备已录入但同步生成购置账单失败: "+err.Error())
+			return
+		}
 	}
 
 	Success(c, newGear)
@@ -487,7 +482,10 @@ func SellGearAsset(c *gin.Context) {
 		PaymentMethod: "二手转让",
 		OccurredAt:    occurred,
 	}
-	_ = db.DB.Create(&incomeTx)
+	if err := db.DB.Create(&incomeTx).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "设备已转售但生成二手回血账单失败: "+err.Error())
+		return
+	}
 
 	Success(c, list[foundIdx])
 }

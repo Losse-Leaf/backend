@@ -146,6 +146,51 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("4b. Brute-force PIN protection invalidates ticket after 5 failed attempts", func(t *testing.T) {
+		ticket3 := models.PairTicket{
+			Ticket:    "pair_tk_bruteforce_test",
+			PinCode:   "999111",
+			ExpiresAt: time.Now().Add(5 * time.Minute),
+			Used:      false,
+		}
+		db.DB.Create(&ticket3)
+
+		// 5 次错误 PIN 尝试
+		for i := 0; i < 5; i++ {
+			badPayload := ConfirmPairingRequest{
+				PinCode: "000000",
+			}
+			body, _ := json.Marshal(badPayload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for incorrect pin attempt %d, got %d", i+1, w.Code)
+			}
+		}
+
+		// 检查数据库中该工单已被废弃
+		var checkTk models.PairTicket
+		db.DB.Where("ticket = ?", ticket3.Ticket).First(&checkTk)
+		if !checkTk.Used || checkTk.FailedAttempts != 5 {
+			t.Fatalf("expected ticket to be marked used with failed_attempts=5, got used=%v, failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
+		}
+
+		// 第 6 次即便输入正确 PIN，也无法配对成功
+		correctPayload := ConfirmPairingRequest{
+			PinCode: "999111",
+		}
+		body, _ := json.Marshal(correctPayload)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalidated ticket even with correct pin, got %d", w.Code)
+		}
+	})
+
 	t.Run("5. List trusted devices", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
 		w := httptest.NewRecorder()

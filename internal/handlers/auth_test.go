@@ -273,5 +273,14 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("8. DetectNetworkCandidates filters out loopback and virtual point-to-point tunnels", func(t *testing.T) {
+		candidates := DetectNetworkCandidates("8088")
+		for _, c := range candidates {
+			if strings.Contains(c.IP, "127.0.0.1") || strings.Contains(c.IP, "172.18.0.1") {
+				t.Fatalf("unexpected loopback or virtual tunnel IP in candidates: %+v", c)
+			}
+		}
+	})
+
 	_ = deviceToken
 }

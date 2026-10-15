@@ -72,8 +72,11 @@ func TestR2Connection(ctx context.Context, cfg config.R2Config) (int64, error) {
 		return 0, fmt.Errorf("加载 AWS S3 客户端配置失败: %w", err)
 	}
 
-	testClient := s3.NewFromConfig(awsCfg)
-	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	testClient := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+		o.RetryMaxAttempts = 1
+	})
+	testCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	start := time.Now()
@@ -82,6 +85,10 @@ func TestR2Connection(ctx context.Context, cfg config.R2Config) (int64, error) {
 		MaxKeys: aws.Int32(1),
 	})
 	if err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "handshake failure") || strings.Contains(errMsg, "alert number 40") {
+			return 0, fmt.Errorf("TLS 握手被 Cloudflare 拒绝：当前填写的 Account ID (%s) 不是有效的 R2 账户 ID（请勿填入域名的区域 ID/Zone ID 或 API 令牌 ID；请在 Cloudflare 控制台 -> R2 对象存储 -> 概览页右侧复制 32 位「账户 ID」）", cfg.AccountID)
+		}
 		return 0, fmt.Errorf("对象存储连接校验失败: %w", err)
 	}
 
@@ -120,7 +127,9 @@ func InitR2(cfg config.R2Config) error {
 		return fmt.Errorf("failed to load AWS config for R2: %w", err)
 	}
 
-	s3Client = s3.NewFromConfig(awsCfg)
+	s3Client = s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 	presignClient = s3.NewPresignClient(s3Client)
 	r2Bucket = cfg.BucketName
 	r2PublicDomain = cfg.PublicDomain

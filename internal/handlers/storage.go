@@ -79,6 +79,36 @@ func LoadStorageConfigFromDB() {
 	}
 }
 
+// normalizeR2AccountAndEndpoint 支持用户在 Account ID 框中直接粘贴完整 https://<account_id>.r2.cloudflarestorage.com 终结点
+func normalizeR2AccountAndEndpoint(rawAccountID, rawEndpoint string) (string, string) {
+	acc := strings.TrimSpace(rawAccountID)
+	ep := strings.TrimRight(strings.TrimSpace(rawEndpoint), "/")
+
+	if strings.HasPrefix(acc, "http://") || strings.HasPrefix(acc, "https://") {
+		acc = strings.TrimRight(acc, "/")
+		if ep == "" {
+			ep = acc
+		}
+		trimmed := strings.TrimPrefix(strings.TrimPrefix(acc, "https://"), "http://")
+		if idx := strings.Index(trimmed, ".r2.cloudflarestorage.com"); idx > 0 {
+			acc = trimmed[:idx]
+		}
+	}
+	if ep != "" {
+		// 若用户粘贴的 S3 API 终结点末尾带了 /bucket_name（Cloudflare 桶设置页的 S3 API 会带桶名后缀），自动剥离路径只保留 origin
+		if strings.HasPrefix(ep, "https://") || strings.HasPrefix(ep, "http://") {
+			schemeEnd := strings.Index(ep, "://") + 3
+			if slashIdx := strings.Index(ep[schemeEnd:], "/"); slashIdx > 0 {
+				ep = ep[:schemeEnd+slashIdx]
+			}
+		}
+	}
+	if ep == "" && acc != "" {
+		ep = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", acc)
+	}
+	return acc, ep
+}
+
 // TestStorageConfig 测试指定对象存储配置是否连通 (POST /api/v1/storage/test)
 func TestStorageConfig(c *gin.Context) {
 	var req StorageConfigRequest
@@ -87,19 +117,14 @@ func TestStorageConfig(c *gin.Context) {
 		return
 	}
 
-	accountID := strings.TrimSpace(req.AccountID)
+	accountID, endpoint := normalizeR2AccountAndEndpoint(req.AccountID, req.Endpoint)
 	accessKeyID := strings.TrimSpace(req.AccessKeyID)
 	secretAccessKey := strings.TrimSpace(req.SecretAccessKey)
 	bucketName := strings.TrimSpace(req.BucketName)
-	endpoint := strings.TrimSpace(req.Endpoint)
 
 	// 若未填写密钥但系统已有保存的密钥，则沿用已有密钥进行握手测试
 	if secretAccessKey == "" {
 		secretAccessKey = config.AppConfig.R2.SecretAccessKey
-	}
-
-	if endpoint == "" && accountID != "" {
-		endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
 	}
 
 	if bucketName == "" || accessKeyID == "" || secretAccessKey == "" || endpoint == "" {
@@ -136,20 +161,15 @@ func UpdateStorageConfig(c *gin.Context) {
 		return
 	}
 
-	accountID := strings.TrimSpace(req.AccountID)
+	accountID, endpoint := normalizeR2AccountAndEndpoint(req.AccountID, req.Endpoint)
 	accessKeyID := strings.TrimSpace(req.AccessKeyID)
 	secretAccessKey := strings.TrimSpace(req.SecretAccessKey)
 	bucketName := strings.TrimSpace(req.BucketName)
-	endpoint := strings.TrimSpace(req.Endpoint)
 	publicDomain := strings.TrimRight(strings.TrimSpace(req.PublicDomain), "/")
 
 	// 沿用旧密钥逻辑：若留空且已有密钥，保留原密钥
 	if secretAccessKey == "" {
 		secretAccessKey = config.AppConfig.R2.SecretAccessKey
-	}
-
-	if endpoint == "" && accountID != "" {
-		endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
 	}
 
 	if bucketName == "" || accessKeyID == "" || secretAccessKey == "" || endpoint == "" {

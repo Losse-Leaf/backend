@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"image/color"
-	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -30,15 +29,6 @@ func generateRandomHex(n int) string {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(bytes)
-}
-
-func generatePinCode() string {
-	max := big.NewInt(900000)
-	n, err := rand.Int(rand.Reader, max)
-	if err != nil {
-		return fmt.Sprintf("%06d", (time.Now().UnixNano()%900000)+100000)
-	}
-	return fmt.Sprintf("%06d", n.Int64()+100000)
 }
 
 func resolveHubURL(c *gin.Context) string {
@@ -82,7 +72,7 @@ type InitPairingRequest struct {
 	DeviceHint string `json:"device_hint"`
 }
 
-// InitPairing 签发 5 分钟有效期的配对 Ticket 与 6 位 PIN 码 (需已授权设备凭据)
+// InitPairing 签发 5 分钟有效期的配对工单（仅通过二维码与配对链接 looseleaf://pair?hub=...&ticket=... 传递中枢地址与工单）
 func InitPairing(c *gin.Context) {
 	var req InitPairingRequest
 	_ = c.ShouldBindJSON(&req)
@@ -94,13 +84,11 @@ func InitPairing(c *gin.Context) {
 	hubURL = strings.TrimRight(hubURL, "/")
 
 	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
-	pinCode := generatePinCode()
 	expiresIn := 300 // 5 分钟
 	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
 
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
-		PinCode:   pinCode,
 		HubURL:    hubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,
@@ -116,7 +104,6 @@ func InitPairing(c *gin.Context) {
 
 	Success(c, gin.H{
 		"ticket":             ticketStr,
-		"pin_code":           pinCode,
 		"hub_url":            hubURL,
 		"expires_at":         expiresAt.Format(time.RFC3339),
 		"expires_in_seconds": expiresIn,
@@ -131,7 +118,6 @@ func InitPairing(c *gin.Context) {
 
 type ConfirmPairingRequest struct {
 	Ticket      string `json:"ticket"`
-	PinCode     string `json:"pin_code"`
 	DeviceName  string `json:"device_name"`
 	Platform    string `json:"platform"`
 	DeviceModel string `json:"device_model"`
@@ -176,7 +162,7 @@ func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window tim
 	return true
 }
 
-// ConfirmPairing 新设备提交 Ticket 或 PIN 码完成握手，获取永久 Device Token；
+// ConfirmPairing 新设备通过扫码或配对深链提交 Ticket 完成握手，获取永久 Device Token；
 // 若当前系统尚未初始化 (initialized == false)，在同一事务中将 initialized 置为 true (BE-19)
 func ConfirmPairing(c *gin.Context) {
 	if !pairLimiter.checkRateLimit(c.ClientIP(), 30, time.Minute) {
@@ -191,64 +177,25 @@ func ConfirmPairing(c *gin.Context) {
 	}
 
 	ticketVal := strings.TrimSpace(req.Ticket)
-	pinVal := strings.TrimSpace(req.PinCode)
-
-	if ticketVal == "" && pinVal == "" {
-		Error(c, http.StatusBadRequest, "必须提供 ticket 或 pin_code 进行握手验证")
+	if ticketVal == "" {
+		Error(c, http.StatusBadRequest, "必须提供配对工单 ticket 进行握手验证")
 		return
 	}
 
 	now := time.Now()
 	var ticket models.PairTicket
 
-	if ticketVal != "" {
-		if err := db.DB.Where("ticket = ?", ticketVal).First(&ticket).Error; err != nil {
-			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
-			return
-		}
-		if ticket.Used || now.After(ticket.ExpiresAt) {
-			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
-			return
-		}
-		if ticket.FailedAttempts >= 5 {
-			Error(c, http.StatusBadRequest, "配对工单尝试次数过多已作废，请重新发起配对")
-			return
-		}
-		if pinVal != "" && subtle.ConstantTimeCompare([]byte(ticket.PinCode), []byte(pinVal)) != 1 {
-			ticket.FailedAttempts++
-			if ticket.FailedAttempts >= 5 {
-				ticket.Used = true
-			}
-			db.DB.Save(&ticket)
-			Error(c, http.StatusBadRequest, "配对 PIN 码错误")
-			return
-		}
-	} else {
-		// 纯 PIN 握手防爆破 (最多 5 次错误尝试后作废)
-		var activeTickets []models.PairTicket
-		db.DB.Where("used = ? AND expires_at > ? AND failed_attempts < 5", false, now).Find(&activeTickets)
-		if len(activeTickets) == 0 {
-			Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
-			return
-		}
-
-		var matchedTicket *models.PairTicket
-		for i := range activeTickets {
-			if subtle.ConstantTimeCompare([]byte(activeTickets[i].PinCode), []byte(pinVal)) == 1 {
-				matchedTicket = &activeTickets[i]
-				break
-			}
-		}
-
-		if matchedTicket == nil {
-			// 纯 PIN 握手无法定位工单，不做跨工单累加 (BE-26)：
-			// 否则 5 次错误 PIN 即可作废系统内全部有效工单，形成拒绝服务。
-			// 防爆破由 ConfirmPairing 入口的 IP 级限速 (30 次/分钟) 兜底。
-			Error(c, http.StatusBadRequest, "配对 PIN 码错误或工单无效")
-			return
-		}
-
-		ticket = *matchedTicket
+	if err := db.DB.Where("ticket = ?", ticketVal).First(&ticket).Error; err != nil {
+		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+		return
+	}
+	if ticket.Used || now.After(ticket.ExpiresAt) {
+		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+		return
+	}
+	if ticket.FailedAttempts >= 5 {
+		Error(c, http.StatusBadRequest, "配对工单尝试次数过多已作废，请重新发起配对")
+		return
 	}
 
 	platform := strings.ToLower(strings.TrimSpace(req.Platform))
@@ -453,6 +400,38 @@ func RevokeDevice(c *gin.Context) {
 		"status":    "revoked",
 		"message":   "设备已成功吊销，该设备的凭证已立即失效",
 	})
+}
+
+// UpdateDeviceName 修改已授信设备的备注名称 (PUT /api/v1/auth/devices/:id)
+func UpdateDeviceName(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Name string `json:"name" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "设备名称不能为空")
+		return
+	}
+
+	newName := strings.TrimSpace(req.Name)
+	if newName == "" {
+		Error(c, http.StatusBadRequest, "设备名称不能为空")
+		return
+	}
+
+	var device models.Device
+	if err := db.DB.Where("(id = ? OR device_id = ?) AND status = ?", id, id, "active").First(&device).Error; err != nil {
+		Error(c, http.StatusNotFound, "未找到该活动设备")
+		return
+	}
+
+	device.Name = newName
+	if err := db.DB.Save(&device).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新设备名称失败: "+err.Error())
+		return
+	}
+
+	Success(c, device)
 }
 
 // ==========================================

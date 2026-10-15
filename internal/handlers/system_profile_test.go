@@ -38,7 +38,6 @@ func setupTestFullDB(t *testing.T) {
 		&models.Wish{},
 		&models.Footprint{},
 		&models.CreditChannel{},
-		&models.UpdateNotice{},
 	)
 	database.Create(&models.CreditChannel{
 		Code:         "huabei",
@@ -237,14 +236,13 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 				CuratorName   string `json:"curator_name"`
 				Location      string `json:"location"`
 				Ticket        string `json:"ticket"`
-				PinCode       string `json:"pin_code"`
 				HubURL        string `json:"hub_url"`
 				QRPayload     string `json:"qr_payload"`
 				QRCodeDataURL string `json:"qr_code_data_url"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.Ticket == "" || res.Data.PinCode == "" || res.Data.CuratorName != "测试主理人" {
+		if res.Data.Ticket == "" || res.Data.QRPayload == "" || res.Data.CuratorName != "测试主理人" {
 			t.Fatalf("unexpected bootstrap response: %+v", res.Data)
 		}
 		bootstrapTicket = res.Data.Ticket
@@ -458,8 +456,8 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 	})
 }
 
-// TestSystemUpdateCheckAndUpdateNotices 测试主理人系统版本更新检查与更新说明 CRUD (RC-97)
-func TestSystemUpdateCheckAndUpdateNotices(t *testing.T) {
+// TestSystemUpdateCheck 测试主理人系统版本更新检查 (需管理员鉴权，访客零感知)
+func TestSystemUpdateCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 	resetUpdateCheckCache()
@@ -472,20 +470,14 @@ func TestSystemUpdateCheckAndUpdateNotices(t *testing.T) {
 	write.Use(middleware.AdminAuthRequired())
 	{
 		write.GET("/system/update-check", CheckSystemUpdate)
-		write.GET("/system/update-notices", GetUpdateNotices)
-		write.POST("/system/update-notices", CreateUpdateNotice)
-		write.PUT("/system/update-notices/:id", UpdateUpdateNotice)
-		write.DELETE("/system/update-notices/:id", DeleteUpdateNotice)
 	}
 
 	t.Run("1. Visitors without admin token are rejected with 401 (zero visitor exposure)", func(t *testing.T) {
-		for _, path := range []string{"/api/v1/system/update-check", "/api/v1/system/update-notices"} {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code != http.StatusUnauthorized {
-				t.Fatalf("expected 401 Unauthorized for visitor on %s, got %d", path, w.Code)
-			}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-check", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for visitor on update-check, got %d", w.Code)
 		}
 	})
 
@@ -588,81 +580,6 @@ func TestSystemUpdateCheckAndUpdateNotices(t *testing.T) {
 			t.Fatalf("expected has_update=false and non-empty check_error, got %+v", res500.Data)
 		}
 	})
-
-	t.Run("3. UpdateNotices CRUD and semver descending sort", func(t *testing.T) {
-		// Create v1.0.0
-		n1, _ := json.Marshal(UpsertUpdateNoticeRequest{
-			Version:    "v1.0.0",
-			Title:      "散页首发版本",
-			Body:       "支持单二进制分发与完整生活档案管理",
-			ReleasedAt: "2026-10-10",
-		})
-		req1 := httptest.NewRequest(http.MethodPost, "/api/v1/system/update-notices", bytes.NewReader(n1))
-		req1.Header.Set("Content-Type", "application/json")
-		req1.Header.Set("Authorization", "Bearer "+adminToken)
-		w1 := httptest.NewRecorder()
-		r.ServeHTTP(w1, req1)
-		if w1.Code != http.StatusOK {
-			t.Fatalf("expected 200 creating notice v1.0.0, got %d: %s", w1.Code, w1.Body.String())
-		}
-
-		// Create v1.2.0
-		n2, _ := json.Marshal(UpsertUpdateNoticeRequest{
-			Version:    "v1.2.0",
-			Title:      "系统版本更新检查",
-			Body:       "新增版本检查与更新说明时间轴",
-			ReleasedAt: "2026-10-11",
-		})
-		req2 := httptest.NewRequest(http.MethodPost, "/api/v1/system/update-notices", bytes.NewReader(n2))
-		req2.Header.Set("Content-Type", "application/json")
-		req2.Header.Set("Authorization", "Bearer "+adminToken)
-		w2 := httptest.NewRecorder()
-		r.ServeHTTP(w2, req2)
-		if w2.Code != http.StatusOK {
-			t.Fatalf("expected 200 creating notice v1.2.0, got %d", w2.Code)
-		}
-
-		// List and verify descending order (v1.2.0 first, v1.0.0 second)
-		listReq := httptest.NewRequest(http.MethodGet, "/api/v1/system/update-notices", nil)
-		listReq.Header.Set("Authorization", "Bearer "+adminToken)
-		listW := httptest.NewRecorder()
-		r.ServeHTTP(listW, listReq)
-		var listRes struct {
-			Data []models.UpdateNotice `json:"data"`
-		}
-		_ = json.Unmarshal(listW.Body.Bytes(), &listRes)
-		if len(listRes.Data) != 2 || listRes.Data[0].Version != "v1.2.0" || listRes.Data[1].Version != "v1.0.0" {
-			t.Fatalf("expected [v1.2.0, v1.0.0], got %+v", listRes.Data)
-		}
-
-		// Update v1.0.0 title
-		targetID := listRes.Data[1].ID
-		updBody, _ := json.Marshal(UpsertUpdateNoticeRequest{
-			Version:    "v1.0.1",
-			Title:      "散页首发修正版",
-			Body:       "修复构建流水线",
-			ReleasedAt: "2026-10-10",
-		})
-		updReq := httptest.NewRequest(http.MethodPut, "/api/v1/system/update-notices/1", bytes.NewReader(updBody))
-		if targetID != 1 {
-			updReq = httptest.NewRequest(http.MethodPut, "/api/v1/system/update-notices/2", bytes.NewReader(updBody))
-		}
-		updReq.Header.Set("Content-Type", "application/json")
-		updReq.Header.Set("Authorization", "Bearer "+adminToken)
-		updW := httptest.NewRecorder()
-		r.ServeHTTP(updW, updReq)
-		if updW.Code != http.StatusOK {
-			t.Fatalf("expected 200 on update notice, got %d: %s", updW.Code, updW.Body.String())
-		}
-
-		// Delete notice
-		delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/system/update-notices/1", nil)
-		delReq.Header.Set("Authorization", "Bearer "+adminToken)
-		delW := httptest.NewRecorder()
-		r.ServeHTTP(delW, delReq)
-		if delW.Code != http.StatusOK {
-			t.Fatalf("expected 200 on delete notice, got %d", delW.Code)
-		}
-	})
 }
+
 

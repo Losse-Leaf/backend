@@ -443,3 +443,138 @@ func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 		t.Fatalf("expected 0 active projects, got %d", len(projs))
 	}
 }
+
+func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	r := gin.New()
+	r.POST("/api/v1/entries", CreateLifeEntry)
+	r.GET("/api/v1/entries", GetLifeEntriesV1)
+	r.GET("/api/v1/entries/on-this-day", GetOnThisDayEntries)
+	r.GET("/api/v1/search", GlobalSearch)
+	r.POST("/api/v1/wishes", CreateWish)
+	r.POST("/api/v1/projects", CreateProject)
+
+	// 1. Seed entries across years for On-This-Day & Cursor Pagination
+	entriesToSeed := []CreateEntryRequest{
+		{
+			Type:       "life",
+			Title:      "2024 西湖秋日漫步",
+			Content:    "在桂花香气中走过苏堤",
+			OccurredAt: "2024-10-15T14:00:00+08:00",
+			Location:   "杭州西湖",
+			CityCode:   "330100",
+			CityName:   "杭州市",
+		},
+		{
+			Type:       "life",
+			Title:      "2025 景德镇陶艺手记",
+			Content:    "拉坯与利坯的静心时刻",
+			OccurredAt: "2025-10-15T16:00:00+08:00",
+			Location:   "景德镇",
+			CityCode:   "360200",
+			CityName:   "景德镇市",
+		},
+		{
+			Type:       "life",
+			Title:      "2025 深夜阅读",
+			Content:    "读完一本纸质散文集",
+			OccurredAt: "2025-11-20T22:00:00+08:00",
+		},
+	}
+
+	for _, item := range entriesToSeed {
+		body, _ := json.Marshal(item)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/entries", bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("failed to seed entry %s: %d %s", item.Title, w.Code, w.Body.String())
+		}
+	}
+
+	// 2. Test Cursor Pagination (before_occurred_at & before_id)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/entries?before_occurred_at=2025-11-01T00:00:00%2B08:00", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on cursor pagination, got %d", w.Code)
+	}
+	var cursorResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &cursorResp)
+	cursorData := cursorResp["data"].(map[string]interface{})
+	cursorEntries := cursorData["entries"].([]interface{})
+	if len(cursorEntries) != 2 {
+		t.Fatalf("expected 2 entries before 2025-11-01, got %d", len(cursorEntries))
+	}
+
+	// Test cursor with same timestamp and before_id
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?before_occurred_at=2025-10-15T16:00:00%2B08:00&before_id=2", nil)
+	r.ServeHTTP(w, req)
+	_ = json.Unmarshal(w.Body.Bytes(), &cursorResp)
+	cursorData = cursorResp["data"].(map[string]interface{})
+	cursorEntries = cursorData["entries"].([]interface{})
+	if len(cursorEntries) != 1 {
+		t.Fatalf("expected 1 entry before (2025-10-15T16:00:00+08:00, id=2), got %d", len(cursorEntries))
+	}
+
+	// 3. Test On-This-Day (GET /api/v1/entries/on-this-day?month=10&day=15)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries/on-this-day?month=10&day=15", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on on-this-day, got %d", w.Code)
+	}
+	var otdResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &otdResp)
+	otdData := otdResp["data"].(map[string]interface{})
+	otdEntries := otdData["entries"].([]interface{})
+	if len(otdEntries) != 2 {
+		t.Fatalf("expected 2 historical entries on Oct 15, got %d", len(otdEntries))
+	}
+
+	// 4. Seed Wish and Project and test GlobalSearch
+	wishBody, _ := json.Marshal(CreateWishRequest{
+		Title:    "收藏一把西湖手工绸伞",
+		Kind:     "item",
+		Note:     "杭州非遗手艺",
+		CityName: "杭州市",
+		Budget:   38000,
+	})
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/wishes", bytes.NewBuffer(wishBody))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	projBody, _ := json.Marshal(ProjectRequest{
+		Title:       "西湖植物志图鉴",
+		Description: "整理杭州西湖四季植物标本",
+		Category:    "人文自然",
+	})
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(projBody))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/search?q=西湖&limit=20", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on global search, got %d", w.Code)
+	}
+	var searchResp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &searchResp)
+	searchData := searchResp["data"].(map[string]interface{})
+	if len(searchData["entries"].([]interface{})) == 0 {
+		t.Errorf("expected entries matching '西湖'")
+	}
+	if len(searchData["wishes"].([]interface{})) == 0 {
+		t.Errorf("expected wishes matching '西湖'")
+	}
+	if len(searchData["projects"].([]interface{})) == 0 {
+		t.Errorf("expected projects matching '西湖'")
+	}
+}

@@ -29,6 +29,7 @@ type presignedCacheItem struct {
 }
 
 var (
+	s3Mu           sync.RWMutex
 	s3Client       *s3.Client
 	presignClient  *s3.PresignClient
 	r2Bucket       string
@@ -41,10 +42,64 @@ var (
 	safeFilenameRegex = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 )
 
+// ClearPresignCache 清理预签名 URL 缓存
+func ClearPresignCache() {
+	presignCacheMu.Lock()
+	presignCache = make(map[string]presignedCacheItem)
+	presignCacheMu.Unlock()
+}
+
+// TestR2Connection 测试指定的 R2 / S3 配置是否能够正常通信，成功时返回握手往返延迟毫秒数
+func TestR2Connection(ctx context.Context, cfg config.R2Config) (int64, error) {
+	if !cfg.IsConfigured() {
+		return 0, errors.New("配置信息不完整，必须填写 Endpoint (或 Account ID)、Access Key ID、Secret Access Key 与 Bucket Name")
+	}
+
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL:               cfg.Endpoint,
+			HostnameImmutable: true,
+			SigningRegion:     "auto",
+		}, nil
+	})
+
+	awsCfg, err := s3config.LoadDefaultConfig(ctx,
+		s3config.WithEndpointResolverWithOptions(customResolver),
+		s3config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
+		s3config.WithRegion("auto"),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("加载 AWS S3 客户端配置失败: %w", err)
+	}
+
+	testClient := s3.NewFromConfig(awsCfg)
+	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = testClient.ListObjectsV2(testCtx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(cfg.BucketName),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("对象存储连接校验失败: %w", err)
+	}
+
+	return time.Since(start).Milliseconds(), nil
+}
+
 // InitR2 初始化 Cloudflare R2 / S3 客户端
 func InitR2(cfg config.R2Config) error {
+	s3Mu.Lock()
+	defer s3Mu.Unlock()
+
 	if !cfg.IsConfigured() {
 		isConfigured = false
+		s3Client = nil
+		presignClient = nil
+		r2Bucket = ""
+		r2PublicDomain = ""
+		ClearPresignCache()
 		return nil
 	}
 
@@ -70,30 +125,56 @@ func InitR2(cfg config.R2Config) error {
 	r2Bucket = cfg.BucketName
 	r2PublicDomain = cfg.PublicDomain
 	isConfigured = true
+	ClearPresignCache()
 
 	return nil
 }
 
 // IsConfigured 检查 R2 是否已配置就绪
 func IsConfigured() bool {
+	s3Mu.RLock()
+	defer s3Mu.RUnlock()
 	return isConfigured
 }
 
 // GetStorageStatus 获取存储服务当前公开状态 (不暴露密钥)
 func GetStorageStatus() map[string]interface{} {
+	s3Mu.RLock()
+	defer s3Mu.RUnlock()
+
 	cfg := config.AppConfig.R2
 	expireSec := cfg.PresignExpireSeconds
 	if expireSec <= 0 {
 		expireSec = 1800
 	}
+
+	// 统计服务端本地存储目录下的文件数量与总大小
+	var localFileCount int64
+	var localTotalBytes int64
+	localDir := GetLocalUploadDir()
+	if fi, err := os.Stat(localDir); err == nil && fi.IsDir() {
+		_ = filepath.Walk(localDir, func(p string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && !info.IsDir() {
+				localFileCount++
+				localTotalBytes += info.Size()
+			}
+			return nil
+		})
+	}
+
 	return map[string]interface{}{
 		"provider":               "Cloudflare R2",
 		"configured":             isConfigured,
+		"account_id":             cfg.AccountID,
 		"bucket":                 cfg.BucketName,
 		"public_domain":          cfg.PublicDomain,
 		"endpoint":               cfg.Endpoint,
+		"access_key_id":          cfg.AccessKeyID,
+		"has_secret_key":         cfg.SecretAccessKey != "",
 		"presign_expire_seconds": expireSec,
 		"presign_expire_minutes": expireSec / 60,
+		"local_file_count":       localFileCount,
+		"local_total_bytes":      localTotalBytes,
 	}
 }
 
@@ -195,6 +276,58 @@ func DeleteObject(objectKey string) error {
 
 	_, err := s3Client.DeleteObject(context.TODO(), delInput)
 	return err
+}
+
+// S3ObjectItem 表示对象存储中的对象元数据
+type S3ObjectItem struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
+// ListObjects 列出指定前缀的对象
+func ListObjects(ctx context.Context, prefix string) ([]S3ObjectItem, error) {
+	if !isConfigured || s3Client == nil {
+		return nil, nil
+	}
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(r2Bucket),
+		Prefix: aws.String(prefix),
+	}
+	output, err := s3Client.ListObjectsV2(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	var items []S3ObjectItem
+	for _, obj := range output.Contents {
+		key := aws.ToString(obj.Key)
+		lastMod := time.Time{}
+		if obj.LastModified != nil {
+			lastMod = *obj.LastModified
+		}
+		items = append(items, S3ObjectItem{
+			Key:          key,
+			Size:         aws.ToInt64(obj.Size),
+			LastModified: lastMod,
+		})
+	}
+	return items, nil
+}
+
+// GetObject 获取 R2 存储对象的读取流
+func GetObject(ctx context.Context, objectKey string) (io.ReadCloser, int64, error) {
+	if !isConfigured || s3Client == nil {
+		return nil, 0, errors.New("对象存储未配置")
+	}
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(r2Bucket),
+		Key:    aws.String(objectKey),
+	}
+	output, err := s3Client.GetObject(ctx, input)
+	if err != nil {
+		return nil, 0, err
+	}
+	return output.Body, aws.ToInt64(output.ContentLength), nil
 }
 
 // GetPublicURL 计算公开访问 URL (用于静态无鉴权降级场景)

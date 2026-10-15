@@ -139,6 +139,17 @@ type SiteConfig struct {
 	Initialized          bool      `gorm:"default:false" json:"initialized"`
 	MasterPasscode       string    `gorm:"size:128" json:"-"`                       // 主理人记忆口令哈希
 	InitialLiquidBalance int64     `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
+
+	// 对象存储动态配置 (支持通过管理后台在线配置 Cloudflare R2 / S3 兼容存储)
+	R2Disabled             bool   `gorm:"default:false" json:"-"`
+	R2AccountID            string `gorm:"size:128" json:"-"`
+	R2AccessKeyID          string `gorm:"size:128" json:"-"`
+	R2SecretAccessKey      string `gorm:"size:128" json:"-"` // 不在通用接口直接下发，避免泄露
+	R2BucketName           string `gorm:"size:128" json:"-"`
+	R2Endpoint             string `gorm:"size:255" json:"-"`
+	R2PublicDomain         string `gorm:"size:255" json:"-"`
+	R2PresignExpireSeconds int    `gorm:"default:1800" json:"-"`
+
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
@@ -180,11 +191,10 @@ type Device struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// PairTicket 临时设备配对工单 (5分钟有效，单次核销 BE-19)
+// PairTicket 临时设备配对工单 (5分钟有效，单次核销 BE-19；仅保留二维码与配对链接 ticket 方式)
 type PairTicket struct {
 	ID             uint       `gorm:"primaryKey" json:"id"`
 	Ticket         string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "pair_tk_9f82d1c6e4b8"
-	PinCode        string     `gorm:"index;size:16;not null" json:"pin_code"`     // e.g. "749210"
 	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
 	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
 	WebToken       string     `gorm:"size:128" json:"-"`                         // 首次装帧伴生 Web 设备 Token (单次读取 BE-19)
@@ -239,15 +249,4 @@ type Footprint struct {
 	CreatedAt        time.Time      `json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`
 	DeletedAt        gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
-}
-
-// UpdateNotice 版本装订更新公告历史存档表 (管理端专用 RC-97)
-type UpdateNotice struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	Version    string    `gorm:"size:32;index;not null" json:"version"`
-	Title      string    `gorm:"size:255;not null" json:"title"`
-	Body       string    `gorm:"type:text;not null" json:"body"`
-	ReleasedAt string    `gorm:"size:32" json:"released_at"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
 }

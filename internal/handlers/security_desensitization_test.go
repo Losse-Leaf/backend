@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -639,4 +640,66 @@ func TestGearStatusAndPriceOverview(t *testing.T) {
 			resp.Data.GearSummary.SoldCount, resp.Data.GearSummary.SoldRecoveredValue)
 	}
 }
+
+// TestGlobalStatsRoleCacheIsolation 测试全局统计接口对访客隐藏当月支出且不污染主理人缓存
+func TestGlobalStatsRoleCacheIsolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+	InvalidateStatsCache()
+
+	testMasterKey := "lldt_secret_stats_isolation"
+	seedTestAdminDevice(testMasterKey)
+
+	db.DB.Create(&models.Transaction{
+		Amount:     88800,
+		Type:       "expense",
+		Category:   "日常餐饮",
+		Title:      "测试支出",
+		OccurredAt: time.Now().In(config.BeijingLocation),
+	})
+
+	r := gin.New()
+	r.GET("/api/v1/stats", GetGlobalStats)
+
+	// 1. 访客先请求，month_expense 必须为 0
+	wGuest := httptest.NewRecorder()
+	reqGuest, _ := http.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	r.ServeHTTP(wGuest, reqGuest)
+	if wGuest.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wGuest.Code)
+	}
+	var guestResp struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	_ = json.Unmarshal(wGuest.Body.Bytes(), &guestResp)
+	if int64(guestResp.Data["month_expense"].(float64)) != 0 {
+		t.Fatalf("expected month_expense=0 for guest, got %v", guestResp.Data["month_expense"])
+	}
+
+	// 2. 主理人命中缓存请求，必须拿到真实 month_expense=88800
+	wAdmin := httptest.NewRecorder()
+	reqAdmin, _ := http.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	reqAdmin.Header.Set("Authorization", "Bearer "+testMasterKey)
+	r.ServeHTTP(wAdmin, reqAdmin)
+	if wAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wAdmin.Code)
+	}
+	var adminResp struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	_ = json.Unmarshal(wAdmin.Body.Bytes(), &adminResp)
+	if int64(adminResp.Data["month_expense"].(float64)) != 88800 {
+		t.Fatalf("expected month_expense=88800 for admin, got %v", adminResp.Data["month_expense"])
+	}
+
+	// 3. 访客再次命中缓存请求，仍必须为 0
+	wGuest2 := httptest.NewRecorder()
+	reqGuest2, _ := http.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	r.ServeHTTP(wGuest2, reqGuest2)
+	_ = json.Unmarshal(wGuest2.Body.Bytes(), &guestResp)
+	if int64(guestResp.Data["month_expense"].(float64)) != 0 {
+		t.Fatalf("expected month_expense=0 for guest after admin cache hit, got %v", guestResp.Data["month_expense"])
+	}
+}
+
 

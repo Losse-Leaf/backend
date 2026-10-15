@@ -63,7 +63,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.CuratorProfile{},
 		&models.Wish{},
 		&models.Footprint{},
-		&models.UpdateNotice{},
 	)
 	if err != nil {
 		return nil, err
@@ -120,14 +119,35 @@ func seedData(database *gorm.DB) {
 	database.Model(&models.SiteConfig{}).Count(&cfgCount)
 	if cfgCount == 0 {
 		config := models.SiteConfig{
-			SiteName:        "散页 · 时光手账与生活档案",
-			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
+			SiteName:        "散页 · 个人生活志",
+			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",
 			CuratorName:     "",
 			DefaultLocation: "",
-			SiteDesc:        "生活档案与时光手账，记录真实可感的日子。",
+			SiteDesc:        "记录日常、打理资产、兑现心愿、丈量山河、实践造物。",
 			Initialized:     false,
 		}
 		database.Create(&config)
+	} else {
+		// 升级已有配置中的旧版俗套口号 (时光手账与生活档案 -> 散页 · 个人生活志)
+		var existingCfg models.SiteConfig
+		if err := database.First(&existingCfg).Error; err == nil {
+			changed := false
+			if strings.Contains(existingCfg.SiteName, "时光手账") || strings.Contains(existingCfg.SiteName, "生活档案与时光手账") {
+				existingCfg.SiteName = "散页 · 个人生活志"
+				changed = true
+			}
+			if strings.Contains(existingCfg.SiteSubtitle, "时光手账") {
+				existingCfg.SiteSubtitle = "日常 · 资产 · 心愿 · 行迹 · 造物"
+				changed = true
+			}
+			if strings.Contains(existingCfg.SiteDesc, "时光手账") {
+				existingCfg.SiteDesc = "记录日常、打理资产、兑现心愿、丈量山河、实践造物。"
+				changed = true
+			}
+			if changed {
+				database.Save(&existingCfg)
+			}
+		}
 	}
 
 	// 2. 初始化主理人身份中枢 (Curator Profile 纯净空态 RC-52)

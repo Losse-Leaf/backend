@@ -40,7 +40,7 @@ func setupFrontendStaticServing(r *gin.Engine) {
 			})
 			r.StaticFile("/favicon.ico", filepath.Join(distDir, "favicon.ico"))
 			r.StaticFile("/favicon.svg", filepath.Join(distDir, "favicon.svg"))
-			r.StaticFile("/icons.svg", filepath.Join(distDir, "icons.svg"))
+			r.StaticFile("/loose-leaf-icon.svg", filepath.Join(distDir, "loose-leaf-icon.svg"))
 			r.StaticFile("/robots.txt", filepath.Join(distDir, "robots.txt"))
 			r.StaticFile("/manifest.webmanifest", filepath.Join(distDir, "manifest.webmanifest"))
 

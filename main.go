@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"loose-leaf/internal/backup"
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/handlers"
@@ -49,6 +50,7 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	handlers.EnsureEntryFootprintsSynced()
+	handlers.LoadStorageConfigFromDB()
 
 	// 3. 生产模式或开发模式
 	if os.Getenv("GIN_MODE") == "release" {
@@ -85,7 +87,9 @@ func main() {
 	{
 		// === 公开只读接口 ===
 		v1.GET("/entries", handlers.GetLifeEntriesV1)
+		v1.GET("/entries/on-this-day", handlers.GetOnThisDayEntries)
 		v1.GET("/entries/:id", handlers.GetLifeEntryByID)
+		v1.GET("/search", handlers.GlobalSearch)
 		v1.GET("/storage/status", handlers.GetStorageStatus)
 		v1.GET("/projects", handlers.GetProjectsV1)
 		v1.GET("/projects/:id", handlers.GetProjectByID)
@@ -191,14 +195,24 @@ func main() {
 			// Device Pairing & Management (受信任设备管理)
 			write.POST("/auth/pair/init", handlers.InitPairing)
 			write.GET("/auth/devices", handlers.GetTrustedDevices)
+			write.PUT("/auth/devices/:id", handlers.UpdateDeviceName)
 			write.DELETE("/auth/devices/:id", handlers.RevokeDevice)
 
-			// 主理人系统版本更新检查与更新说明维护 (需管理员鉴权，访客零感知 RC-97)
+			// 主理人系统版本更新检查 (需管理员鉴权，访客零感知)
 			write.GET("/system/update-check", handlers.CheckSystemUpdate)
-			write.GET("/system/update-notices", handlers.GetUpdateNotices)
-			write.POST("/system/update-notices", handlers.CreateUpdateNotice)
-			write.PUT("/system/update-notices/:id", handlers.UpdateUpdateNotice)
-			write.DELETE("/system/update-notices/:id", handlers.DeleteUpdateNotice)
+
+			// 自动与手动全量备份 (ZIP 格式，最多保留 7 份)
+			write.POST("/system/backup/now", handlers.CreateBackupNow)
+			write.GET("/system/backup/list", handlers.GetBackupList)
+			write.GET("/system/backup/download/:filename", handlers.DownloadBackup)
+			write.DELETE("/system/backup/:filename", handlers.DeleteBackup)
+			write.POST("/system/backup/restore", handlers.RestoreBackup)
+
+			// 对象存储在线配置与连通性测试 (热重载)
+			write.POST("/storage/test", handlers.TestStorageConfig)
+			write.PUT("/storage/config", handlers.UpdateStorageConfig)
+			write.DELETE("/storage/config", handlers.ResetStorageConfig)
+			write.POST("/storage/migrate", handlers.MigrateStorageMedia)
 		}
 
 		// Health Check
@@ -216,6 +230,9 @@ func main() {
 
 	// 8. 前端静态文件托管（支持 //go:embed 单二进制内嵌与本地磁盘双模，docs/ecosystem.md §10.4）
 	setupFrontendStaticServing(r)
+
+	// 9. 启动每日自动定时备份任务 (北京时间 03:30)
+	backup.StartDailyBackupScheduler()
 
 	port := cfg.Port
 	srv := &http.Server{

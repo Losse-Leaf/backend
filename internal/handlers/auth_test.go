@@ -34,9 +34,10 @@ func TestDevicePairingLifecycle(t *testing.T) {
 	r.POST("/api/v1/auth/pair/init", InitPairing)
 	r.POST("/api/v1/auth/pair/confirm", ConfirmPairing)
 	r.GET("/api/v1/auth/devices", GetTrustedDevices)
+	r.PUT("/api/v1/auth/devices/:id", UpdateDeviceName)
 	r.DELETE("/api/v1/auth/devices/:id", RevokeDevice)
 
-	var ticketStr, pinCode string
+	var ticketStr string
 
 	t.Run("1. Init pairing ticket", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
@@ -51,7 +52,6 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			Code int `json:"code"`
 			Data struct {
 				Ticket           string `json:"ticket"`
-				PinCode          string `json:"pin_code"`
 				ExpiresInSeconds int    `json:"expires_in_seconds"`
 				QRPayload        string `json:"qr_payload"`
 			} `json:"data"`
@@ -60,12 +60,11 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			t.Fatalf("failed to decode response: %v", err)
 		}
 
-		if res.Data.Ticket == "" || len(res.Data.PinCode) != 6 {
-			t.Fatalf("invalid ticket or pin code: %+v", res.Data)
+		if res.Data.Ticket == "" || res.Data.QRPayload == "" {
+			t.Fatalf("invalid ticket or qr_payload: %+v", res.Data)
 		}
 
 		ticketStr = res.Data.Ticket
-		pinCode = res.Data.PinCode
 	})
 
 	var deviceToken, deviceID string
@@ -120,18 +119,16 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("4. Confirm pairing with PIN code on second ticket", func(t *testing.T) {
-		// 先初始化第二个工单
+	t.Run("4. Confirm pairing with second ticket", func(t *testing.T) {
 		ticket2 := models.PairTicket{
-			Ticket:    "pair_tk_test_pin_ticket",
-			PinCode:   "888666",
+			Ticket:    "pair_tk_test_second_ticket",
 			ExpiresAt: time.Now().Add(5 * time.Minute),
 			Used:      false,
 		}
 		db.DB.Create(&ticket2)
 
 		payload := ConfirmPairingRequest{
-			PinCode:    "888666",
+			Ticket:     "pair_tk_test_second_ticket",
 			DeviceName: "Test iPhone 16",
 			Platform:   "ios",
 		}
@@ -142,79 +139,32 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 for PIN confirm, got %d, body: %s", w.Code, w.Body.String())
+			t.Fatalf("expected 200 for second ticket confirm, got %d, body: %s", w.Code, w.Body.String())
 		}
 	})
 
-	// BE-26：纯 PIN 握手不定位工单，故错误 PIN 不再跨工单累加（否则 5 次错误即可作废全部工单形成 DoS）。
-	// 防爆破改由 ConfirmPairing 入口的 IP 级限速（30 次/分钟）兜底；带 ticket 的握手仍按工单计次作废。
-	t.Run("4b. Pure-PIN failures do not invalidate other tickets (rate-limit is the brute-force guard)", func(t *testing.T) {
+	t.Run("4b. Empty or invalid ticket is rejected without affecting valid tickets", func(t *testing.T) {
 		ticket3 := models.PairTicket{
-			Ticket:    "pair_tk_bruteforce_test",
-			PinCode:   "999111",
+			Ticket:    "pair_tk_valid_ticket",
 			ExpiresAt: time.Now().Add(5 * time.Minute),
 			Used:      false,
 		}
 		db.DB.Create(&ticket3)
 
-		for i := 0; i < 5; i++ {
-			badPayload := ConfirmPairingRequest{PinCode: "000000"}
-			body, _ := json.Marshal(badPayload)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400 for incorrect pin attempt %d, got %d", i+1, w.Code)
-			}
-		}
-
-		var checkTk models.PairTicket
-		db.DB.Where("ticket = ?", ticket3.Ticket).First(&checkTk)
-		if checkTk.Used || checkTk.FailedAttempts != 0 {
-			t.Fatalf("pure-PIN failures must not void tickets, got used=%v failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
-		}
-
-		// 正确 PIN 仍可正常配对（工单未被误伤）
-		correctPayload := ConfirmPairingRequest{PinCode: "999111"}
-		body, _ := json.Marshal(correctPayload)
+		badPayload := ConfirmPairingRequest{Ticket: ""}
+		body, _ := json.Marshal(badPayload)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 for correct pin after failed attempts, got %d: %s", w.Code, w.Body.String())
-		}
-
-		// 清理本子测试新建的设备，避免影响后续设备计数断言
-		db.DB.Where("platform = ?", "device").Delete(&models.Device{})
-	})
-
-	t.Run("4c. Ticket-scoped handshake still counts failures and voids ticket after 5 attempts", func(t *testing.T) {
-		ticket4 := models.PairTicket{
-			Ticket:    "pair_tk_scoped_test",
-			PinCode:   "999222",
-			ExpiresAt: time.Now().Add(5 * time.Minute),
-			Used:      false,
-		}
-		db.DB.Create(&ticket4)
-
-		for i := 0; i < 5; i++ {
-			badPayload := ConfirmPairingRequest{Ticket: ticket4.Ticket, PinCode: "000000"}
-			body, _ := json.Marshal(badPayload)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400 for incorrect pin attempt %d, got %d", i+1, w.Code)
-			}
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for empty ticket, got %d", w.Code)
 		}
 
 		var checkTk models.PairTicket
-		db.DB.Where("ticket = ?", ticket4.Ticket).First(&checkTk)
-		if !checkTk.Used || checkTk.FailedAttempts != 5 {
-			t.Fatalf("expected scoped ticket used=true failed_attempts=5, got used=%v failed_attempts=%d", checkTk.Used, checkTk.FailedAttempts)
+		db.DB.Where("ticket = ?", ticket3.Ticket).First(&checkTk)
+		if checkTk.Used {
+			t.Fatalf("valid ticket must remain unused, got used=%v", checkTk.Used)
 		}
 	})
 
@@ -235,6 +185,37 @@ func TestDevicePairingLifecycle(t *testing.T) {
 
 		if len(res.Data) != 2 {
 			t.Fatalf("expected 2 devices, got %d", len(res.Data))
+		}
+	})
+
+	t.Run("5b. Rename active device via UpdateDeviceName", func(t *testing.T) {
+		renameBody, _ := json.Marshal(map[string]string{"name": "  Studio MacBook Pro M3  "})
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(renameBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 on rename, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var res struct {
+			Code int           `json:"code"`
+			Data models.Device `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &res)
+		if res.Data.Name != "Studio MacBook Pro M3" {
+			t.Fatalf("expected trimmed name 'Studio MacBook Pro M3', got '%s'", res.Data.Name)
+		}
+
+		// Empty name should return 400
+		emptyBody, _ := json.Marshal(map[string]string{"name": "   "})
+		badReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(emptyBody))
+		badReq.Header.Set("Content-Type", "application/json")
+		badW := httptest.NewRecorder()
+		r.ServeHTTP(badW, badReq)
+		if badW.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for empty device name, got %d", badW.Code)
 		}
 	})
 
@@ -272,5 +253,4 @@ func TestDevicePairingLifecycle(t *testing.T) {
 	})
 
 	_ = deviceToken
-	_ = pinCode
 }

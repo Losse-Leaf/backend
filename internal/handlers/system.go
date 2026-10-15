@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,7 +24,7 @@ func GetSystemStatus(c *gin.Context) {
 
 	siteName := cfg.SiteName
 	if siteName == "" {
-		siteName = "散页 · 时光手账与生活档案"
+		siteName = "散页 · 个人生活志"
 	}
 
 	Success(c, gin.H{
@@ -85,7 +84,7 @@ func BootstrapSystem(c *gin.Context) {
 		db.DB.FirstOrCreate(&cfg)
 	}
 	if cfg.SiteName == "" {
-		cfg.SiteName = "散页 · 时光手账与生活档案"
+		cfg.SiteName = "散页 · 个人生活志"
 	}
 	cfg.CuratorName = curatorName
 	cfg.DefaultLocation = location
@@ -125,13 +124,11 @@ func BootstrapSystem(c *gin.Context) {
 	hubURL = strings.TrimRight(hubURL, "/")
 
 	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
-	pinCode := generatePinCode()
 	expiresIn := 300 // 5 分钟
 	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
 
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
-		PinCode:   pinCode,
 		HubURL:    hubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,
@@ -148,7 +145,6 @@ func BootstrapSystem(c *gin.Context) {
 		"curator_name":       curatorName,
 		"location":           location,
 		"ticket":             ticketStr,
-		"pin_code":           pinCode,
 		"hub_url":            hubURL,
 		"qr_payload":         qrPayload,
 		"qr_code_data_url":   qrDataURL,
@@ -374,131 +370,5 @@ func CheckSystemUpdate(c *gin.Context) {
 	updateCheckMu.Unlock()
 
 	Success(c, result)
-}
-
-// UpsertUpdateNoticeRequest 新增或修改版本更新说明请求体 (RC-97)
-type UpsertUpdateNoticeRequest struct {
-	Version    string `json:"version"`
-	Title      string `json:"title"`
-	Body       string `json:"body"`
-	ReleasedAt string `json:"released_at"`
-}
-
-// GetUpdateNotices 获取历史版本更新说明列表，按版本号倒序排列 (需管理员鉴权，RC-97)
-func GetUpdateNotices(c *gin.Context) {
-	var notices []models.UpdateNotice
-	if err := db.DB.Order("id DESC").Find(&notices).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "查询版本更新说明失败: "+err.Error())
-		return
-	}
-	if notices == nil {
-		notices = []models.UpdateNotice{}
-	}
-
-	sort.SliceStable(notices, func(i, j int) bool {
-		cmp := compareSemver(notices[i].Version, notices[j].Version)
-		if cmp != 0 {
-			return cmp > 0
-		}
-		if notices[i].ReleasedAt != notices[j].ReleasedAt {
-			return notices[i].ReleasedAt > notices[j].ReleasedAt
-		}
-		return notices[i].ID > notices[j].ID
-	})
-
-	Success(c, notices)
-}
-
-// CreateUpdateNotice 录入新版本更新说明 (需管理员鉴权，RC-97)
-func CreateUpdateNotice(c *gin.Context) {
-	var req UpsertUpdateNoticeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "无效的更新说明参数: "+err.Error())
-		return
-	}
-
-	version := strings.TrimSpace(req.Version)
-	title := strings.TrimSpace(req.Title)
-	body := strings.TrimSpace(req.Body)
-	releasedAt := strings.TrimSpace(req.ReleasedAt)
-
-	if version == "" || title == "" || body == "" {
-		Error(c, http.StatusBadRequest, "版本号、更新标题与更新内容不能为空")
-		return
-	}
-	if releasedAt == "" {
-		releasedAt = config.TodayInBeijing()
-	}
-
-	notice := models.UpdateNotice{
-		Version:    version,
-		Title:      title,
-		Body:       body,
-		ReleasedAt: releasedAt,
-	}
-	if err := db.DB.Create(&notice).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "创建版本更新说明失败: "+err.Error())
-		return
-	}
-
-	Success(c, notice)
-}
-
-// UpdateUpdateNotice 编辑既有版本更新说明 (需管理员鉴权，RC-97)
-func UpdateUpdateNotice(c *gin.Context) {
-	id := c.Param("id")
-	var notice models.UpdateNotice
-	if err := db.DB.First(&notice, id).Error; err != nil {
-		Error(c, http.StatusNotFound, "未找到该版本更新说明")
-		return
-	}
-
-	var req UpsertUpdateNoticeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "无效的更新说明参数: "+err.Error())
-		return
-	}
-
-	if v := strings.TrimSpace(req.Version); v != "" {
-		notice.Version = v
-	}
-	if t := strings.TrimSpace(req.Title); t != "" {
-		notice.Title = t
-	}
-	if b := strings.TrimSpace(req.Body); b != "" {
-		notice.Body = b
-	}
-	if r := strings.TrimSpace(req.ReleasedAt); r != "" {
-		notice.ReleasedAt = r
-	}
-
-	if strings.TrimSpace(notice.Version) == "" || strings.TrimSpace(notice.Title) == "" || strings.TrimSpace(notice.Body) == "" {
-		Error(c, http.StatusBadRequest, "版本号、更新标题与更新内容不能为空")
-		return
-	}
-
-	if err := db.DB.Save(&notice).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "保存版本更新说明失败: "+err.Error())
-		return
-	}
-
-	Success(c, notice)
-}
-
-// DeleteUpdateNotice 删除指定版本更新说明 (需管理员鉴权，RC-97)
-func DeleteUpdateNotice(c *gin.Context) {
-	id := c.Param("id")
-	var notice models.UpdateNotice
-	if err := db.DB.First(&notice, id).Error; err != nil {
-		Error(c, http.StatusNotFound, "未找到该版本更新说明")
-		return
-	}
-
-	if err := db.DB.Delete(&notice).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "删除版本更新说明失败: "+err.Error())
-		return
-	}
-
-	Success(c, gin.H{"deleted": true, "id": notice.ID})
 }
 

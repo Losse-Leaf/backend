@@ -384,6 +384,16 @@ func GetLifeEntriesV1(c *gin.Context) {
 		}
 	}
 
+	if beforeOccurredStr := strings.TrimSpace(c.Query("before_occurred_at")); beforeOccurredStr != "" {
+		if beforeTime, err := ParseFlexTime(beforeOccurredStr); err == nil {
+			if beforeID, err := strconv.Atoi(c.Query("before_id")); err == nil && beforeID > 0 {
+				query = query.Where("(occurred_at < ?) OR (occurred_at = ? AND id < ?)", beforeTime, beforeTime, beforeID)
+			} else {
+				query = query.Where("occurred_at < ?", beforeTime)
+			}
+		}
+	}
+
 	var total int64
 	query.Count(&total)
 
@@ -423,6 +433,41 @@ func GetLifeEntriesV1(c *gin.Context) {
 		"page":      page,
 		"page_size": pageSize,
 		"entries":   entries,
+	})
+}
+
+// GetOnThisDayEntries 查询往年今日生活档案 (GET /api/v1/entries/on-this-day)
+func GetOnThisDayEntries(c *gin.Context) {
+	now := time.Now().In(config.BeijingLocation)
+	month := int(now.Month())
+	day := now.Day()
+	if m, err := strconv.Atoi(c.Query("month")); err == nil && m >= 1 && m <= 12 {
+		month = m
+	}
+	if d, err := strconv.Atoi(c.Query("day")); err == nil && d >= 1 && d <= 31 {
+		day = d
+	}
+
+	var allEntries []models.LifeEntry
+	if err := db.DB.Model(&models.LifeEntry{}).Order("occurred_at DESC, id DESC").Find(&allEntries).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "查询往年今日记录失败")
+		return
+	}
+
+	matched := make([]models.LifeEntry, 0)
+	for _, e := range allEntries {
+		occ := e.OccurredAt.In(config.BeijingLocation)
+		if occ.Year() < now.Year() && int(occ.Month()) == month && occ.Day() == day {
+			matched = append(matched, e)
+		}
+	}
+
+	populateEntryURLsBatch(matched)
+
+	Success(c, gin.H{
+		"month":   month,
+		"day":     day,
+		"entries": matched,
 	})
 }
 
@@ -1224,7 +1269,7 @@ func CreateProject(c *gin.Context) {
 			Type:       "project",
 			Title:      p.Title,
 			Content:    entryContent,
-			OccurredAt: time.Now(),
+			OccurredAt: time.Now().In(config.BeijingLocation),
 			Featured:   p.Featured,
 			ProjectID:  &p.ID,
 		}
@@ -1408,7 +1453,7 @@ func UpdateProject(c *gin.Context) {
 				Type:       "project",
 				Title:      entryTitle,
 				Content:    entryContent,
-				OccurredAt: time.Now(),
+				OccurredAt: time.Now().In(config.BeijingLocation),
 				ProjectID:  &p.ID,
 			}
 			if err := tx.Create(&progressEntry).Error; err != nil {
@@ -1467,26 +1512,50 @@ func DeleteProject(c *gin.Context) {
 // 5. Global Stats (生活档案统计概览)
 // ==========================================
 
+type statsSnapshot struct {
+	TotalEntries  int64
+	TotalPhotos   int64
+	TotalProjects int64
+	MonthExpense  int64
+	CurrentYear   int
+	CurrentMonth  int
+}
+
 var (
 	statsCacheMutex sync.RWMutex
-	cachedStats     gin.H
+	cachedStats     *statsSnapshot
 	cachedStatsTime time.Time
 )
 
 // InvalidateStatsCache 主动失效全局统计缓存
 func InvalidateStatsCache() {
 	statsCacheMutex.Lock()
+	cachedStats = nil
 	cachedStatsTime = time.Time{}
 	statsCacheMutex.Unlock()
 }
 
 func GetGlobalStats(c *gin.Context) {
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	isAdmin := middleware.IsAdmin(c)
+
 	now := time.Now()
 	statsCacheMutex.RLock()
 	if cachedStats != nil && now.Sub(cachedStatsTime) < 30*time.Second {
-		resp := cachedStats
+		snap := *cachedStats
 		statsCacheMutex.RUnlock()
-		Success(c, resp)
+		expense := snap.MonthExpense
+		if !isAdmin {
+			expense = 0
+		}
+		Success(c, gin.H{
+			"total_entries":  snap.TotalEntries,
+			"total_photos":   snap.TotalPhotos,
+			"total_projects": snap.TotalProjects,
+			"month_expense":  expense,
+			"current_year":   snap.CurrentYear,
+			"current_month":  snap.CurrentMonth,
+		})
 		return
 	}
 	statsCacheMutex.RUnlock()
@@ -1517,21 +1586,33 @@ func GetGlobalStats(c *gin.Context) {
 		Scan(&res)
 	monthExpense = res.Total
 
-	result := gin.H{
-		"total_entries":  totalEntries,
-		"total_photos":   totalPhotos,
-		"total_projects": totalProjects,
-		"month_expense":  monthExpense,
-		"current_year":   nowBeijing.Year(),
-		"current_month":  int(nowBeijing.Month()),
+	snap := statsSnapshot{
+		TotalEntries:  totalEntries,
+		TotalPhotos:   totalPhotos,
+		TotalProjects: totalProjects,
+		MonthExpense:  monthExpense,
+		CurrentYear:   nowBeijing.Year(),
+		CurrentMonth:  int(nowBeijing.Month()),
 	}
 
 	statsCacheMutex.Lock()
-	cachedStats = result
+	cachedStats = &snap
 	cachedStatsTime = now
 	statsCacheMutex.Unlock()
 
-	Success(c, result)
+	visibleExpense := monthExpense
+	if !isAdmin {
+		visibleExpense = 0
+	}
+
+	Success(c, gin.H{
+		"total_entries":  snap.TotalEntries,
+		"total_photos":   snap.TotalPhotos,
+		"total_projects": snap.TotalProjects,
+		"month_expense":  visibleExpense,
+		"current_year":   snap.CurrentYear,
+		"current_month":  snap.CurrentMonth,
+	})
 }
 
 // ==========================================
@@ -1542,8 +1623,8 @@ func GetConfigV1(c *gin.Context) {
 	var config models.SiteConfig
 	if err := db.DB.First(&config).Error; err != nil {
 		config = models.SiteConfig{
-			SiteName:        "散页 · 时光手账与生活档案",
-			SiteSubtitle:    "时光手账与生活档案 · 记录真实可感的日子",
+			SiteName:        "散页 · 个人生活志",
+			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",
 			CuratorName:     "",
 			DefaultLocation: "",
 		}
@@ -1598,5 +1679,86 @@ func HealthCheck(c *gin.Context) {
 		"storage_r2": storage.IsConfigured(),
 		"time":       time.Now().Unix(),
 		"message":    fmt.Sprintf("Archive engine %s running quietly on %s", config.Version, runtime.GOARCH),
+	})
+}
+
+// GlobalSearch 全站跨维度聚合搜索 (GET /api/v1/search?q=...&limit=...)
+func GlobalSearch(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		Success(c, gin.H{
+			"query":      "",
+			"entries":    []models.LifeEntry{},
+			"footprints": []models.Footprint{},
+			"wishes":     []models.Wish{},
+			"projects":   []models.Project{},
+		})
+		return
+	}
+
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "30"))
+	if limit < 1 {
+		limit = 30
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	likePat := "%" + q + "%"
+
+	var entries []models.LifeEntry
+	db.DB.Where("title LIKE ? OR content LIKE ? OR location LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat).
+		Order("occurred_at DESC, id DESC").
+		Limit(limit).
+		Find(&entries)
+	if entries == nil {
+		entries = []models.LifeEntry{}
+	}
+	populateEntryURLsBatch(entries)
+
+	var footprints []models.Footprint
+	db.DB.Where("city_name LIKE ? OR title LIKE ? OR note LIKE ?", likePat, likePat, likePat).
+		Order("visited_at DESC, id DESC").
+		Limit(limit).
+		Find(&footprints)
+	if footprints == nil {
+		footprints = []models.Footprint{}
+	}
+	populateFootprintURLsBatch(footprints)
+
+	var wishes []models.Wish
+	db.DB.Where("title LIKE ? OR note LIKE ? OR spec LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat).
+		Order("created_at DESC, id DESC").
+		Limit(limit).
+		Find(&wishes)
+	if wishes == nil {
+		wishes = []models.Wish{}
+	}
+	populateWishURLsBatch(wishes)
+	isAdmin := middleware.IsAdmin(c)
+	if !isAdmin {
+		for i := range wishes {
+			wishes[i].ActualCost = 0
+			wishes[i].TransactionID = nil
+			wishes[i].GearID = nil
+		}
+	}
+
+	var projects []models.Project
+	db.DB.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR story LIKE ? OR category LIKE ?", likePat, likePat, likePat, likePat, likePat).
+		Order("`order` ASC, id DESC").
+		Limit(limit).
+		Find(&projects)
+	if projects == nil {
+		projects = []models.Project{}
+	}
+
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	Success(c, gin.H{
+		"query":      q,
+		"entries":    entries,
+		"footprints": footprints,
+		"wishes":     wishes,
+		"projects":   projects,
 	})
 }

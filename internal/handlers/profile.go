@@ -14,18 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func parseJSONOrRaw(raw string) any {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	var obj any
-	if err := json.Unmarshal([]byte(raw), &obj); err == nil {
-		return obj
-	}
-	return raw
-}
-
 func sanitizeEDCGear(raw string, isAdmin bool) any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

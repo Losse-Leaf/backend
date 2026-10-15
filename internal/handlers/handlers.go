@@ -437,6 +437,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 }
 
 // GetOnThisDayEntries 查询往年今日生活档案 (GET /api/v1/entries/on-this-day)
+// 性能优化：两阶段轻量扫描，第一阶段仅投影 (id, occurred_at) 索引列定位往年同日 ID，避免全表加载大文本 Content
 func GetOnThisDayEntries(c *gin.Context) {
 	now := time.Now().In(config.BeijingLocation)
 	month := int(now.Month())
@@ -448,21 +449,34 @@ func GetOnThisDayEntries(c *gin.Context) {
 		day = d
 	}
 
-	var allEntries []models.LifeEntry
-	if err := db.DB.Model(&models.LifeEntry{}).Order("occurred_at DESC, id DESC").Find(&allEntries).Error; err != nil {
+	type idAndTime struct {
+		ID         uint
+		OccurredAt time.Time
+	}
+	startOfCurrentYear := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, config.BeijingLocation)
+	var metas []idAndTime
+	if err := db.DB.Model(&models.LifeEntry{}).
+		Select("id, occurred_at").
+		Where("occurred_at < ?", startOfCurrentYear).
+		Order("occurred_at DESC, id DESC").
+		Find(&metas).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "查询往年今日记录失败")
 		return
 	}
 
-	matched := make([]models.LifeEntry, 0)
-	for _, e := range allEntries {
-		occ := e.OccurredAt.In(config.BeijingLocation)
+	matchedIDs := make([]uint, 0)
+	for _, m := range metas {
+		occ := m.OccurredAt.In(config.BeijingLocation)
 		if occ.Year() < now.Year() && int(occ.Month()) == month && occ.Day() == day {
-			matched = append(matched, e)
+			matchedIDs = append(matchedIDs, m.ID)
 		}
 	}
 
-	populateEntryURLsBatch(matched)
+	matched := make([]models.LifeEntry, 0, len(matchedIDs))
+	if len(matchedIDs) > 0 {
+		db.DB.Where("id IN ?", matchedIDs).Order("occurred_at DESC, id DESC").Find(&matched)
+		populateEntryURLsBatch(matched)
+	}
 
 	Success(c, gin.H{
 		"month":   month,
@@ -1070,7 +1084,7 @@ func GetTransactionSummary(c *gin.Context) {
 	end := start.AddDate(0, 1, 0)
 
 	var txs []models.Transaction
-	db.DB.Where("occurred_at >= ? AND occurred_at < ?", start, end).Find(&txs)
+	db.DB.Select("type, category, amount").Where("occurred_at >= ? AND occurred_at < ?", start, end).Find(&txs)
 
 	var totalExpense int64
 	var totalIncome int64
@@ -1621,7 +1635,7 @@ func GetGlobalStats(c *gin.Context) {
 
 func GetConfigV1(c *gin.Context) {
 	var config models.SiteConfig
-	if err := db.DB.First(&config).Error; err != nil {
+	if err := db.DB.Limit(1).Find(&config).Error; err != nil || config.ID == 0 {
 		config = models.SiteConfig{
 			SiteName:        "散页 · 个人生活志",
 			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",

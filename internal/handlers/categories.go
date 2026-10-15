@@ -190,7 +190,7 @@ func cascadeRenameCategoryRecords(scope, oldName, newName string) {
 				}
 			}
 			if changed {
-				_ = saveProfileGear(&profile, list).Error
+				_ = saveProfileGear(&profile, list)
 			}
 		}
 	}

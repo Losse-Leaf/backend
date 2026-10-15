@@ -94,7 +94,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	filmGallery := make([]models.Attachment, 0)
 
 	for i, e := range entries {
-		m := e.OccurredAt.Month()
+		m := e.OccurredAt.In(beijing).Month()
 		switch {
 		case m >= 3 && m <= 5:
 			if springHighlight == nil || len(e.Attachments) > len(springHighlight.Attachments) {
@@ -131,9 +131,12 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		fulfilledWishes = make([]models.Wish, 0)
 	}
 
-	// 5. 第五幕：柴米油盐 (Transactions 聚合)
+	// 5. 第五幕：柴米油盐 (Transactions 聚合：仅主理人鉴权请求查询聚合，访客模式零查询脱敏 BE-14)
+	isAdmin := middleware.IsAdmin(c)
 	var txs []models.Transaction
-	db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).Find(&txs)
+	if isAdmin {
+		db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).Find(&txs)
+	}
 
 	var totalIncome, totalExpense, wishExpenses int64
 	categoryBreakdown := make(map[string]int64)
@@ -163,8 +166,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	if totalExpense > 0 {
 		wishRatio = float64(wishExpenses) / float64(totalExpense)
 	}
-
-	isAdmin := middleware.IsAdmin(c)
 
 	txCount := len(txs)
 	finSpectrum := gin.H{

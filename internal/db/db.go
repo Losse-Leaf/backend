@@ -69,6 +69,10 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	}
 
 	DB = database
+	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_att_refs ON attachments(entry_id, wish_id, footprint_id);").Error
+	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_tx_type_occurred ON transactions(type, occurred_at DESC);").Error
+	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_wish_status_kind_created ON wishes(status, kind, created_at DESC);").Error
+	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_fp_city_visited ON footprints(city_code, visited_at DESC);").Error
 	seedData(database)
 	return database, nil
 }
@@ -96,11 +100,23 @@ func SeedDefaultCategories(database *gorm.DB, targetScope string, forceRestore b
 			if cnt > 0 {
 				continue
 			}
+			batch := make([]models.CategoryOption, 0, len(defaults))
+			for idx, name := range defaults {
+				batch = append(batch, models.CategoryOption{
+					Scope:     sc,
+					Name:      name,
+					SortOrder: (idx + 1) * 10,
+					IsBuiltin: true,
+				})
+			}
+			if len(batch) > 0 {
+				database.Create(&batch)
+			}
+			continue
 		}
 		for idx, name := range defaults {
 			var existing models.CategoryOption
-			err := database.Where("scope = ? AND name = ?", sc, name).First(&existing).Error
-			if err != nil {
+			if err := database.Where("scope = ? AND name = ?", sc, name).Limit(1).Find(&existing).Error; err == nil && existing.ID == 0 {
 				database.Create(&models.CategoryOption{
 					Scope:     sc,
 					Name:      name,

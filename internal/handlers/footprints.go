@@ -106,17 +106,20 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 	}
 
 	fpIDs := make([]uint, 0, len(footprints))
-	fpSet := make(map[uint]*models.Footprint, len(footprints))
-	entryCount := make(map[uint]int, len(footprints))
+	entrySetByFP := make(map[uint]map[uint]bool, len(footprints))
+	entryFP := make(map[uint]uint)
 	for i := range footprints {
-		if footprints[i].ID > 0 {
-			fpIDs = append(fpIDs, footprints[i].ID)
-			fpSet[footprints[i].ID] = &footprints[i]
+		f := &footprints[i]
+		if f.ID > 0 {
+			fpIDs = append(fpIDs, f.ID)
+			entrySetByFP[f.ID] = make(map[uint]bool)
+			if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
+				entrySetByFP[f.ID][*f.LifeEntryID] = true
+				entryFP[*f.LifeEntryID] = f.ID
+			}
 		}
 	}
 
-	entryCountByFP := make(map[uint]int)
-	entryFP := make(map[uint]uint)
 	if len(fpIDs) > 0 {
 		type entryRef struct {
 			ID          uint
@@ -128,8 +131,11 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 			Where("footprint_id IN ?", fpIDs).
 			Scan(&refs)
 		for _, r := range refs {
-			if r.FootprintID != nil {
-				entryCountByFP[*r.FootprintID]++
+			if r.FootprintID != nil && *r.FootprintID > 0 {
+				if entrySetByFP[*r.FootprintID] == nil {
+					entrySetByFP[*r.FootprintID] = make(map[uint]bool)
+				}
+				entrySetByFP[*r.FootprintID][r.ID] = true
 				entryFP[r.ID] = *r.FootprintID
 			}
 		}
@@ -149,7 +155,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 		}
 		for _, att := range atts {
 			switch {
-			case att.FootprintID != nil:
+			case att.FootprintID != nil && *att.FootprintID > 0:
 				attByFP[*att.FootprintID] = append(attByFP[*att.FootprintID], att)
 			case att.EntryID != nil:
 				if fid, ok := entryFP[*att.EntryID]; ok {
@@ -161,13 +167,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 
 	for i := range footprints {
 		f := &footprints[i]
-		// 首生条目也计入关联动态数（与单条版 populateFootprintURLs 保持同一口径）
-		if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
-			entryCount[f.ID] = entryCountByFP[f.ID] + 1
-		} else {
-			entryCount[f.ID] = entryCountByFP[f.ID]
-		}
-		f.EntriesCount = entryCount[f.ID]
+		f.EntriesCount = len(entrySetByFP[f.ID])
 		atts := attByFP[f.ID]
 		if atts == nil {
 			atts = []models.Attachment{}
@@ -177,7 +177,6 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 		}
 		f.Attachments = atts
 	}
-	_ = fpSet
 }
 
 // populateFootprintExpenseStats 为单次旅程计算关联的花销笔数与总额 (仅管理员可见)
@@ -186,18 +185,19 @@ func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 		return
 	}
 	wStart, wEnd := footprintTripWindow(f, 1)
-	var txs []models.Transaction
-	db.DB.Where(
-		"type = 'expense' AND (footprint_id = ? OR ((footprint_id IS NULL OR footprint_id = 0) AND city_code = ? AND occurred_at >= ? AND occurred_at <= ?))",
-		f.ID, f.CityCode, wStart, wEnd,
-	).Find(&txs)
-
-	var spent int64
-	for _, t := range txs {
-		spent += t.Amount
+	var stats struct {
+		TotalSpent       int64
+		TransactionCount int64
 	}
-	f.TotalSpent = spent
-	f.TransactionCount = len(txs)
+	db.DB.Model(&models.Transaction{}).
+		Select("COALESCE(SUM(amount), 0) AS total_spent, COUNT(*) AS transaction_count").
+		Where(
+			"type = 'expense' AND (footprint_id = ? OR ((footprint_id IS NULL OR footprint_id = 0) AND city_code = ? AND occurred_at >= ? AND occurred_at <= ?))",
+			f.ID, f.CityCode, wStart, wEnd,
+		).Scan(&stats)
+
+	f.TotalSpent = stats.TotalSpent
+	f.TransactionCount = int(stats.TransactionCount)
 }
 
 // CreateFootprintRequest 录入足迹/旅程请求
@@ -393,9 +393,13 @@ func EnsureEntryFootprintsSynced() {
 	}
 
 	// 将已有 LifeEntryID 绑定但 FootprintID 为空的记录补齐 FootprintID
-	var allFps []models.Footprint
-	db.DB.Order("visited_at ASC, id ASC").Find(&allFps)
-	for _, fp := range allFps {
+	var unlinkedFps []models.Footprint
+	db.DB.Select("id, life_entry_id").
+		Where("life_entry_id IS NOT NULL AND life_entry_id > 0").
+		Where("life_entry_id IN (SELECT id FROM life_entries WHERE (footprint_id IS NULL OR footprint_id = 0) AND deleted_at IS NULL)").
+		Order("visited_at ASC, id ASC").
+		Find(&unlinkedFps)
+	for _, fp := range unlinkedFps {
 		if fp.LifeEntryID != nil && *fp.LifeEntryID > 0 {
 			db.DB.Model(&models.LifeEntry{}).
 				Where("id = ? AND (footprint_id IS NULL OR footprint_id = 0)", *fp.LifeEntryID).
@@ -856,10 +860,10 @@ type DrawerCategoryItem struct {
 
 // processDrawerFootprints 统一处理抽屉足迹相片签名、旅程花销统计并计算首访与最近到访日期
 func processDrawerFootprints(footprints []models.Footprint, isAdmin bool) (string, string, []uint) {
+	populateFootprintURLsBatch(footprints)
 	var firstVisit, latestVisit time.Time
 	fpIDs := make([]uint, 0, len(footprints))
 	for i, f := range footprints {
-		populateFootprintURLs(&footprints[i])
 		populateFootprintExpenseStats(&footprints[i], isAdmin)
 		if f.ID > 0 {
 			fpIDs = append(fpIDs, f.ID)
@@ -1160,9 +1164,7 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		entries = []models.LifeEntry{}
 	}
 
-	for i := range entries {
-		populateEntryURLs(&entries[i])
-	}
+	populateEntryURLsBatch(entries)
 
 	// 3. 关联该省份及旅程的消费账单光谱 (仅管理员下发 RC-81, RC-91, RC-93)
 	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {

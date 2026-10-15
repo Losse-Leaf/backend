@@ -193,10 +193,6 @@ func ConfirmPairing(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
 		return
 	}
-	if ticket.FailedAttempts >= 5 {
-		Error(c, http.StatusBadRequest, "配对工单尝试次数过多已作废，请重新发起配对")
-		return
-	}
 
 	platform := strings.ToLower(strings.TrimSpace(req.Platform))
 	if platform == "" {
@@ -510,7 +506,7 @@ func VerifyPasscode(c *gin.Context) {
 
 	// RC-82: 检查是否已存在同平台同名的 Web 登录设备记录，避免同一浏览器重复登录无限累积记录
 	var existingDevice models.Device
-	if err := db.DB.Where("platform = ? AND name = ?", "web", deviceName).First(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
+	if err := db.DB.Where("platform = ? AND name = ?", "web", deviceName).Limit(1).Find(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
 		existingDevice.TokenHash = tokenHash
 		existingDevice.Status = "active"
 		existingDevice.LastActiveAt = now

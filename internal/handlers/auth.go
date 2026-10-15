@@ -89,6 +89,7 @@ func InitPairing(c *gin.Context) {
 
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
+		PinCode:   "",
 		HubURL:    hubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,

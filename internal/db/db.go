@@ -69,6 +69,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	}
 
 	DB = database
+	_ = database.Exec("DROP INDEX IF EXISTS idx_pair_tickets_pin_code;").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_att_refs ON attachments(entry_id, wish_id, footprint_id);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_tx_type_occurred ON transactions(type, occurred_at DESC);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_wish_status_kind_created ON wishes(status, kind, created_at DESC);").Error

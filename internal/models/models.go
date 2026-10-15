@@ -195,6 +195,7 @@ type Device struct {
 type PairTicket struct {
 	ID             uint       `gorm:"primaryKey" json:"id"`
 	Ticket         string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "pair_tk_9f82d1c6e4b8"
+	PinCode        string     `gorm:"size:16;default:''" json:"-"`                // 兼容已有 SQLite 数据库中可能残留的 NOT NULL 约束，不对外暴露
 	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
 	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
 	WebToken       string     `gorm:"size:128" json:"-"`                         // 首次装帧伴生 Web 设备 Token (单次读取 BE-19)

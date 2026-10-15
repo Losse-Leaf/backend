@@ -107,6 +107,7 @@ func main() {
 		v1.POST("/auth/verify", handlers.VerifyPasscode)
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
 		v1.GET("/auth/pair/status", handlers.PollPairingStatus)
+		v1.GET("/auth/pair/qr", handlers.RenderPairQRCode)
 
 		// 统一文件临时签名接口 (公开只读，供各端获取动态有效访问 URL)
 		v1.GET("/files/sign", handlers.SignFileURL)

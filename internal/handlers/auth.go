@@ -72,16 +72,12 @@ type InitPairingRequest struct {
 	DeviceHint string `json:"device_hint"`
 }
 
-// InitPairing 签发 5 分钟有效期的配对工单（仅通过二维码与配对链接 looseleaf://pair?hub=...&ticket=... 传递中枢地址与工单）
+// InitPairing 签发 5 分钟有效期的配对工单（智能避开 localhost 回环，优先选用 Tailscale / 局域网 Wi-Fi IP）
 func InitPairing(c *gin.Context) {
 	var req InitPairingRequest
 	_ = c.ShouldBindJSON(&req)
 
-	hubURL := strings.TrimSpace(req.HubURL)
-	if hubURL == "" {
-		hubURL = resolveHubURL(c)
-	}
-	hubURL = strings.TrimRight(hubURL, "/")
+	smartHubURL, candidates := ResolveSmartHubURL(req.HubURL, c)
 
 	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
 	expiresIn := 300 // 5 分钟
@@ -90,7 +86,7 @@ func InitPairing(c *gin.Context) {
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
 		PinCode:   "",
-		HubURL:    hubURL,
+		HubURL:    smartHubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,
 	}
@@ -100,16 +96,37 @@ func InitPairing(c *gin.Context) {
 		return
 	}
 
-	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticketStr)
+	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", smartHubURL, ticketStr)
 	qrDataURL := generateQRCodeDataURL(qrPayload)
 
 	Success(c, gin.H{
 		"ticket":             ticketStr,
-		"hub_url":            hubURL,
+		"hub_url":            smartHubURL,
 		"expires_at":         expiresAt.Format(time.RFC3339),
 		"expires_in_seconds": expiresIn,
 		"qr_payload":         qrPayload,
 		"qr_code_data_url":   qrDataURL,
+		"candidates":         candidates,
+	})
+}
+
+// RenderPairQRCode 动态生成指定中枢节点与工单的纸墨二维码 (GET /api/v1/auth/pair/qr)
+func RenderPairQRCode(c *gin.Context) {
+	hubURL := strings.TrimRight(strings.TrimSpace(c.Query("hub")), "/")
+	ticket := strings.TrimSpace(c.Query("ticket"))
+	if hubURL == "" || ticket == "" {
+		Error(c, http.StatusBadRequest, "缺少必要参数 hub 或 ticket")
+		return
+	}
+
+	payload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticket)
+	dataURL := generateQRCodeDataURL(payload)
+
+	Success(c, gin.H{
+		"hub_url":          hubURL,
+		"ticket":           ticket,
+		"qr_payload":       payload,
+		"qr_code_data_url": dataURL,
 	})
 }
 

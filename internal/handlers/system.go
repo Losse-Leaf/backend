@@ -117,11 +117,7 @@ func BootstrapSystem(c *gin.Context) {
 	db.DB.Save(&profile)
 
 	// 3. 结合前端上报的 hub_url 签发 5 分钟有效的首台设备配对工单 (BE-19, BE-20)
-	hubURL := strings.TrimSpace(req.HubURL)
-	if hubURL == "" {
-		hubURL = resolveHubURL(c)
-	}
-	hubURL = strings.TrimRight(hubURL, "/")
+	smartHubURL, candidates := ResolveSmartHubURL(req.HubURL, c)
 
 	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
 	expiresIn := 300 // 5 分钟
@@ -130,7 +126,7 @@ func BootstrapSystem(c *gin.Context) {
 	ticket := models.PairTicket{
 		Ticket:    ticketStr,
 		PinCode:   "",
-		HubURL:    hubURL,
+		HubURL:    smartHubURL,
 		ExpiresAt: expiresAt,
 		Used:      false,
 	}
@@ -139,16 +135,17 @@ func BootstrapSystem(c *gin.Context) {
 		return
 	}
 
-	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticketStr)
+	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", smartHubURL, ticketStr)
 	qrDataURL := generateQRCodeDataURL(qrPayload)
 
 	Success(c, gin.H{
 		"curator_name":       curatorName,
 		"location":           location,
 		"ticket":             ticketStr,
-		"hub_url":            hubURL,
+		"hub_url":            smartHubURL,
 		"qr_payload":         qrPayload,
 		"qr_code_data_url":   qrDataURL,
+		"candidates":         candidates,
 		"expires_at":         expiresAt.Format(time.RFC3339),
 		"expires_in_seconds": expiresIn,
 	})

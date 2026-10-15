@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,6 +250,26 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 		if res.Data[0].DeviceID == deviceID {
 			t.Fatalf("expected revoked device %s to be excluded from trusted devices list", deviceID)
+		}
+	})
+
+	t.Run("7. RenderPairQRCode dynamically renders QR code Data URL", func(t *testing.T) {
+		r.GET("/api/v1/auth/pair/qr", RenderPairQRCode)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/pair/qr?hub=http://100.112.108.52:8088&ticket="+ticketStr, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var res struct {
+			Data struct {
+				QRPayload     string `json:"qr_payload"`
+				QRCodeDataURL string `json:"qr_code_data_url"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &res)
+		if !strings.Contains(res.Data.QRPayload, "100.112.108.52:8088") || !strings.HasPrefix(res.Data.QRCodeDataURL, "data:image/png;base64,") {
+			t.Fatalf("unexpected QR payload or data URL: %+v", res.Data)
 		}
 	})
 

@@ -86,6 +86,24 @@ func LoadConfig() Config {
 	}
 
 	port := os.Getenv("PORT")
+
+	// 命令行参数最高优先级覆盖 (支持 ./looseleaf -port 8080 或 ./looseleaf -p 8080 或 ./looseleaf 8080)
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if (arg == "-p" || arg == "-port" || arg == "--port") && i+1 < len(os.Args) {
+			port = os.Args[i+1]
+			i++
+		} else if strings.HasPrefix(arg, "-port=") {
+			port = strings.TrimPrefix(arg, "-port=")
+		} else if strings.HasPrefix(arg, "--port=") {
+			port = strings.TrimPrefix(arg, "--port=")
+		} else if strings.HasPrefix(arg, "-p=") {
+			port = strings.TrimPrefix(arg, "-p=")
+		} else if val, err := strconv.Atoi(arg); err == nil && val > 0 && val <= 65535 {
+			port = arg
+		}
+	}
+
 	if port == "" {
 		port = "8088"
 	}

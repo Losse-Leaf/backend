@@ -65,13 +65,10 @@ func main() {
 		r = gin.Default()
 	}
 
-	// 4. CORS 跨域配置 (支持环境变量 CORS_ALLOWED_ORIGINS 精确限制来源)
-	// 生产形态为「单二进制内嵌前端」的前后端同源部署，默认不开放跨域；仅本地开发与显式配置时放宽 (BE-38)
+	// 4. CORS 跨域配置 (支持环境变量 CORS_ALLOWED_ORIGINS 精确限制来源，默认允许跨端连接)
 	corsConfig := cors.DefaultConfig()
 	if allowedOrigins := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS")); allowedOrigins != "" {
 		corsConfig.AllowOrigins = strings.Split(allowedOrigins, ",")
-	} else if gin.Mode() == gin.ReleaseMode {
-		corsConfig.AllowAllOrigins = false
 	} else {
 		corsConfig.AllowAllOrigins = true
 	}

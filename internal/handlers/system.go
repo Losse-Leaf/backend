@@ -54,10 +54,6 @@ func BootstrapSystem(c *gin.Context) {
 		Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
 		return
 	}
-	if strings.TrimSpace(cfg.MasterPasscode) != "" {
-		Error(c, http.StatusForbidden, "自留地已设定管理员密钥，配对激活前禁止覆盖初始化")
-		return
-	}
 
 	var req BootstrapRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -68,12 +64,21 @@ func BootstrapSystem(c *gin.Context) {
 	masterPasscode := strings.TrimSpace(req.MasterPasscode)
 	confirmPasscode := strings.TrimSpace(req.ConfirmPasscode)
 	if masterPasscode == "" {
-		Error(c, http.StatusBadRequest, "请设定管理员密钥")
+		Error(c, http.StatusBadRequest, "请设定管理员密码")
 		return
 	}
 	if masterPasscode != confirmPasscode {
-		Error(c, http.StatusBadRequest, "两次输入的管理员密钥不一致")
+		Error(c, http.StatusBadRequest, "两次输入的密码不一致")
 		return
+	}
+
+	// 若尚未完成首台设备配对激活 (Initialized == false) 但已设定过密码：
+	// 仅允许使用相同密码继续装帧与签发新配对票据，禁止外部攻击者恶意覆盖
+	if strings.TrimSpace(cfg.MasterPasscode) != "" {
+		if !CheckPasscode(masterPasscode, cfg.MasterPasscode) {
+			Error(c, http.StatusForbidden, "自留地已设定管理员密钥，配对激活前禁止覆盖初始化")
+			return
+		}
 	}
 
 	curatorName := strings.TrimSpace(req.CuratorName)

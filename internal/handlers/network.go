@@ -140,7 +140,7 @@ func DetectNetworkCandidates(serverPort string) []NetworkCandidate {
 				seenIPs[ipStr] = true
 				candidates = append(candidates, NetworkCandidate{
 					Type:  "lan",
-					Label: "局域网 Wi-Fi",
+					Label: "内网/局域网",
 					IP:    ipStr,
 					URL:   candidateURL,
 				})
@@ -168,11 +168,15 @@ func ResolveSmartHubURL(incomingHubURL string, c *gin.Context) (string, []Networ
 
 	// 若传入的地址并非 localhost（如公网域名 https://archive.example.com 或已有特定 IP），作为首选
 	if !isLoopbackHost(reqURL) {
+		cleanDisplayHost := reqURL
+		if u, err := url.Parse(reqURL); err == nil && u.Host != "" {
+			cleanDisplayHost = u.Host
+		}
 		resultCandidates := make([]NetworkCandidate, 0, len(candidates)+1)
 		resultCandidates = append(resultCandidates, NetworkCandidate{
 			Type:      "origin",
 			Label:     "当前访问域名",
-			IP:        reqURL,
+			IP:        cleanDisplayHost,
 			URL:       reqURL,
 			IsDefault: true,
 		})

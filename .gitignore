@@ -7,6 +7,8 @@
 loose-leaf-server
 looseleaf-server
 server
+release/
+release-dist/
 tmp/
 build-errors.log
 

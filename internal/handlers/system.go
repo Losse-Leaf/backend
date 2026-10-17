@@ -310,7 +310,7 @@ func CheckSystemUpdate(c *gin.Context) {
 			ReleaseURL:     defaultReleaseURL,
 			PublishedAt:    "",
 			CheckedAt:      nowStr,
-			CheckError:     "未检测到 Release 发行版（若仓库已设为私有，请配置 GITHUB_TOKEN 进行鉴权）",
+			CheckError:     "未检测到可用版本更新",
 		}
 		updateCheckMu.Lock()
 		cachedUpdateCheck = &result

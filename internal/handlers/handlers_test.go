@@ -50,6 +50,24 @@ func TestParseFlexTime(t *testing.T) {
 			expected: time.Date(2026, 10, 9, 0, 0, 0, 0, time.Local),
 			hasError: false,
 		},
+		{
+			name:     "RFC3339 with +08:00 offset",
+			input:    "2026-10-09T14:30:00+08:00",
+			expected: time.Date(2026, 10, 9, 14, 30, 0, 0, time.Local),
+			hasError: false,
+		},
+		{
+			name:     "RFC3339Nano with +08:00 offset and fractional seconds",
+			input:    "2026-10-09T14:30:00.123+08:00",
+			expected: time.Date(2026, 10, 9, 14, 30, 0, 0, time.Local),
+			hasError: false,
+		},
+		{
+			name:     "ISO8601 with UTC Z and milliseconds (toISOString)",
+			input:    "2026-10-09T06:30:00.000Z",
+			expected: time.Date(2026, 10, 9, 14, 30, 0, 0, time.Local),
+			hasError: false,
+		},
 	}
 
 	for _, tc := range tests {

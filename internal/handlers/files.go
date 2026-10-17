@@ -72,7 +72,7 @@ func UnifiedUploadFile(c *gin.Context) {
 	// 净化并构建规范的存储桶相对路径 (folder 仅允许白名单目录，杜绝任意子目录写入 BE-22)
 	folder = strings.TrimSpace(folder)
 	if !allowedUploadFolders[folder] {
-		Error(c, http.StatusBadRequest, "不支持的存储归类目录 (可选值: entries, avatar, covers, audio)")
+		Error(c, http.StatusBadRequest, "不支持的存储归类目录")
 		return
 	}
 	objectKey, err := storage.BuildSafeObjectKey(folder, fileHeader.Filename, customKey)

@@ -242,7 +242,7 @@ func DeleteCategory(c *gin.Context) {
 	// 仍被历史业务记录引用的分类不可删除，否则旧记录将残留孤儿分类名 (BE-28)
 	if used := countCategoryRecordsInUse(item.Scope, item.Name); used > 0 {
 		Error(c, http.StatusBadRequest,
-			fmt.Sprintf("「%s」仍被 %d 条历史记录引用，请先将其重命名为其他分类以完成迁移", item.Name, used))
+			fmt.Sprintf("「%s」仍被 %d 条历史记录引用，暂无法删除", item.Name, used))
 		return
 	}
 

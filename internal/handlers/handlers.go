@@ -51,9 +51,12 @@ func ParseFlexTime(s string) (time.Time, error) {
 		return config.NowInBeijing(), nil
 	}
 	layouts := []string{
+		time.RFC3339Nano,
 		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
 		"2006-01-02T15:04:05",
 		"2006-01-02T15:04",
+		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04",
 		"2006-01-02",
@@ -62,7 +65,7 @@ func ParseFlexTime(s string) (time.Time, error) {
 	}
 	for _, l := range layouts {
 		if t, err := time.ParseInLocation(l, s, config.BeijingLocation); err == nil {
-			return t, nil
+			return t.In(config.BeijingLocation), nil
 		}
 	}
 	return config.NowInBeijing(), fmt.Errorf("unable to parse time string: %s", s)
@@ -233,13 +236,9 @@ func CreateLifeEntry(c *gin.Context) {
 		}
 	}
 
-	if cityCode != "" {
-		if cityName == "" && location != "" {
-			cityName = location
-		}
-		if location == "" && cityName != "" {
-			location = cityName
-		}
+	cityCode, cityName, location = ResolveCityCodeAndName(cityCode, cityName, location)
+	if cityCode != "" && location == "" {
+		location = cityName
 	}
 
 	// 若前端在 CreateProject 后立即调用了 CreateLifeEntry，复用刚伴生创建的同项目记录，避免重复入库
@@ -545,11 +544,23 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.Featured != nil {
 		entry.Featured = *req.Featured
 	}
-	if req.CityCode != "" {
-		entry.CityCode = strings.TrimSpace(req.CityCode)
-	}
-	if req.CityName != "" {
-		entry.CityName = strings.TrimSpace(req.CityName)
+	if req.CityCode != "" || req.CityName != "" || req.Location != "" {
+		curCode := entry.CityCode
+		if req.CityCode != "" {
+			curCode = req.CityCode
+		}
+		curName := entry.CityName
+		if req.CityName != "" {
+			curName = req.CityName
+		}
+		curLoc := entry.Location
+		if req.Location != "" {
+			curLoc = req.Location
+		}
+		cCode, cName, cLoc := ResolveCityCodeAndName(curCode, curName, curLoc)
+		entry.CityCode = cCode
+		entry.CityName = cName
+		entry.Location = cLoc
 	}
 	if req.FootprintID != nil {
 		entry.FootprintID = req.FootprintID
@@ -563,13 +574,8 @@ func UpdateLifeEntry(c *gin.Context) {
 			}
 		}
 	}
-	if entry.CityCode != "" {
-		if entry.CityName == "" && entry.Location != "" {
-			entry.CityName = entry.Location
-		}
-		if entry.Location == "" && entry.CityName != "" {
-			entry.Location = entry.CityName
-		}
+	if entry.CityCode != "" && entry.Location == "" {
+		entry.Location = entry.CityName
 	}
 	if req.ProjectID != nil {
 		entry.ProjectID = req.ProjectID
@@ -894,6 +900,7 @@ func CreateTransaction(c *gin.Context) {
 	}
 
 	occurred, _ := ParseFlexTime(req.OccurredAt)
+	cleanCityCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", req.Title+" "+req.Note)
 
 	tx := models.Transaction{
 		Amount:        req.Amount,
@@ -904,7 +911,7 @@ func CreateTransaction(c *gin.Context) {
 		PaymentMethod: strings.TrimSpace(req.PaymentMethod),
 		WishID:        req.WishID,
 		FootprintID:   req.FootprintID,
-		CityCode:      strings.TrimSpace(req.CityCode),
+		CityCode:      cleanCityCode,
 		OccurredAt:    occurred,
 	}
 
@@ -1142,7 +1149,8 @@ func UpdateTransaction(c *gin.Context) {
 		}
 	}
 	if req.CityCode != "" {
-		tx.CityCode = strings.TrimSpace(req.CityCode)
+		cCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", tx.Title+" "+tx.Note)
+		tx.CityCode = cCode
 	}
 
 	if req.OccurredAt != "" {

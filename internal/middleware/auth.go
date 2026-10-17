@@ -110,7 +110,7 @@ func AdminAuthRequired() gin.HandlerFunc {
 
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 			"code":    http.StatusUnauthorized,
-			"message": "未授权的操作：缺少有效的受信任设备凭证。请在欢迎扉页输入管理员密钥登录，或通过设备配对接入。",
+			"message": "未授权的操作：缺少有效的访问凭证",
 			"data":    nil,
 		})
 	}

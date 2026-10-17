@@ -87,7 +87,7 @@ func TestR2Connection(ctx context.Context, cfg config.R2Config) (int64, error) {
 	if err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "handshake failure") || strings.Contains(errMsg, "alert number 40") {
-			return 0, fmt.Errorf("TLS 握手被 Cloudflare 拒绝：当前填写的 Account ID (%s) 不是有效的 R2 账户 ID（请勿填入域名的区域 ID/Zone ID 或 API 令牌 ID；请在 Cloudflare 控制台 -> R2 对象存储 -> 概览页右侧复制 32 位「账户 ID」）", cfg.AccountID)
+			return 0, fmt.Errorf("Cloudflare 拒绝访问：Account ID (%s) 无效", cfg.AccountID)
 		}
 		return 0, fmt.Errorf("对象存储连接校验失败: %w", err)
 	}

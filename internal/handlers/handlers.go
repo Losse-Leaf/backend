@@ -71,6 +71,18 @@ func ParseFlexTime(s string) (time.Time, error) {
 	return config.NowInBeijing(), fmt.Errorf("unable to parse time string: %s", s)
 }
 
+// ParseSyncSinceTime 解析增量同步用于比较 updated_at / deleted_at 的时间过滤参数。
+// 由于 SQLite 底层驱动对 time.Time 采用本地时区文本字面量存储，
+// 且 GORM 自动维护的时间戳为 time.Now() (服务器本地时区)，
+// 与数据库审计时间戳比较时必须使用本地时区 Local()，确保在 UTC CI/服务器或任意时区下比对无偏差。
+func ParseSyncSinceTime(s string) (time.Time, error) {
+	t, err := ParseFlexTime(s)
+	if err != nil {
+		return t, err
+	}
+	return t.Local(), nil
+}
+
 // populateAttachmentURLs 填充附件的动态临时预签名访问 URL (默认 30 分钟有效)
 func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	for i := range atts {
@@ -351,7 +363,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 		Order("occurred_at DESC, id DESC")
 
 	if sinceStr != "" {
-		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
 			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
 		}
 	}
@@ -1000,7 +1012,7 @@ func GetTransactions(c *gin.Context) {
 	query := dbScope.Model(&models.Transaction{}).Order("occurred_at DESC, id DESC")
 
 	if sinceStr != "" {
-		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
 			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
 		}
 	}
@@ -1319,7 +1331,7 @@ func GetProjectsV1(c *gin.Context) {
 	query := dbScope.Model(&models.Project{}).Order("`order` ASC, id DESC")
 
 	if sinceStr != "" {
-		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
 			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
 		}
 	}

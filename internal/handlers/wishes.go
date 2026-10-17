@@ -139,7 +139,7 @@ func GetWishes(c *gin.Context) {
 	query := dbScope.Model(&models.Wish{}).Order("created_at DESC, id DESC")
 
 	if sinceStr != "" {
-		if sinceTime, err := ParseFlexTime(sinceStr); err == nil {
+		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
 			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
 		}
 	}

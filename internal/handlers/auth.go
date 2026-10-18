@@ -416,11 +416,13 @@ func RevokeDevice(c *gin.Context) {
 	})
 }
 
-// UpdateDeviceName 修改已授信设备的备注名称 (PUT /api/v1/auth/devices/:id)
+// UpdateDeviceName 修改已授信设备的备注名称及设备平台 (PUT /api/v1/auth/devices/:id)
 func UpdateDeviceName(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
-		Name string `json:"name" binding:"required"`
+		Name        string `json:"name"`
+		Platform    string `json:"platform"`
+		DeviceModel string `json:"device_model"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "设备名称不能为空")
@@ -428,7 +430,10 @@ func UpdateDeviceName(c *gin.Context) {
 	}
 
 	newName := strings.TrimSpace(req.Name)
-	if newName == "" {
+	newPlatform := strings.ToLower(strings.TrimSpace(req.Platform))
+	newModel := strings.TrimSpace(req.DeviceModel)
+
+	if newName == "" && newPlatform == "" && newModel == "" {
 		Error(c, http.StatusBadRequest, "设备名称不能为空")
 		return
 	}
@@ -439,9 +444,18 @@ func UpdateDeviceName(c *gin.Context) {
 		return
 	}
 
-	device.Name = newName
+	if newName != "" {
+		device.Name = newName
+	}
+	if newPlatform != "" {
+		device.Platform = newPlatform
+	}
+	if newModel != "" {
+		device.DeviceModel = newModel
+	}
+
 	if err := db.DB.Save(&device).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新设备名称失败: "+err.Error())
+		Error(c, http.StatusInternalServerError, "更新设备信息失败: "+err.Error())
 		return
 	}
 
@@ -453,8 +467,10 @@ func UpdateDeviceName(c *gin.Context) {
 // ==========================================
 
 type VerifyPasscodeRequest struct {
-	Passcode   string `json:"passcode" binding:"required"`
-	DeviceName string `json:"device_name"`
+	Passcode    string `json:"passcode" binding:"required"`
+	DeviceName  string `json:"device_name"`
+	Platform    string `json:"platform"`
+	DeviceModel string `json:"device_model"`
 }
 
 // HashPasscode 使用 bcrypt 进行加盐慢哈希加密 (杜绝彩虹表与硬件离线爆破)
@@ -476,7 +492,7 @@ var verifyPasscodeLimiter = &ipAttemptTracker{
 	attempts: make(map[string][]time.Time),
 }
 
-// VerifyPasscode 校验 site_configs.master_passcode 的哈希（bcrypt / SHA-256），限速防爆破并签发 Web 设备凭据 (BE-18)
+// VerifyPasscode 校验 site_configs.master_passcode 的哈希（bcrypt / SHA-256），限速防爆破并签发设备凭据 (BE-18)
 func VerifyPasscode(c *gin.Context) {
 	if !verifyPasscodeLimiter.checkRateLimit(c.ClientIP(), 5, time.Minute) {
 		Error(c, http.StatusTooManyRequests, "密码尝试过于频繁，请稍后再试")
@@ -517,17 +533,35 @@ func VerifyPasscode(c *gin.Context) {
 	now := time.Now()
 	rawToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
 	tokenHash := middleware.HashToken(rawToken)
-	deviceName := strings.TrimSpace(req.DeviceName)
-	if deviceName == "" {
-		deviceName = "Web 浏览器 · 主人密钥登录"
+
+	platform := strings.ToLower(strings.TrimSpace(req.Platform))
+	if platform == "" {
+		platform = "web"
 	}
 
-	// RC-82: 检查是否已存在同平台同名的 Web 登录设备记录，避免同一浏览器重复登录无限累积记录
+	deviceName := strings.TrimSpace(req.DeviceName)
+	if deviceName == "" {
+		switch platform {
+		case "macos":
+			deviceName = "Mac · 主人密钥登录"
+		case "ios":
+			deviceName = "iOS 设备 · 主人密钥登录"
+		case "android":
+			deviceName = "Android 设备 · 主人密钥登录"
+		default:
+			deviceName = "Web 浏览器 · 主人密钥登录"
+		}
+	}
+
+	// 检查是否已存在同平台同名的设备记录，避免同一客户端重复登录无限累积记录
 	var existingDevice models.Device
-	if err := db.DB.Where("platform = ? AND name = ?", "web", deviceName).Limit(1).Find(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
+	if err := db.DB.Where("platform = ? AND name = ?", platform, deviceName).Limit(1).Find(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
 		existingDevice.TokenHash = tokenHash
 		existingDevice.Status = "active"
 		existingDevice.LastActiveAt = now
+		if req.DeviceModel != "" {
+			existingDevice.DeviceModel = strings.TrimSpace(req.DeviceModel)
+		}
 		if err := db.DB.Save(&existingDevice).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "更新设备凭证失败: "+err.Error())
 			return
@@ -539,16 +573,19 @@ func VerifyPasscode(c *gin.Context) {
 				"token":       rawToken,
 				"device_id":   existingDevice.DeviceID,
 				"device_name": existingDevice.Name,
+				"platform":    existingDevice.Platform,
 			},
 		})
 		return
 	}
 
-	deviceID := fmt.Sprintf("dev_web_%s_%s", now.Format("20060102"), generateRandomHex(2))
+	dateTag := now.Format("20060102")
+	deviceID := fmt.Sprintf("dev_%s_%s_%s", platform, dateTag, generateRandomHex(2))
 	device := models.Device{
 		DeviceID:     deviceID,
 		Name:         deviceName,
-		Platform:     "web",
+		Platform:     platform,
+		DeviceModel:  strings.TrimSpace(req.DeviceModel),
 		TokenHash:    tokenHash,
 		Status:       "active",
 		PairedAt:     now,
@@ -566,6 +603,7 @@ func VerifyPasscode(c *gin.Context) {
 			"token":       rawToken,
 			"device_id":   deviceID,
 			"device_name": deviceName,
+			"platform":    platform,
 		},
 	})
 }

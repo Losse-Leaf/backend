@@ -209,7 +209,27 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			t.Fatalf("expected trimmed name 'Studio MacBook Pro M3', got '%s'", res.Data.Name)
 		}
 
-		// Empty name should return 400
+		// Update platform and device_model
+		updatePlatformBody, _ := json.Marshal(map[string]string{
+			"platform":     "macos",
+			"device_model": "MacBook Air",
+		})
+		platReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(updatePlatformBody))
+		platReq.Header.Set("Content-Type", "application/json")
+		platW := httptest.NewRecorder()
+		r.ServeHTTP(platW, platReq)
+		if platW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on platform update, got %d", platW.Code)
+		}
+		var platRes struct {
+			Data models.Device `json:"data"`
+		}
+		_ = json.Unmarshal(platW.Body.Bytes(), &platRes)
+		if platRes.Data.Platform != "macos" || platRes.Data.DeviceModel != "MacBook Air" {
+			t.Fatalf("expected platform 'macos' and model 'MacBook Air', got %+v", platRes.Data)
+		}
+
+		// Empty name, platform, and model should return 400
 		emptyBody, _ := json.Marshal(map[string]string{"name": "   "})
 		badReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(emptyBody))
 		badReq.Header.Set("Content-Type", "application/json")
@@ -279,6 +299,43 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			if strings.Contains(c.IP, "127.0.0.1") || strings.Contains(c.IP, "172.18.0.1") {
 				t.Fatalf("unexpected loopback or virtual tunnel IP in candidates: %+v", c)
 			}
+		}
+	})
+
+	t.Run("9. VerifyPasscode with macos platform", func(t *testing.T) {
+		var cfg models.SiteConfig
+		db.DB.FirstOrCreate(&cfg)
+		hash, _ := HashPasscode("master-password-123")
+		cfg.MasterPasscode = hash
+		db.DB.Save(&cfg)
+
+		r.POST("/api/v1/auth/verify", VerifyPasscode)
+		verifyBody, _ := json.Marshal(map[string]string{
+			"passcode":     "master-password-123",
+			"device_name":  "MacBook Air · macOS",
+			"platform":     "macos",
+			"device_model": "Mac",
+		})
+		vReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/verify", bytes.NewReader(verifyBody))
+		vReq.Header.Set("Content-Type", "application/json")
+		vW := httptest.NewRecorder()
+		r.ServeHTTP(vW, vReq)
+		if vW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on verify with macos platform, got %d: %s", vW.Code, vW.Body.String())
+		}
+		var vRes struct {
+			Data struct {
+				DeviceID   string `json:"device_id"`
+				DeviceName string `json:"device_name"`
+				Platform   string `json:"platform"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(vW.Body.Bytes(), &vRes)
+		if !strings.HasPrefix(vRes.Data.DeviceID, "dev_macos_") {
+			t.Fatalf("expected dev_macos_ prefix, got %s", vRes.Data.DeviceID)
+		}
+		if vRes.Data.Platform != "macos" {
+			t.Fatalf("expected macos platform, got %s", vRes.Data.Platform)
 		}
 	})
 

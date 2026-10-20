@@ -164,7 +164,8 @@ func AssembleInstallmentTransaction(
 type CreditChannelRequest struct {
 	Code         string `json:"code"`
 	Name         string `json:"name" binding:"required"`
-	RepaymentDay int    `json:"repayment_day" binding:"required"` // 1~31
+	// MOB-P1-35：省略即默认 10 号
+	RepaymentDay int    `json:"repayment_day"` // 1~31
 	Color        string `json:"color"`
 }
 
@@ -192,7 +193,12 @@ func CreateCreditChannel(c *gin.Context) {
 		return
 	}
 
-	if req.RepaymentDay < 1 || req.RepaymentDay > 31 {
+	// MOB-P1-35：省略还款日（0）时回落到默认 10 号
+	repaymentDay := req.RepaymentDay
+	if repaymentDay == 0 {
+		repaymentDay = 10
+	}
+	if repaymentDay < 1 || repaymentDay > 31 {
 		Error(c, http.StatusBadRequest, "每月还款日必须在 1 至 31 日之间")
 		return
 	}
@@ -218,7 +224,7 @@ func CreateCreditChannel(c *gin.Context) {
 	ch := models.CreditChannel{
 		Code:         code,
 		Name:         name,
-		RepaymentDay: req.RepaymentDay,
+		RepaymentDay: repaymentDay,
 		IsBuiltin:    false,
 		Color:        color,
 	}

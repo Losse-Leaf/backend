@@ -348,7 +348,8 @@ func SetInitialLiquidBalance(c *gin.Context) {
 // AddGearAssetRequest 录入新设备单品请求 (RC-53)
 type AddGearAssetRequest struct {
 	Name                   string `json:"name" binding:"required"`
-	Category               string `json:"category" binding:"required"`
+	// MOB-P1-35：省略即默认「数码器材」
+	Category               string `json:"category"`
 	Spec                   string `json:"spec"`
 	PriceCents             int64  `json:"price_cents"`
 	PurchaseDate           string `json:"purchase_date"`
@@ -382,11 +383,17 @@ func AddGearAsset(c *gin.Context) {
 	}
 
 	gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
+	// MOB-P1-35：省略分类时回落到默认「数码器材」
+	gearCategory := strings.TrimSpace(req.Category)
+	if gearCategory == "" {
+		gearCategory = "数码器材"
+	}
+
 	newGear := models.GearItem{
 		ID:           gearID,
 		Name:         strings.TrimSpace(req.Name),
 		Spec:         strings.TrimSpace(req.Spec),
-		Category:     strings.TrimSpace(req.Category),
+		Category:     gearCategory,
 		Status:       "active",
 		PriceCents:   req.PriceCents,
 		PurchaseDate: purchaseDate,

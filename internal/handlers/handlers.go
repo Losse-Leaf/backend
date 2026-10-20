@@ -208,7 +208,10 @@ func populateEntryURLsBatch(entries []models.LifeEntry) {
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
-	Type          string `json:"type" binding:"required"` // life, travel, project, wish
+	// MOB-P1-35：不再 binding:"required" —— 省略即默认 life。
+	// 客户端（Android/macOS/Web）统一采用「省略等于默认值」的编码约定后，
+	// 把 type 标成必填会让**省略 type 的合法请求**直接 400。
+	Type          string `json:"type"` // life, travel, project, wish
 	Title         string `json:"title"`
 	Content       string `json:"content" binding:"required"`
 	OccurredAt    string `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
@@ -294,8 +297,14 @@ func CreateLifeEntry(c *gin.Context) {
 		}
 	}
 
+	// MOB-P1-35：省略 type 时回落到默认 life（与客户端默认值保持一致）
+	entryType := strings.TrimSpace(req.Type)
+	if entryType == "" {
+		entryType = "life"
+	}
+
 	entry := models.LifeEntry{
-		Type:        req.Type,
+		Type:        entryType,
 		Title:       title,
 		Content:     content,
 		OccurredAt:  occurred,
@@ -362,11 +371,8 @@ func GetLifeEntriesV1(c *gin.Context) {
 	query := dbScope.Model(&models.LifeEntry{}).
 		Order("occurred_at DESC, id DESC")
 
-	if sinceStr != "" {
-		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
-			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
-		}
-	}
+	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
+	query = applySyncSince(query, sinceStr)
 
 	if entryType != "" && entryType != "all" {
 		query = query.Where("type = ?", entryType)
@@ -426,6 +432,9 @@ func GetLifeEntriesV1(c *gin.Context) {
 	}
 	etag := fmt.Sprintf(`W/"%d-%d"`, total, maxUpdated.UnixMilli())
 	c.Header("ETag", etag)
+
+	// MOB-P1-36：服务端权威增量游标（客户端可直接回传为 ?since=）
+	setSyncCursor(c, entriesSyncCursor(entries))
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -880,7 +889,8 @@ func GetStorageStatus(c *gin.Context) {
 
 type TransactionRequest struct {
 	Amount        int64  `json:"amount" binding:"required"` // 分
-	Type          string `json:"type" binding:"required"`   // income, expense
+	// MOB-P1-35：省略即默认 expense（与客户端默认值保持一致）
+	Type          string `json:"type"` // income, expense
 	Category      string `json:"category" binding:"required"`
 	Title         string `json:"title"`
 	Note          string `json:"note"`
@@ -914,9 +924,15 @@ func CreateTransaction(c *gin.Context) {
 	occurred, _ := ParseFlexTime(req.OccurredAt)
 	cleanCityCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", req.Title+" "+req.Note)
 
+	// MOB-P1-35：省略 type 时回落到默认 expense
+	txType := strings.TrimSpace(req.Type)
+	if txType == "" {
+		txType = "expense"
+	}
+
 	tx := models.Transaction{
 		Amount:        req.Amount,
-		Type:          req.Type,
+		Type:          txType,
 		Category:      strings.TrimSpace(req.Category),
 		Title:         strings.TrimSpace(req.Title),
 		Note:          strings.TrimSpace(req.Note),
@@ -1011,11 +1027,8 @@ func GetTransactions(c *gin.Context) {
 
 	query := dbScope.Model(&models.Transaction{}).Order("occurred_at DESC, id DESC")
 
-	if sinceStr != "" {
-		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
-			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
-		}
-	}
+	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
+	query = applySyncSince(query, sinceStr)
 
 	if yearStr != "" {
 		y, err := strconv.Atoi(yearStr)
@@ -1075,6 +1088,9 @@ func GetTransactions(c *gin.Context) {
 	}
 	etag := fmt.Sprintf(`W/"%d-%d"`, len(txs), maxUpdated.UnixMilli())
 	c.Header("ETag", etag)
+
+	// MOB-P1-36：服务端权威增量游标（客户端可直接回传为 ?since=）
+	setSyncCursor(c, maxUpdated)
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -1268,6 +1284,12 @@ func CreateProject(c *gin.Context) {
 		return
 	}
 
+	// MOB-P1-35：省略 status 时回落到默认「进行中」
+	projectStatus := strings.TrimSpace(req.Status)
+	if projectStatus == "" {
+		projectStatus = "进行中"
+	}
+
 	p := models.Project{
 		Title:       title,
 		Subtitle:    strings.TrimSpace(req.Subtitle),
@@ -1275,7 +1297,7 @@ func CreateProject(c *gin.Context) {
 		Story:       strings.TrimSpace(req.Story),
 		Category:    strings.TrimSpace(req.Category),
 		GithubURL:   strings.TrimSpace(req.GithubURL),
-		Status:      strings.TrimSpace(req.Status),
+		Status:      projectStatus,
 		Featured:    req.Featured,
 		Order:       req.Order,
 	}
@@ -1330,11 +1352,8 @@ func GetProjectsV1(c *gin.Context) {
 
 	query := dbScope.Model(&models.Project{}).Order("`order` ASC, id DESC")
 
-	if sinceStr != "" {
-		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
-			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
-		}
-	}
+	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
+	query = applySyncSince(query, sinceStr)
 
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
 	if limit > 1000 {
@@ -1362,6 +1381,9 @@ func GetProjectsV1(c *gin.Context) {
 	}
 	etag := fmt.Sprintf(`W/"%d-%d"`, len(projects), maxUpdated.UnixMilli())
 	c.Header("ETag", etag)
+
+	// MOB-P1-36：服务端权威增量游标
+	setSyncCursor(c, maxUpdated)
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -1570,7 +1592,7 @@ func InvalidateStatsCache() {
 }
 
 func GetGlobalStats(c *gin.Context) {
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	isAdmin := middleware.IsAdmin(c)
 
 	now := time.Now()
@@ -1663,7 +1685,7 @@ func GetConfigV1(c *gin.Context) {
 			DefaultLocation: "",
 		}
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	if !middleware.IsAdmin(c) {
 		config.InitialLiquidBalance = 0
 	}
@@ -1787,7 +1809,7 @@ func GlobalSearch(c *gin.Context) {
 		projects = []models.Project{}
 	}
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	Success(c, gin.H{
 		"query":      q,
 		"entries":    entries,

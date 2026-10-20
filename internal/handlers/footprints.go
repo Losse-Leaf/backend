@@ -422,11 +422,8 @@ func GetFootprints(c *gin.Context) {
 
 	query := dbScope.Model(&models.Footprint{}).Order("visited_at DESC, id DESC")
 
-	if sinceStr != "" {
-		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
-			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
-		}
-	}
+	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
+	query = applySyncSince(query, sinceStr)
 
 	if cityCode != "" {
 		query = query.Where("city_code = ?", cityCode)
@@ -464,6 +461,9 @@ func GetFootprints(c *gin.Context) {
 	}
 	etag := fmt.Sprintf(`W/"%d-%d"`, len(footprints), maxUpdated.UnixMilli())
 	c.Header("ETag", etag)
+
+	// MOB-P1-36：服务端权威增量游标
+	setSyncCursor(c, maxUpdated)
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -987,7 +987,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		return txs
 	})
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	Success(c, gin.H{
 		"city_code": cityCode,
 		"city_name": cityName,
@@ -1181,7 +1181,7 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		return txs
 	})
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	Success(c, gin.H{
 		"province_adcode": provAdcode,
 		"province_name":   provName,

@@ -293,6 +293,11 @@ func ConfirmPairing(c *gin.Context) {
 		hubURL = resolveHubURL(c)
 	}
 
+	// MOB-P1-69：配对成功的浏览器直接拿到 HttpOnly 会话 Cookie，
+	// 令牌不必再由前端写入 localStorage（JS 读不到 ⇒ 一次 XSS 也偷不走）。
+	// 原生端（Android / macOS）用请求头带令牌，Cookie 对它们无影响。
+	middleware.SetSessionCookie(c, rawDeviceToken)
+
 	c.JSON(http.StatusOK, Response{
 		Code:    http.StatusOK,
 		Message: "device paired successfully",
@@ -351,6 +356,9 @@ func PollPairingStatus(c *gin.Context) {
 		if webToken != "" {
 			// 单次读取后立即清除数据库中的伴生明文令牌，防止重放泄露 (BE-19)
 			db.DB.Model(&ticket).Update("web_token", "")
+			// MOB-P1-69：伴生令牌同时下发 HttpOnly 会话 Cookie ——
+			// 浏览器端从此不必把令牌写进 localStorage
+			middleware.SetSessionCookie(c, webToken)
 		}
 
 		Success(c, gin.H{
@@ -566,6 +574,9 @@ func VerifyPasscode(c *gin.Context) {
 			Error(c, http.StatusInternalServerError, "更新设备凭证失败: "+err.Error())
 			return
 		}
+		// MOB-P1-69：同步下发 HttpOnly 会话 Cookie（浏览器端不再需要把令牌落盘）
+		middleware.SetSessionCookie(c, rawToken)
+
 		c.JSON(http.StatusOK, Response{
 			Code:    http.StatusOK,
 			Message: "密钥验证通过，已授权以主人身份进入",
@@ -596,6 +607,9 @@ func VerifyPasscode(c *gin.Context) {
 		return
 	}
 
+	// MOB-P1-69：同步下发 HttpOnly 会话 Cookie
+	middleware.SetSessionCookie(c, rawToken)
+
 	c.JSON(http.StatusOK, Response{
 		Code:    http.StatusOK,
 		Message: "密钥验证通过，已授权以主人身份进入",
@@ -606,4 +620,38 @@ func VerifyPasscode(c *gin.Context) {
 			"platform":    platform,
 		},
 	})
+}
+
+// ==========================================
+// 4. 会话探针与登出 (MOB-P1-69)
+// ==========================================
+
+// GetSessionStatus 探测当前请求是否具备主理人权限
+//
+// GET /api/v1/auth/session
+//
+// 浏览器端把令牌放进 HttpOnly Cookie 后，JS 读不到令牌本身，
+// 但仍需要知道「当前是不是主人」来决定是否渲染私密 UI。
+// 这个公开探针只回传角色，不回传任何凭据。
+func GetSessionStatus(c *gin.Context) {
+	isAdmin := middleware.IsAdmin(c)
+	role := "guest"
+	if isAdmin {
+		role = "admin"
+	}
+	Success(c, gin.H{
+		"is_admin": isAdmin,
+		"role":     role,
+	})
+}
+
+// LogoutSession 登出：清除会话 Cookie
+//
+// POST /api/v1/auth/logout
+//
+// 只清浏览器侧的 Cookie，不吊销设备记录 ——
+// 设备吊销是「主人显式操作」，那是另一条既有接口（DELETE /auth/devices/:id）。
+func LogoutSession(c *gin.Context) {
+	middleware.ClearSessionCookie(c)
+	Success(c, gin.H{"logged_out": true})
 }

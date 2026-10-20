@@ -70,7 +70,8 @@ func populateWishURLsBatch(wishes []models.Wish) {
 // CreateWishRequest 新建心愿请求
 type CreateWishRequest struct {
 	Title         string `json:"title" binding:"required"`
-	Kind          string `json:"kind" binding:"required"` // item | travel | milestone
+	// MOB-P1-35：省略即默认 item
+	Kind          string `json:"kind"` // item | travel | milestone
 	Note          string `json:"note"`
 	Spec          string `json:"spec"`
 	CityCode      string `json:"city_code"`
@@ -138,11 +139,8 @@ func GetWishes(c *gin.Context) {
 
 	query := dbScope.Model(&models.Wish{}).Order("created_at DESC, id DESC")
 
-	if sinceStr != "" {
-		if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
-			query = query.Where("updated_at > ? OR deleted_at > ?", sinceTime, sinceTime)
-		}
-	}
+	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
+	query = applySyncSince(query, sinceStr)
 
 	if kind != "" && kind != "all" {
 		query = query.Where("kind = ?", kind)
@@ -188,7 +186,10 @@ func GetWishes(c *gin.Context) {
 	}
 	etag := fmt.Sprintf(`W/"%d-%d-%s"`, total, maxUpdated.UnixMilli(), role)
 	c.Header("ETag", etag)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+
+	// MOB-P1-36：服务端权威增量游标
+	setSyncCursor(c, maxUpdated)
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
@@ -212,7 +213,7 @@ func GetWishByID(c *gin.Context) {
 		return
 	}
 	populateWishURLs(&w)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key")
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	if !middleware.IsAdmin(c) {
 		w.ActualCost = 0
 		w.TransactionID = nil
@@ -236,9 +237,15 @@ func CreateWish(c *gin.Context) {
 		}
 	}
 
+	// MOB-P1-35：省略 kind 时回落到默认 item
+	wishKind := strings.TrimSpace(req.Kind)
+	if wishKind == "" {
+		wishKind = "item"
+	}
+
 	wish := models.Wish{
 		Title:      strings.TrimSpace(req.Title),
-		Kind:       strings.TrimSpace(req.Kind),
+		Kind:       wishKind,
 		Note:       strings.TrimSpace(req.Note),
 		Spec:       strings.TrimSpace(req.Spec),
 		CityCode:   strings.TrimSpace(req.CityCode),

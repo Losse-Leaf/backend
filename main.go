@@ -105,6 +105,10 @@ func main() {
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
 		v1.GET("/auth/pair/status", handlers.PollPairingStatus)
 		v1.GET("/auth/pair/qr", handlers.RenderPairQRCode)
+		// 会话探针与登出 (MOB-P1-69)：浏览器端用 HttpOnly Cookie 承载令牌后，
+		// 需要一个不回传凭据的接口来判断「当前是不是主人」
+		v1.GET("/auth/session", handlers.GetSessionStatus)
+		v1.POST("/auth/logout", handlers.LogoutSession)
 
 		// 统一文件临时签名接口 (公开只读，供各端获取动态有效访问 URL)
 		v1.GET("/files/sign", handlers.SignFileURL)

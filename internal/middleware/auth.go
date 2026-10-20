@@ -19,8 +19,19 @@ func HashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer, X-Device-Token 与 X-Admin-Key 请求头)
+// SessionCookieName 会话 Cookie 名 (MOB-P1-69)
+// 浏览器端用它承载设备子钥匙，从而让令牌彻底不落在 localStorage / 可被脚本读取的位置。
+const SessionCookieName = "looseleaf_session"
+
+// sessionCookieMaxAge 会话 Cookie 有效期 (30 天)
+const sessionCookieMaxAge = 30 * 24 * 3600
+
+// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer, X-Device-Token、X-Admin-Key 请求头与 Cookie)
 // 安全规范：严禁通过 URL Query 参数传递 Token，防止凭据泄露至访问日志、反代日志与 Referer
+//
+// MOB-P1-69：Cookie 作为**兜底**通道，优先级排在三个请求头之后 ——
+// 这样现有 Android / macOS 客户端（都用请求头）的行为一字不变，
+// 而浏览器端可以把令牌放进 HttpOnly Cookie（JS 读不到 ⇒ 一次 XSS 也偷不走）。
 func ExtractToken(c *gin.Context) string {
 	authHeader := c.GetHeader("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
@@ -32,7 +43,48 @@ func ExtractToken(c *gin.Context) string {
 	if t := strings.TrimSpace(c.GetHeader("X-Admin-Key")); t != "" {
 		return t
 	}
+	// MOB-P1-69：Cookie 兜底
+	if ck, err := c.Cookie(SessionCookieName); err == nil {
+		if t := strings.TrimSpace(ck); t != "" {
+			return t
+		}
+	}
 	return ""
+}
+
+// SetSessionCookie 下发 HttpOnly 会话 Cookie (MOB-P1-69)
+//
+// Secure 由实际传输协议决定（直连 TLS 或反代透传 X-Forwarded-Proto）——
+// 局域网纯 HTTP 部署时若硬置 Secure=true，浏览器会直接拒收，登录反而失效。
+func SetSessionCookie(c *gin.Context, token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+	secure := c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   sessionCookieMaxAge,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// ClearSessionCookie 清除会话 Cookie (登出, MOB-P1-69)
+func ClearSessionCookie(c *gin.Context) {
+	secure := c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // isSystemInitialized 检查系统是否已完成初次装帧并绑定激活首台设备 (BE-18, BE-19)

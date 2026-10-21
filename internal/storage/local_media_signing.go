@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -75,13 +76,25 @@ func MediaSigningSecret() []byte {
 	return []byte(mediaSigningSecret)
 }
 
-// computeMediaSignature 计算某个对象键在某个时刻的签名
-func computeMediaSignature(objectKey string, expiresAt int64) string {
+// computeMediaSignature 计算某个资源在某个时刻的签名
+//
+// resource 是资源的「身份串」：
+//   - 本机媒体： "media:" + objectKey
+//   - 缩略图：   "thumb:" + objectKey + ":" + width
+func computeMediaSignature(resource string, expiresAt int64) string {
 	mac := hmac.New(sha256.New, MediaSigningSecret())
-	mac.Write([]byte(objectKey))
+	mac.Write([]byte(resource))
 	mac.Write([]byte{0})
 	mac.Write([]byte(strconv.FormatInt(expiresAt, 10)))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// 本机媒体资源的身份串
+func mediaResource(objectKey string) string { return "media:" + objectKey }
+
+// 缩略图资源的身份串
+func thumbnailResource(objectKey string, width int) string {
+	return fmt.Sprintf("thumb:%s:%d", objectKey, width)
 }
 
 // SignLocalMediaURL 生成本机媒体的签名访问 URL
@@ -97,7 +110,7 @@ func SignLocalMediaURL(objectKey string, customDuration ...time.Duration) string
 		ttl = customDuration[0]
 	}
 	expiresAt := time.Now().Add(ttl).Unix()
-	sig := computeMediaSignature(objectKey, expiresAt)
+	sig := computeMediaSignature(mediaResource(objectKey), expiresAt)
 	return fmt.Sprintf("/media/%s?%s=%d&%s=%s",
 		objectKey,
 		mediaSignatureParamExpires, expiresAt,
@@ -130,8 +143,44 @@ func VerifyLocalMediaSignature(objectKey string, expRaw string, sigRaw string) b
 	if time.Now().Unix() > expiresAt {
 		return false
 	}
-	expected := computeMediaSignature(objectKey, expiresAt)
+	expected := computeMediaSignature(mediaResource(objectKey), expiresAt)
 	return hmac.Equal([]byte(expected), []byte(sigRaw))
+}
+
+// SignLocalThumbnailURL 生成缩略图的签名访问 URL
+//
+// 关键：缩略图路由也必须签名 —— 否则它就是一个公开的「按 key 取图」接口，
+// 任何知道 object_key 的人都能拿到你的相纸。
+func SignLocalThumbnailURL(objectKey string, width int) string {
+	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
+	if objectKey == "" {
+		return ""
+	}
+	if width <= 0 {
+		width = 480
+	}
+	expiresAt := time.Now().Add(mediaSignatureTTL).Unix()
+	sig := computeMediaSignature(thumbnailResource(objectKey, width), expiresAt)
+	return fmt.Sprintf("/api/v1/files/thumbnail?key=%s&w=%d&%s=%d&%s=%s",
+		url.QueryEscape(objectKey), width,
+		mediaSignatureParamExpires, expiresAt,
+		mediaSignatureParamSig, sig)
+}
+
+// VerifyLocalThumbnailSignature 校验缩略图访问请求
+func VerifyLocalThumbnailSignature(objectKey string, width int, expRaw string, sigRaw string) bool {
+	if objectKey == "" {
+		return false
+	}
+	expiresAt, err := strconv.ParseInt(strings.TrimSpace(expRaw), 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix() > expiresAt {
+		return false
+	}
+	expected := computeMediaSignature(thumbnailResource(objectKey, width), expiresAt)
+	return hmac.Equal([]byte(expected), []byte(strings.TrimSpace(sigRaw)))
 }
 
 // LocalMediaPathFromRequest 从请求路径里取出对象键，并做穿越防护

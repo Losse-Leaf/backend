@@ -24,11 +24,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"image"
-	"image/jpeg"
 	_ "image/gif"
+	"image/jpeg"
 	_ "image/png"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,6 +38,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/image/draw"
 
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/storage"
 )
 
@@ -156,6 +156,9 @@ func ThumbnailFile(c *gin.Context) {
 		return
 	}
 
+	// 关键：校验签名（或有效的设备令牌 / 会话 Cookie）。
+	// 缩略图与本机媒体是同一套访问控制 ——
+	// 否则它就是一个公开的「按 key 取图」接口。
 	width := thumbnailDefaultWidth
 	if raw := strings.TrimSpace(c.Query("w")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
@@ -165,6 +168,18 @@ func ThumbnailFile(c *gin.Context) {
 	if width > thumbnailMaxWidth {
 		width = thumbnailMaxWidth
 	}
+	authorized := middleware.IsAdmin(c)
+	if !authorized {
+		authorized = storage.VerifyLocalThumbnailSignature(
+			objectKey, width,
+			c.Query("exp"),
+			c.Query("sig"),
+		)
+	}
+	if !authorized {
+		Error(c, http.StatusUnauthorized, "需要有效签名或授权才能访问缩略图")
+		return
+	}
 
 	cacheKey := thumbnailCacheKey(objectKey, width)
 
@@ -173,7 +188,7 @@ func ThumbnailFile(c *gin.Context) {
 	entry, ok := thumbnailMemory[cacheKey]
 	thumbnailMemoryMu.RUnlock()
 	if ok && entry.expiresAt.After(time.Now()) {
-	 serveThumbnail(c, entry.data, cacheKey)
+		serveThumbnail(c, entry.data, cacheKey)
 		return
 	}
 
@@ -243,5 +258,8 @@ func ThumbnailURLFor(objectKey string, width int) string {
 	if width <= 0 {
 		width = thumbnailDefaultWidth
 	}
-	return fmt.Sprintf("/api/v1/files/thumbnail?key=%s&w=%d", url.QueryEscape(objectKey), width)
+	// 关键：缩略图地址也**必须签名** ——
+	// 否则它就是一个公开的「按 key 取图」接口，
+	// 任何知道 object_key 的人都能拿到你的相纸。
+	return storage.SignLocalThumbnailURL(objectKey, width)
 }

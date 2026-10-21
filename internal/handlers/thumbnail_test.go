@@ -58,11 +58,11 @@ func TestCreateLifeEntryDerivesTitleFromContent(t *testing.T) {
 	// 预置一个管理员设备令牌
 	token := "lldt_test_derive_title"
 	device := models.Device{
-		DeviceID: "dev_derive_title",
-		Name:     "测试设备",
-		Platform: "macos",
+		DeviceID:  "dev_derive_title",
+		Name:      "测试设备",
+		Platform:  "macos",
 		TokenHash: middleware.HashToken(token),
-		Status:   "active",
+		Status:    "active",
 	}
 	if err := db.DB.Create(&device).Error; err != nil {
 		t.Fatalf("创建设备失败: %v", err)
@@ -126,9 +126,20 @@ func TestThumbnailEndpointDownscales(t *testing.T) {
 	r := gin.New()
 	r.GET("/api/v1/files/thumbnail", ThumbnailFile)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/thumbnail?key="+key+"&w=320", nil)
+	// 关键：缩略图地址也**必须签名** ——
+	// 否则它就是一个公开的「按 key 取图」接口。
+	signedURL := storage.SignLocalThumbnailURL(key, 320)
+	req := httptest.NewRequest(http.MethodGet, signedURL, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+
+	// 对照：裸路径（无签名）必须被拒绝
+	plainReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/thumbnail?key="+key+"&w=320", nil)
+	plainW := httptest.NewRecorder()
+	r.ServeHTTP(plainW, plainReq)
+	if plainW.Code != http.StatusUnauthorized {
+		t.Errorf("无签名的缩略图请求应当被拒绝，实际 %d", plainW.Code)
+	}
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("缩略图接口失败: %d %s", w.Code, w.Body.String())

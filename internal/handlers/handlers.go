@@ -1161,7 +1161,19 @@ func UpdateTransaction(c *gin.Context) {
 	}
 
 	tx.Amount = req.Amount
-	tx.Type = req.Type
+	// MOB-P1-xx：type 为空时**保持原值**，不能写成空串。
+	//
+	// 客户端用 encodeDefaults=false，等于默认值（expense）的字段会被整个省略 ⇒
+	// PUT 请求体里根本没有 type 键 ⇒ req.Type 绑定成 ""。
+	// 原先直接 `tx.Type = req.Type` ⇒ 支出账目编辑一次就从服务端消失了
+	// （不命中任何 type='expense' 的过滤，支出统计与日合计随之失真），
+	// 而本地还是乐观写回的 "expense" ⇒ 两端分叉，下一轮拉取才把空串同步回去。
+	//
+	// Update 的语义本就是「部分更新」：空串表示「这次没带这个字段」，
+	// 于是保留原值（而不是回落成默认 expense —— 那样会把 income 账目错改成 expense）。
+	if txType := strings.TrimSpace(req.Type); txType != "" {
+		tx.Type = txType
+	}
 	tx.Category = strings.TrimSpace(req.Category)
 	tx.Title = strings.TrimSpace(req.Title)
 	tx.Note = strings.TrimSpace(req.Note)

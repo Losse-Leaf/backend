@@ -596,3 +596,61 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 		t.Errorf("expected projects matching '西湖'")
 	}
 }
+
+// MOB-P1-xx：编辑账目时若请求体**没带 type**，服务端必须**保留原值**。
+//
+// 踩过的坑：客户端开启了 encodeDefaults=false，等于默认值的字段会被整个省略 ⇒
+// PUT 请求体里没有 type 键 ⇒ req.Type 绑定成 ""。
+// 原先直接 `tx.Type = req.Type` ⇒ 支出账目编辑一次就变成空串，
+// 不再命中任何 type='expense' 的过滤 ⇒ 从支出统计与日合计里消失；
+// 而本地还是乐观写回的 "expense" ⇒ 两端分叉，下一轮拉取才把空串同步回去。
+//
+// Update 的语义本就是「部分更新」：空 = 这次没带这个字段 ⇒ 保留原值。
+func TestUpdateTransactionKeepsTypeWhenOmitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	r := gin.New()
+	r.POST("/api/v1/transactions", CreateTransaction)
+	r.PUT("/api/v1/transactions/:id", UpdateTransaction)
+
+	// 建一笔 expense
+	body, _ := json.Marshal(TransactionRequest{
+		Amount:        2500,
+		Type:          "expense",
+		Category:      "餐饮",
+		Title:         "手冲咖啡",
+		OccurredAt:    "2026-10-10 10:00:00",
+		PaymentMethod: "wechat",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/transactions", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to create transaction: %d %s", w.Code, w.Body.String())
+	}
+
+	// 编辑：金额改了，但**不带 type**（模拟 encodeDefaults=false 省略了默认值字段）
+	updateBody := []byte(`{"amount":3000,"category":"餐饮","title":"手冲咖啡（改）","occurred_at":"2026-10-10 10:00:00"}`)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPut, "/api/v1/transactions/1", bytes.NewBuffer(updateBody))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to update transaction: %d %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Data models.Transaction `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response: %v (%s)", err, w.Body.String())
+	}
+	if resp.Data.Type != "expense" {
+		t.Fatalf("省略 type 时应保留原值 expense，实际得到 %q", resp.Data.Type)
+	}
+	if resp.Data.Amount != 3000 {
+		t.Fatalf("金额应当被更新为 3000，实际 %d", resp.Data.Amount)
+	}
+}

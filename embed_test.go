@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,50 @@ func TestFrontendStaticServingAPIIsolation(t *testing.T) {
 	}
 	if w404.Header().Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("expected application/json, got %s", w404.Header().Get("Content-Type"))
+	}
+}
+
+// MOB-P1-xx：Service Worker 的文件必须能按**原路径**取到，不能落进 SPA 回退。
+//
+// 踩过的坑：本地磁盘分支只白名单了 favicon / manifest / robots 几个文件，
+// 于是 /registerSW.js、/sw.js、/workbox-xxx.js 全部走 NoRoute ⇒ 返回 index.html
+// （HTML！）⇒ 浏览器报 "SyntaxError: Unexpected token '<'"
+// ⇒ **Service Worker 注册失败**，PWA 的离线能力整个不生效。
+//
+// 这条测试守住「这些路径返回的是 JS/图标，不是 HTML」。
+func TestFrontendStaticServingServiceWorkerAssets(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	setupFrontendStaticServing(r)
+
+	// 这些路径在**嵌入副本**里都存在（backend/web/dist 由 //go:embed 带入），
+	// 因此无论走本地磁盘还是嵌入分支，都必须能被正确取到。
+	cases := []struct {
+		path        string
+		contentType string
+	}{
+		{"/registerSW.js", "javascript"},
+		{"/sw.js", "javascript"},
+		{"/manifest.webmanifest", "json"},
+	}
+
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: expected 200, got %d", tc.path, w.Code)
+			continue
+		}
+		ct := w.Header().Get("Content-Type")
+		if !strings.Contains(ct, tc.contentType) {
+			t.Errorf("%s: expected content-type containing %q, got %q", tc.path, tc.contentType, ct)
+		}
+		body := w.Body.String()
+		if strings.HasPrefix(strings.TrimSpace(body), "<") {
+			t.Errorf("%s: got HTML (SPA fallback) instead of the real asset — SW registration would fail", tc.path)
+		}
 	}
 }
 

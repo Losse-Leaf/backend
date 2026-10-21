@@ -323,11 +323,12 @@ func MigrateStorageMedia(c *gin.Context) {
 		if err != nil || rc == nil {
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
 			rc.Close()
 			continue
 		}
-		out, err := os.Create(localPath)
+		// 私密内容 0600
+		out, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
 			rc.Close()
 			continue

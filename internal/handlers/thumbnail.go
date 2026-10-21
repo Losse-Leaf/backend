@@ -100,7 +100,7 @@ func ensureThumbnailDiskDir() string {
 			base = abs
 		}
 		thumbnailDiskDir = filepath.Join(base, ".thumbnails")
-		_ = os.MkdirAll(thumbnailDiskDir, 0o755)
+		_ = os.MkdirAll(thumbnailDiskDir, 0o700)
 	})
 	return thumbnailDiskDir
 }
@@ -231,8 +231,8 @@ func ThumbnailFile(c *gin.Context) {
 	thumbnailMemory[cacheKey] = thumbnailEntry{data: data, expiresAt: time.Now().Add(30 * time.Minute)}
 	thumbnailMemoryMu.Unlock()
 
-	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err == nil {
-		_ = os.WriteFile(diskPath, data, 0o644)
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err == nil {
+		_ = os.WriteFile(diskPath, data, 0o600)
 	}
 
 	serveThumbnail(c, data, cacheKey)

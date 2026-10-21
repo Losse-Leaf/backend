@@ -98,7 +98,24 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 		}
 	}
 
-	// 将快照写入 ZIP: database/looseleaf.db
+	// 关键：**打包前先对快照副本脱敏**。
+	//
+	// 原先把 VACUUM 出来的**原始数据库**直接打进 ZIP，
+	// 而脱敏只作用于 metadata/data.json 那份镜像 ——
+	// 于是 `site_configs.r2_secret_access_key`（**明文**列）与
+	// 主理人口令哈希、以及全部私人内容都原样进了备份包。
+	// 拿到 ZIP = 同时拿到「所有散页正文/照片/账目」+「R2 桶的写权限密钥」
+	// +「可离线爆破的口令哈希」。
+	//
+	// 脱敏在**副本**上做，绝不碰线上库。
+	if err := sanitizeSnapshotDB(tempDBPath); err != nil {
+		// 脱敏失败宁可不打这一份，也不能带着密钥出去
+		zipWriter.Close()
+		tempZipFile.Close()
+		return nil, fmt.Errorf("备份脱敏失败，已中止打包: %w", err)
+	}
+
+	// 将**已脱敏**的快照写入 ZIP: database/looseleaf.db
 	if err := addFileToZip(zipWriter, tempDBPath, "database/looseleaf.db"); err != nil {
 		zipWriter.Close()
 		tempZipFile.Close()
@@ -247,7 +264,7 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	} else {
 		tempZipFile.Close()
 		localDir := GetLocalBackupDir()
-		if err := os.MkdirAll(localDir, 0755); err != nil {
+		if err := os.MkdirAll(localDir, 0700); err != nil {
 			return nil, fmt.Errorf("创建本地备份目录失败: %w", err)
 		}
 		targetPath := filepath.Join(localDir, filename)
@@ -502,6 +519,11 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 		log.Printf("[Backup] 生成当前在用库紧急保底副本失败: %v (继续执行)", err)
 	} else {
 		log.Printf("[Backup] 已生成当前在用库紧急保底副本: %s", emergencyBackupPath)
+		// 关键：**只保留最近一份**。
+		// 原先每执行一次「回滚还原」就在库旁多一个完整数据库副本
+		// （含全部私人内容与 R2 密钥），代码里**没有任何地方删除**它们 ——
+		// 10 次恢复就是 10 份全量档案堆积在磁盘上。
+		pruneEmergencyCopies(currentDBPath, 1)
 	}
 
 	// 4. 关闭旧连接池，清理残留 WAL / SHM 日志，覆写当前数据库文件
@@ -527,7 +549,7 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 			continue
 		}
 		targetPath := filepath.Join(localUploadDir, cleanRel)
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
 			_, _ = db.InitDB(currentDBPath)
 			return fmt.Errorf("创建媒体恢复目录失败: %w", err)
 		}
@@ -651,6 +673,70 @@ func addBytesToZip(zw *zip.Writer, content []byte, zipPath string) error {
 	return err
 }
 
+// pruneEmergencyCopies 只保留最近 N 份 pre-restore 紧急副本
+func pruneEmergencyCopies(dbPath string, keeping int) {
+	dir := filepath.Dir(dbPath)
+	base := filepath.Base(dbPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type item struct {
+		path string
+		mod  time.Time
+	}
+	var copies []item
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, base+".pre-restore-emergency-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		copies = append(copies, item{path: filepath.Join(dir, name), mod: info.ModTime()})
+	}
+	sort.Slice(copies, func(i, j int) bool { return copies[i].mod.After(copies[j].mod) })
+	for i, c := range copies {
+		if i < keeping {
+			continue
+		}
+		if err := os.Remove(c.path); err == nil {
+			log.Printf("[Backup] 已清理过期的紧急保底副本: %s", filepath.Base(c.path))
+		}
+	}
+}
+
+// sanitizeSnapshotDB 清空备份快照里的凭据字段
+//
+// 关键：在**副本**上执行，线上库绝不能被改动。
+// 需要清空的：
+//   - site_configs.master_passcode（主理人口令哈希，可离线爆破）
+//   - site_configs.r2_secret_access_key（R2 桶的写权限密钥，明文列）
+//   - site_configs.r2_access_key_id（配合上面的密钥即可完全控制桶）
+func sanitizeSnapshotDB(snapshotPath string) error {
+	conn, err := sql.Open("sqlite", snapshotPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	stmts := []string{
+		`UPDATE site_configs SET master_passcode = ''`,
+		`UPDATE site_configs SET r2_secret_access_key = ''`,
+		`UPDATE site_configs SET r2_access_key_id = ''`,
+		`UPDATE site_configs SET r2_password = ''`,
+	}
+	for _, stmt := range stmts {
+		// 表不存在 / 列不存在时忽略（不同版本列集合可能有差异）
+		if _, err := conn.Exec(stmt); err != nil {
+			log.Printf("[Backup] 脱敏语句执行失败（可忽略）: %v", err)
+		}
+	}
+	return nil
+}
+
 // 辅助工具：文件安全拷贝
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -659,7 +745,7 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
 		return err
 	}
 

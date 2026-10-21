@@ -24,15 +24,22 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	}
 
 	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// 关键：目录 0700 —— 数据库里存着 R2 桶的密钥与主理人口令哈希，
+	// 0755 意味着**同机的其它用户可以读到**。
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
+	// 已存在的目录也收紧一次（老部署可能是 0755）
+	_ = os.Chmod(dir, 0700)
 
 	// 启用 WAL 模式、5秒忙碌重试与普通同步模式，避免并发写锁死
 	dsn := dbPath
 	if !strings.Contains(dsn, "?") {
 		dsn += "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
 	}
+
+	// 数据库文件本身也收紧到 0600（SQLite 驱动按 umask 落地，可能是 0644）
+	_ = os.Chmod(dbPath, 0600)
 
 	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger:                                   logger.Default.LogMode(logger.Warn),

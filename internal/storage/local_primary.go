@@ -129,10 +129,12 @@ func writeLocalObject(objectKey string, reader io.Reader, size int64) error {
 	if target == "" {
 		return errors.New("对象路径越界，已拒绝写入")
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return fmt.Errorf("failed to create upload dir: %w", err)
 	}
-	outFile, err := os.Create(target)
+	// 关键：文件本身 0600 —— 用户原图是私密内容，
+	// os.Create 按 umask 落地可能是 0644（同机其它用户可读）。
+	outFile, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to create local file: %w", err)
 	}

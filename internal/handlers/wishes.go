@@ -103,6 +103,15 @@ type UpdateWishRequest struct {
 	TargetDate    string `json:"target_date"`
 	FulfilledAt   string `json:"fulfilled_at"`
 	AttachmentIDs []uint `json:"attachment_ids"`
+	// ClearAttachments 显式声明「本次要解除全部参考图绑定」
+	//
+	// 关键：单传空数组**不足以**表达「解绑」意图 ——
+	// 已发布的客户端把 attachmentIds 定义成非可选数组（默认 `[]`），
+	// JSONEncoder 必定写出 `"attachment_ids": []`，
+	// 而部分客户端的心愿编辑弹窗**根本没有附件 UI**，
+	// 于是每次改个标题/预算，服务端都会把该心愿的照片 `wish_id` 置空。
+	// 跨端更刺眼：用 web 传了图，再用 mac 改个字，图片就没了。
+	ClearAttachments bool `json:"clear_attachments"`
 }
 
 // ResolveWishRequest 归册仪式请求 (4种归册情景与多模块联动 RC-53)
@@ -468,10 +477,23 @@ func UpdateWish(c *gin.Context) {
 
 		if req.AttachmentIDs != nil {
 			// 空数组语义 = 解除该心愿的全部参考图绑定
+			//
+			// 关键：这是**破坏性**操作，必须由客户端显式请求。
+			// 已发布的老客户端把 attachmentIds 定义成非可选数组（默认 `[]`），
+			// JSONEncoder 必定写出 `"attachment_ids": []` ——
+			// 而 mac 的心愿编辑弹窗**根本没有附件 UI**，
+			// 于是每次在 mac 上改心愿标题/预算，服务端都会把该心愿的照片
+			// `wish_id` 置空，照片变成游离附件。
+			// 跨端更刺眼：用 web 给心愿传了图，再用 mac 改个字，图片就没了。
+			//
+			// 所以与分期一样：**只有显式声明 clear_attachments 时才真的解绑**；
+			// 空数组但没声明 → 视为「本次不携带附件字段」，保持原样。
 			if len(req.AttachmentIDs) == 0 {
-				tx.Model(&models.Attachment{}).
-					Where("wish_id = ?", wish.ID).
-					Update("wish_id", nil)
+				if req.ClearAttachments {
+					tx.Model(&models.Attachment{}).
+						Where("wish_id = ?", wish.ID).
+						Update("wish_id", nil)
+				}
 			} else {
 				tx.Model(&models.Attachment{}).
 					Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).

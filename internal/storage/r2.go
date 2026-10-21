@@ -512,13 +512,17 @@ func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) 
 		return ""
 	}
 
-	// 本地为主：文件就在同一台机器的磁盘上 → 直接给中枢自己的 /media 路由。
+	// 本地为主：文件就在同一台机器的磁盘上 → 给中枢自己的 /media 路由。
 	// 关键收益：客户端不必绕道对象存储。实测同一张 1.5MB 的相纸，
 	// 走对象存储要 4.4 秒，走本机路由是毫秒级。
+	//
+	// 关键：给的是**带签名的** URL（与对象存储的预签名同构），
+	// 而不是一个裸路径 —— 否则 /media 就是无鉴权公开目录，
+	// 任何知道中枢地址的人都能翻阅全部照片。
 	if localPrimaryEnabled {
 		key := ExtractObjectKey(resourcePathOrKey)
 		if key != "" && ObjectExistsLocally(key) {
-			return "/media/" + key
+			return SignLocalMediaURL(key, customDuration...)
 		}
 	}
 

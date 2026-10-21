@@ -238,8 +238,11 @@ func main() {
 	if err != nil {
 		uploadsDir = filepath.Join("data", "uploads")
 	}
-	_ = os.MkdirAll(uploadsDir, 0755)
-	r.Static("/media", uploadsDir)
+	_ = os.MkdirAll(uploadsDir, 0700)
+	// 关键：媒体路由**带签名校验**（原先是无鉴权的静态托管 ——
+	// 任何知道中枢地址的人都能翻阅全部照片）。
+	// 放行条件：URL 自带有效签名，或携带有效的设备令牌 / 会话 Cookie。
+	r.GET("/media/*filepath", handlers.ServeLocalMedia)
 
 	// 8. 前端静态文件托管（支持 //go:embed 单二进制内嵌与本地磁盘双模，docs/ecosystem.md §10.4）
 	setupFrontendStaticServing(r)

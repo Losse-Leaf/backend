@@ -30,11 +30,11 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 
 	token := "lldt_test_installment_keep"
 	device := models.Device{
-		DeviceID: "dev_installment_keep",
-		Name:     "测试设备",
-		Platform: "macos",
+		DeviceID:  "dev_installment_keep",
+		Name:      "测试设备",
+		Platform:  "macos",
 		TokenHash: middleware.HashToken(token),
-		Status:   "active",
+		Status:    "active",
 	}
 	if err := db.DB.Create(&device).Error; err != nil {
 		t.Fatalf("创建设备失败: %v", err)
@@ -42,19 +42,19 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 
 	// 一条 12 期分期账目
 	tx := models.Transaction{
-		Title:                  "分期买笔记本",
-		Amount:                 1200000,
-		Type:                   "expense",
-		Category:               "数码器材",
-		PaymentMethod:          "花呗",
-		OccurredAt:             time.Now(),
-		IsInstallment:          true,
-		InstallmentChannelCode: "huabei",
-		InstallmentTotalAmount: 1200000,
-		InstallmentMonths:      12,
-		InstallmentMonthlyPay:  100000,
+		Title:                   "分期买笔记本",
+		Amount:                  1200000,
+		Type:                    "expense",
+		Category:                "数码器材",
+		PaymentMethod:           "花呗",
+		OccurredAt:              time.Now(),
+		IsInstallment:           true,
+		InstallmentChannelCode:  "huabei",
+		InstallmentTotalAmount:  1200000,
+		InstallmentMonths:       12,
+		InstallmentMonthlyPay:   100000,
 		InstallmentRemainMonths: 12,
-		RepaymentDay:           10,
+		RepaymentDay:            10,
 	}
 	if err := db.DB.Create(&tx).Error; err != nil {
 		t.Fatalf("创建分期账目失败: %v", err)
@@ -96,9 +96,15 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 		t.Errorf("标题应被更新，实际 %q", reloaded.Title)
 	}
 
-	// 场景二：显式传 false 才降级
+	// 场景二：**老客户端形态** —— 只发 is_installment:false（不携带 clear_installment）
+	//
+	// 关键：已发布的 mac 客户端（v1.8.1 ~ v2.0.1）的 `isInstallment` 是非可选 Bool，
+	// JSONEncoder **必定**写出 `"is_installment": false`，它压根不知道可以不传。
+	// 若后端把 false 当成「取消分期」，老用户**编辑一次账目**就会毁掉分期负债：
+	// 期数、月供、剩余期数、渠道全部清零，待还总额与流动余额随之失真。
+	// 所以单传 false **必须**保持原值。
 	body2, _ := json.Marshal(map[string]any{
-		"title":          "改成一次性",
+		"title":          "老客户端只发了 false",
 		"category":       "数码器材",
 		"amount":         1200000,
 		"type":           "expense",
@@ -112,12 +118,41 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 	if w2.Code != http.StatusOK {
 		t.Fatalf("更新失败: %d %s", w2.Code, w2.Body.String())
 	}
+	var stillInstallment models.Transaction
+	if err := db.DB.First(&stillInstallment, tx.ID).Error; err != nil {
+		t.Fatalf("重新读取失败: %v", err)
+	}
+	if !stillInstallment.IsInstallment {
+		t.Error("只发 is_installment=false（老客户端形态）**不得**降级 —— 否则老用户编辑一次就毁掉分期负债")
+	}
+	if stillInstallment.InstallmentMonthlyPay != 100000 || stillInstallment.InstallmentMonths != 12 {
+		t.Errorf("分期字段应保持不变，实际 monthlyPay=%d months=%d",
+			stillInstallment.InstallmentMonthlyPay, stillInstallment.InstallmentMonths)
+	}
+
+	// 场景三：显式声明 clear_installment 才真的降级
+	body3, _ := json.Marshal(map[string]any{
+		"title":             "明确改成一次性",
+		"category":          "数码器材",
+		"amount":            1200000,
+		"type":              "expense",
+		"is_installment":    false,
+		"clear_installment": true,
+	})
+	req3 := httptest.NewRequest(http.MethodPut, "/api/v1/transactions/"+itoa(int(tx.ID)), bytes.NewReader(body3))
+	req3.Header.Set("Content-Type", "application/json")
+	req3.Header.Set("X-Device-Token", token)
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("更新失败: %d %s", w3.Code, w3.Body.String())
+	}
 	var downgraded models.Transaction
 	if err := db.DB.First(&downgraded, tx.ID).Error; err != nil {
 		t.Fatalf("重新读取失败: %v", err)
 	}
 	if downgraded.IsInstallment {
-		t.Error("显式传 is_installment=false 时应当降级为一次性支出")
+		t.Error("显式声明 clear_installment 时应当降级为一次性支出")
 	}
 	if downgraded.InstallmentMonthlyPay != 0 || downgraded.InstallmentMonths != 0 {
 		t.Errorf("降级后分期字段应清零，实际 monthlyPay=%d months=%d",
@@ -135,11 +170,11 @@ func TestTransactionRejectsNonPositiveAmount(t *testing.T) {
 
 	token := "lldt_test_amount_positive"
 	device := models.Device{
-		DeviceID: "dev_amount_positive",
-		Name:     "测试设备",
-		Platform: "macos",
+		DeviceID:  "dev_amount_positive",
+		Name:      "测试设备",
+		Platform:  "macos",
 		TokenHash: middleware.HashToken(token),
-		Status:   "active",
+		Status:    "active",
 	}
 	if err := db.DB.Create(&device).Error; err != nil {
 		t.Fatalf("创建设备失败: %v", err)

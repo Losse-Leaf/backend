@@ -591,16 +591,28 @@ func UpdateLifeEntry(c *gin.Context) {
 		return ok
 	}
 
-	if req.Type != "" || hasKey("type") {
+	// type 是**筛选维度**，不是可清空字段。
+	// 关键：绝不能用「携带即写入」的语义 ——
+	// 一旦某个客户端发出 `"type": ""`，条目会被写成空类型，
+	// 从所有分类视角里**静默消失**。
+	// 保持旧语义（空串 = 未携带），并对非法值直接拒绝。
+	if req.Type != "" {
 		entry.Type = req.Type
 	}
-	if req.Title != "" || hasKey("title") {
+	// titleKeyPresent：请求是否显式携带了 title
+	titleKeyPresent := hasKey("title")
+	if req.Title != "" || titleKeyPresent {
 		entry.Title = strings.TrimSpace(req.Title)
 	}
 	if req.Content != "" {
 		entry.Content = strings.TrimSpace(req.Content)
-		// 标题原本就是从正文首行派生的（朋友圈式发布）→ 正文改了，标题跟着改
-		if entry.Title == "" || entry.Title == DeriveTitleFromContent(entry.Content, 40) {
+		// 标题原本就是从正文首行派生的（朋友圈式发布）→ 正文改了，标题跟着改。
+		//
+		// 关键：**只有请求未携带 title 时**才允许回填派生标题。
+		// 否则用户显式清空标题后，这里会立刻把它填回正文首行 ——
+		// 「清空标题」这条契约等于从未生效（三端都在同时提交 title 与 content）。
+		if !titleKeyPresent &&
+			(entry.Title == "" || entry.Title == DeriveTitleFromContent(entry.Content, 40)) {
 			entry.Title = DeriveTitleFromContent(entry.Content, 40)
 		}
 	}
@@ -960,6 +972,19 @@ type TransactionRequest struct {
 	// 于是客户端**不传**时也被解读成「显式取消分期」——
 	// 而 Swift 的 `Bool` 不可选，任何一次「只改标题」的编辑都会把分期账目降级。
 	IsInstallment           *bool  `json:"is_installment"`
+	// ClearInstallment 显式声明「本次要取消分期」
+	//
+	// 关键：`is_installment: false` **不足以**表达「取消分期」。
+	// 已发布的 mac 客户端（v1.8.1 ~ v2.0.1）的 `isInstallment` 是非可选 `Bool`，
+	// JSONEncoder **必定**写出 `"is_installment": false` ——
+	// 它压根不知道这个字段可以不传。
+	// 若后端把 `false` 当成「取消分期」，那么老客户端**编辑一次账目**
+	// 就会把分期降级成一次性支出：期数、月供、剩余期数、渠道全部清零，
+	// 分期负债凭空消失、流动余额被整额冲减。
+	//
+	// 所以：**只有携带 clear_installment=true 时才真的降级**；
+	// 单传 false 一律保持原值。
+	ClearInstallment         bool   `json:"clear_installment"`
 	InstallmentChannelCode  string `json:"installment_channel_code"`
 	InstallmentTotalAmount  int64  `json:"installment_total_amount"`
 	InstallmentMonths       int    `json:"installment_months"`
@@ -1307,10 +1332,8 @@ func UpdateTransaction(c *gin.Context) {
 		} else {
 			tx.InstallmentRemainMonths = autoRemain
 		}
-	} else if req.IsInstallment != nil && !*req.IsInstallment {
-		// 显式传 false 才降级为一次性支出；
-		// **未携带（nil）时保持原值** —— 否则「只改标题」的编辑会抹掉分期标记，
-		// 让分期负债凭空消失、流动余额被整额冲减。
+	} else if req.ClearInstallment {
+		// 显式声明「取消分期」→ 真的降级并清空账期字段
 		tx.IsInstallment = false
 		tx.InstallmentChannelCode = ""
 		tx.InstallmentTotalAmount = 0
@@ -1319,6 +1342,10 @@ func UpdateTransaction(c *gin.Context) {
 		tx.InstallmentRemainMonths = 0
 		tx.RepaymentDay = 0
 	}
+	// 注意：`is_installment: false` 但**没有** clear_installment 时，
+	// 这里**故意什么都不做** —— 保持原分期状态。
+	// 否则已发布的老客户端（它的 Bool 不可选，必定发 false）
+	// 编辑一次账目就会毁掉分期负债。
 
 	if err := db.DB.Save(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新账目失败")

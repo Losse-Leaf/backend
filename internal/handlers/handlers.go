@@ -242,7 +242,6 @@ type CreateEntryRequest struct {
 	Content       string `json:"content" binding:"required"`
 	OccurredAt    string `json:"occurred_at"` // ISO8601 或 "2006-01-02T15:04" 或 "2006-01-02 15:04" 或 "2006.01.02"
 	Location      string `json:"location"`
-	Featured      bool   `json:"featured"`
 	CityCode      string `json:"city_code"`
 	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
@@ -304,7 +303,6 @@ func CreateLifeEntry(c *gin.Context) {
 				if location != "" {
 					existing.Location = location
 				}
-				existing.Featured = req.Featured
 				if cityCode != "" {
 					existing.CityCode = cityCode
 					existing.CityName = cityName
@@ -340,7 +338,6 @@ func CreateLifeEntry(c *gin.Context) {
 		Content:     content,
 		OccurredAt:  occurred,
 		Location:    location,
-		Featured:    req.Featured,
 		CityCode:    cityCode,
 		CityName:    cityName,
 		ProjectID:   req.ProjectID,
@@ -557,7 +554,6 @@ type UpdateEntryRequest struct {
 	Content       string `json:"content"`
 	OccurredAt    string `json:"occurred_at"`
 	Location      string `json:"location"`
-	Featured      *bool  `json:"featured"`
 	CityCode      string `json:"city_code"`
 	CityName      string `json:"city_name"`
 	ProjectID     *uint  `json:"project_id"`
@@ -596,9 +592,6 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 	if req.Location != "" {
 		entry.Location = strings.TrimSpace(req.Location)
-	}
-	if req.Featured != nil {
-		entry.Featured = *req.Featured
 	}
 	if req.CityCode != "" || req.CityName != "" || req.Location != "" {
 		curCode := entry.CityCode
@@ -1325,7 +1318,6 @@ type ProjectRequest struct {
 	Category    string `json:"category"`
 	GithubURL   string `json:"github_url"`
 	Status      string `json:"status"`
-	Featured    bool   `json:"featured"`
 	Order       int    `json:"order"`
 }
 
@@ -1356,7 +1348,6 @@ func CreateProject(c *gin.Context) {
 		Category:    strings.TrimSpace(req.Category),
 		GithubURL:   strings.TrimSpace(req.GithubURL),
 		Status:      projectStatus,
-		Featured:    req.Featured,
 		Order:       req.Order,
 	}
 	if p.Status == "" {
@@ -1468,7 +1459,6 @@ type ProjectUpdateRequest struct {
 	Category    *string `json:"category"`
 	GithubURL   *string `json:"github_url"`
 	Status      *string `json:"status"`
-	Featured    *bool   `json:"featured"`
 	Order       *int    `json:"order"`
 }
 
@@ -1518,9 +1508,6 @@ func UpdateProject(c *gin.Context) {
 		if status != "" {
 			p.Status = status
 		}
-	}
-	if req.Featured != nil {
-		p.Featured = *req.Featured
 	}
 	if req.Order != nil {
 		p.Order = *req.Order

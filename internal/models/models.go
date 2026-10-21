@@ -23,7 +23,6 @@ type LifeEntry struct {
 	FootprintID *uint        `gorm:"index" json:"footprint_id,omitempty"`
 	Attachments []Attachment `gorm:"-" json:"attachments"` // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
 
-	Featured bool   `json:"featured,omitempty"`
 	CityCode string `gorm:"size:12;index" json:"city_code,omitempty"`
 	CityName string `gorm:"size:64" json:"city_name,omitempty"`
 
@@ -62,7 +61,6 @@ type Project struct {
 	Category    string         `gorm:"index" json:"category,omitempty"`
 	GithubURL   string         `json:"github_url,omitempty"`
 	Status      string         `json:"status,omitempty"`
-	Featured    bool           `json:"featured,omitempty"`
 	Order       int            `gorm:"index" json:"order,omitempty"`
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `gorm:"index" json:"updated_at"`

@@ -87,7 +87,6 @@ func createProjectCompanionEntry(tx *gorm.DB, p models.Project) (models.LifeEntr
 		Title:      p.Title,
 		Content:    buildProjectCompanionContent(p),
 		OccurredAt: time.Now().In(config.BeijingLocation),
-		Featured:   p.Featured,
 		ProjectID:  &p.ID,
 	}
 	if err := tx.Create(&companionEntry).Error; err != nil {
@@ -96,7 +95,7 @@ func createProjectCompanionEntry(tx *gorm.DB, p models.Project) (models.LifeEntr
 	return companionEntry, nil
 }
 
-// syncProjectCompanionEntry 同步「立项」那条伴生散页（标题 / 正文 / 精选）。
+// syncProjectCompanionEntry 同步「立项」那条伴生散页（标题 / 正文）。
 // 进展手记与状态演进产生的伴生散页不在此处更新 —— 它们是独立的历史时刻。
 func syncProjectCompanionEntry(tx *gorm.DB, p models.Project, oldTitle string) error {
 	return tx.Model(&models.LifeEntry{}).
@@ -104,7 +103,6 @@ func syncProjectCompanionEntry(tx *gorm.DB, p models.Project, oldTitle string) e
 		Updates(map[string]any{
 			"title":      p.Title,
 			"content":    buildProjectCompanionContent(p),
-			"featured":   p.Featured,
 			"updated_at": time.Now(),
 		}).Error
 }

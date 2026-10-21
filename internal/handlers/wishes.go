@@ -737,13 +737,17 @@ func DeleteWish(c *gin.Context) {
 		return
 	}
 
+	// 关键：删除心愿时**一并软删除**它在时间流里的伴生散页（两条删除路径都要走）。
+	// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
+	if err := db.DB.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{}).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "清理伴生记录失败: "+err.Error())
+		return
+	}
+
 	if purge {
 		db.DB.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-		// 关键：删除心愿时**一并软删除**它在时间流里的伴生散页。
-		// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
-		db.DB.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{})
 		if err := db.DB.Unscoped().Delete(&w).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return

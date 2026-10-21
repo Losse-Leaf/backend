@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,11 +19,25 @@ import (
 )
 
 func setupTestDB(t *testing.T) {
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "test_auth.db")
+	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open test in-memory db: %v", err)
 	}
-	_ = database.AutoMigrate(&models.Device{}, &models.PairTicket{}, &models.SiteConfig{})
+	_ = database.AutoMigrate(
+		&models.SiteConfig{},
+		&models.CuratorProfile{},
+		&models.Device{},
+		&models.PairTicket{},
+		&models.Attachment{},
+		&models.LifeEntry{},
+		&models.Transaction{},
+		&models.Project{},
+		&models.Wish{},
+		&models.Footprint{},
+		&models.CreditChannel{},
+		&models.CategoryOption{},
+	)
 	database.Create(&models.SiteConfig{Initialized: true})
 	db.DB = database
 }

@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +23,8 @@ import (
 )
 
 func setupTestFullDB(t *testing.T) {
-	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	database, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open test in-memory db: %v", err)
 	}
@@ -38,6 +40,7 @@ func setupTestFullDB(t *testing.T) {
 		&models.Wish{},
 		&models.Footprint{},
 		&models.CreditChannel{},
+		&models.CategoryOption{},
 	)
 	database.Create(&models.CreditChannel{
 		Code:         "huabei",

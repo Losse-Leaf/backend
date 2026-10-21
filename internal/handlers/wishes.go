@@ -31,6 +31,7 @@ func populateWishURLs(w *models.Wish) {
 	}
 	for i := range w.Attachments {
 		w.Attachments[i].URL = storage.SignResourceURL(w.Attachments[i].ObjectKey)
+		w.Attachments[i].ThumbnailURL = ThumbnailURLFor(w.Attachments[i].ObjectKey, 0)
 	}
 }
 
@@ -62,6 +63,7 @@ func populateWishURLsBatch(wishes []models.Wish) {
 		}
 		for j := range atts {
 			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
+			atts[j].ThumbnailURL = ThumbnailURLFor(atts[j].ObjectKey, 0)
 		}
 		wishes[i].Attachments = atts
 	}

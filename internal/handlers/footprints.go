@@ -96,6 +96,7 @@ func populateFootprintURLs(f *models.Footprint) {
 	}
 	for i := range f.Attachments {
 		f.Attachments[i].URL = storage.SignResourceURL(f.Attachments[i].ObjectKey)
+		f.Attachments[i].ThumbnailURL = ThumbnailURLFor(f.Attachments[i].ObjectKey, 0)
 	}
 }
 
@@ -174,6 +175,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 		}
 		for j := range atts {
 			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
+			atts[j].ThumbnailURL = ThumbnailURLFor(atts[j].ObjectKey, 0)
 		}
 		f.Attachments = atts
 	}

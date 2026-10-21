@@ -45,6 +45,10 @@ type Attachment struct {
 	Width            int       `json:"width,omitempty"`
 	Height           int       `json:"height,omitempty"`
 	URL              string    `gorm:"-" json:"url"` // 动态计算得出的公开或代理可访问 URL
+	// ThumbnailURL 缩略图地址（中枢自己的路由，稳定可缓存）。
+	// 关键：列表与详情用缩略图，只有灯箱才用原图 ——
+	// 原图动辄 1.5MB，从对象存储拉一次要 4 秒，时间流滚动时会把网络打满。
+	ThumbnailURL     string    `gorm:"-" json:"thumbnail_url,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 

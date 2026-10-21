@@ -87,11 +87,36 @@ func ParseSyncSinceTime(s string) (time.Time, error) {
 func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 	for i := range atts {
 		atts[i].URL = storage.SignResourceURL(atts[i].ObjectKey)
+		atts[i].ThumbnailURL = ThumbnailURLFor(atts[i].ObjectKey, 0)
 	}
 	return atts
 }
 
 // populateEntryURLs 通过纯逻辑外键加载条目关联的附件与项目，并填充预签名 URL (RC-13)
+// DeriveTitleFromContent 从正文派生标题（朋友圈式发布：只填正文，标题取首行）
+//
+// 关键：这条规则必须在**后端、mac、Web 三端一致**，
+// 否则同一条记录在不同端标题会不一样，搜索与索引也对不上。
+// 规则：取正文第一行（去掉首尾空白），超过 maxLength 则截断并加省略号。
+func DeriveTitleFromContent(content string, maxLength int) string {
+	if maxLength <= 0 {
+		maxLength = 40
+	}
+	firstLine := content
+	if idx := strings.IndexByte(content, '\n'); idx >= 0 {
+		firstLine = content[:idx]
+	}
+	trimmed := strings.TrimSpace(firstLine)
+	if trimmed == "" {
+		return ""
+	}
+	runes := []rune(trimmed)
+	if len(runes) > maxLength {
+		return string(runes[:maxLength]) + "…"
+	}
+	return trimmed
+}
+
 func populateEntryURLs(e *models.LifeEntry) {
 	if e == nil {
 		return
@@ -236,6 +261,11 @@ func CreateLifeEntry(c *gin.Context) {
 	occurred, _ := ParseFlexTime(req.OccurredAt)
 	title := strings.TrimSpace(req.Title)
 	content := strings.TrimSpace(req.Content)
+	// 朋友圈式发布：客户端可能只填正文不填标题 —— 这里统一从正文首行派生，
+	// 保证任何端（mac / Web / Android / 裸 API）落库的标题都一致。
+	if title == "" {
+		title = DeriveTitleFromContent(content, 40)
+	}
 	location := strings.TrimSpace(req.Location)
 	cityCode := strings.TrimSpace(req.CityCode)
 	cityName := strings.TrimSpace(req.CityName)
@@ -558,6 +588,10 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 	if req.Content != "" {
 		entry.Content = strings.TrimSpace(req.Content)
+		// 标题原本就是从正文首行派生的（朋友圈式发布）→ 正文改了，标题跟着改
+		if entry.Title == "" || entry.Title == DeriveTitleFromContent(entry.Content, 40) {
+			entry.Title = DeriveTitleFromContent(entry.Content, 40)
+		}
 	}
 	if req.Location != "" {
 		entry.Location = strings.TrimSpace(req.Location)
@@ -839,6 +873,7 @@ func CompleteUpload(c *gin.Context) {
 	}
 
 	att.URL = storage.SignResourceURL(att.ObjectKey)
+	att.ThumbnailURL = ThumbnailURLFor(att.ObjectKey, 0)
 	Success(c, att)
 }
 

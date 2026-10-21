@@ -953,7 +953,13 @@ type TransactionRequest struct {
 	CityCode      string `json:"city_code"`
 	OccurredAt    string `json:"occurred_at"`
 	// 分期付款核心字段 (RC-53)
-	IsInstallment           bool   `json:"is_installment"`
+	//
+	// IsInstallment 用 **指针**：nil = 本次请求未携带该字段（更新时保持原值），
+	// 显式 false = 明确降级为一次性支出。
+	// 关键：原先是普通 bool，JSONEncoder 一定会把它写进请求体，
+	// 于是客户端**不传**时也被解读成「显式取消分期」——
+	// 而 Swift 的 `Bool` 不可选，任何一次「只改标题」的编辑都会把分期账目降级。
+	IsInstallment           *bool  `json:"is_installment"`
 	InstallmentChannelCode  string `json:"installment_channel_code"`
 	InstallmentTotalAmount  int64  `json:"installment_total_amount"`
 	InstallmentMonths       int    `json:"installment_months"`
@@ -971,6 +977,14 @@ func CreateTransaction(c *gin.Context) {
 	var req TransactionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请填写金额、类型(支出/收入)与分类")
+		return
+	}
+	// 关键：金额必须为正。
+	// `binding:"required"` 对数值只拒绝 0，**负数放行** ——
+	// 于是 `{"amount": -5000, "type":"expense"}` 会让支出总额**减少** ¥50，
+	// 分类占比出现负比例，流动余额与净资产被反向虚增。
+	if req.Amount <= 0 {
+		Error(c, http.StatusBadRequest, "金额必须大于 0")
 		return
 	}
 
@@ -999,10 +1013,10 @@ func CreateTransaction(c *gin.Context) {
 	// 若选择了关联旅程 (FootprintID) 或带有城市代码，自动对齐城市并尝试归并到对应旅程
 	autoLinkTransactionFootprint(&tx)
 
-	if req.IsInstallment {
+	if req.IsInstallment != nil && *req.IsInstallment {
 		AssembleInstallmentTransaction(
 			&tx,
-			req.IsInstallment,
+			true,
 			req.InstallmentChannelCode,
 			req.InstallmentTotalAmount,
 			req.Amount,
@@ -1018,6 +1032,11 @@ func CreateTransaction(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "记账失败: "+err.Error())
 		return
 	}
+	// 关键：让 /stats 的 30 秒缓存失效。
+	// 否则记完账立刻打开统计弹窗，弹窗显示的是**缓存里的旧数字**，
+	// 而账本页（走 /transactions/summary，无缓存）显示新数字 ——
+	// 同一个 App 里两个「本月支出」当场打架。
+	InvalidateStatsCache()
 
 	// 路径 B：记账大件同步收录至随身设备库 (RC-53)
 	if req.LinkGearAsset {
@@ -1212,7 +1231,14 @@ func UpdateTransaction(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
+	// 金额：**负数**必须被拒绝（会反向冲减所有汇总）。
+	// 0 表示「本次未携带金额」（部分更新语义），保留原值。
+	if req.Amount < 0 {
+		Error(c, http.StatusBadRequest, "金额必须大于 0")
+		return
+	}
 
+	// `amount` 带 binding:"required"，所以这里一定拿得到一个非 0 的值
 	tx.Amount = req.Amount
 	// MOB-P1-xx：type 为空时**保持原值**，不能写成空串。
 	//
@@ -1254,7 +1280,7 @@ func UpdateTransaction(c *gin.Context) {
 
 	autoLinkTransactionFootprint(&tx)
 
-	if req.IsInstallment {
+	if req.IsInstallment != nil && *req.IsInstallment {
 		tx.IsInstallment = true
 		if req.InstallmentChannelCode != "" {
 			tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
@@ -1281,14 +1307,25 @@ func UpdateTransaction(c *gin.Context) {
 		} else {
 			tx.InstallmentRemainMonths = autoRemain
 		}
-	} else {
+	} else if req.IsInstallment != nil && !*req.IsInstallment {
+		// 显式传 false 才降级为一次性支出；
+		// **未携带（nil）时保持原值** —— 否则「只改标题」的编辑会抹掉分期标记，
+		// 让分期负债凭空消失、流动余额被整额冲减。
 		tx.IsInstallment = false
+		tx.InstallmentChannelCode = ""
+		tx.InstallmentTotalAmount = 0
+		tx.InstallmentMonths = 0
+		tx.InstallmentMonthlyPay = 0
+		tx.InstallmentRemainMonths = 0
+		tx.RepaymentDay = 0
 	}
 
 	if err := db.DB.Save(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新账目失败")
 		return
 	}
+	// 同上：更新账目后统计缓存必须失效
+	InvalidateStatsCache()
 
 	Success(c, tx)
 }
@@ -1312,6 +1349,9 @@ func DeleteTransaction(c *gin.Context) {
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
+
+	// 同上：删除账目后统计缓存必须失效
+	defer InvalidateStatsCache()
 
 	if err := db.DB.Delete(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())

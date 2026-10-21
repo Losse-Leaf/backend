@@ -344,7 +344,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			Title:                  "AirPods Max 银色",
 			Note:                   "头戴式主动降噪耳机",
 			PaymentMethod:          "花呗分期",
-			IsInstallment:          true,
+			IsInstallment:          boolPtr(true),
 			InstallmentChannelCode: "huabei",
 			InstallmentTotalAmount: 239900,
 			InstallmentMonths:      12,
@@ -543,3 +543,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		}
 	})
 }
+
+
+// boolPtr 便于在结构体字面量里构造 *bool
+func boolPtr(v bool) *bool { return &v }

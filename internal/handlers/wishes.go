@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -342,9 +344,17 @@ func UpdateWish(c *gin.Context) {
 	}
 
 	var req UpdateWishRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	rawBytes, _ := io.ReadAll(c.Request.Body)
+	if err := json.Unmarshal(rawBytes, &req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
+	}
+	// 字段语义与 profile 一致：**请求携带该 key 即按其值写入**（0 = 清空）
+	var rawKeys map[string]json.RawMessage
+	_ = json.Unmarshal(rawBytes, &rawKeys)
+	hasKey := func(k string) bool {
+		_, ok := rawKeys[k]
+		return ok
 	}
 
 	oldStatus := wish.Status
@@ -368,7 +378,12 @@ func UpdateWish(c *gin.Context) {
 	if req.CityName != "" {
 		wish.CityName = strings.TrimSpace(req.CityName)
 	}
-	if req.Budget != 0 {
+	// 关键：预算要能改成 0。
+	// 原先 `if req.Budget != 0` 把「改成 0」当成「未携带」——
+	// 用户把预算清空想改成 ¥0，后端忽略，预算仍是旧值，
+	// 「心愿统计」的预算合计也多算这一笔。
+	// 改成与 profile 一致的语义：请求携带该 key 即按其值写入。
+	if req.Budget != 0 || hasKey("budget") {
 		wish.Budget = req.Budget
 	}
 	if req.ActualCost != nil {

@@ -904,9 +904,11 @@ func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction
 
 	txs := fetchTxs()
 	var totalSpent int64
+	expenseCount := 0
 	categoryBreakdown := make(map[string]int64)
 	for _, tx := range txs {
 		if tx.Type == "expense" {
+			expenseCount++
 			totalSpent += tx.Amount
 			categoryBreakdown[tx.Category] += tx.Amount
 		}
@@ -925,7 +927,10 @@ func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction
 
 	return gin.H{
 		"total_spent":       totalSpent,
-		"transaction_count": len(txs),
+		// 关键：计数与 total_spent **同口径**（只数支出）。
+		// 原先用 len(txs) 把**收入**也数了进去 ——
+		// 于是「4 笔消费」里混着一笔「二手回血」收入，与旁边的金额对不上。
+		"transaction_count": expenseCount,
 		"categories":        categories,
 	}
 }

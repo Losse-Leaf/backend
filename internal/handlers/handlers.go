@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -855,6 +856,16 @@ func CompleteUpload(c *gin.Context) {
 		}
 		if realContentType != "" {
 			req.MimeType = realContentType
+		}
+
+		// 「本地磁盘为主」策略下，预签名直传的字节是客户端直接 PUT 到 R2 的，
+		// 服务器没经过那份数据 —— 必须在此刻把它同步回本地，
+		// 否则这份文件永远只存在于 R2，「本地为主」对它就不成立。
+		if storage.LocalPrimaryEnabled() {
+			if err := storage.MirrorObjectToLocal(c.Request.Context(), req.ObjectKey); err != nil {
+				// 同步失败不阻断：此时文件仍在 R2，读取时会自动回落
+				log.Printf("[storage] 直传对象同步回本地失败（将回落 R2 读取）：key=%s err=%v", req.ObjectKey, err)
+			}
 		}
 	}
 

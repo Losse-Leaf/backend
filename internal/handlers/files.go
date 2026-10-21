@@ -34,6 +34,9 @@ type FileUploadResult struct {
 	Width        int    `json:"width,omitempty"`  // 图片宽度 (像素)
 	Height       int    `json:"height,omitempty"` // 图片高度 (像素)
 	AttachmentID uint   `json:"attachment_id"`    // 已持久化的关联附件 ID (便于 LifeEntry 快速关联)
+	// ThumbnailURL 缩略图地址（中枢自己的路由，稳定可缓存）
+	// 列表与详情用缩略图，只有灯箱才用原图
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
 }
 
 // allowedUploadFolders 统一文件直传允许的归类目录白名单 (与 docs/backend.md §四.5 路径约定一致)
@@ -115,8 +118,13 @@ func UnifiedUploadFile(c *gin.Context) {
 		return
 	}
 
-	// 生成有时效的预签名访问 URL (默认 30 分钟)
-	signedURL, expiresIn, _ := storage.GeneratePresignedGetURL(objectKey)
+	// 访问 URL：「本地磁盘为主」策略下走中枢自己的 /media 路由（同机直读），
+	// 本地没有该对象时才回落 R2 预签名地址。
+	signedURL := storage.SignResourceURL(objectKey)
+	_, expiresIn, _ := storage.GeneratePresignedGetURL(objectKey)
+	if signedURL == "" {
+		signedURL = storage.GetPublicURL(objectKey)
+	}
 
 	// 自动在 attachments 数据表中记录该实体，防止成为游离资源
 	att := models.Attachment{
@@ -135,6 +143,7 @@ func UnifiedUploadFile(c *gin.Context) {
 	Success(c, FileUploadResult{
 		ObjectKey:    objectKey,
 		URL:          signedURL,
+		ThumbnailURL: ThumbnailURLFor(objectKey, 0),
 		ExpiresIn:    expiresIn,
 		Filename:     fileHeader.Filename,
 		MimeType:     contentType,

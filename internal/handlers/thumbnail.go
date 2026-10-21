@@ -27,7 +27,6 @@ import (
 	"image/jpeg"
 	_ "image/gif"
 	_ "image/png"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -106,26 +105,9 @@ func ensureThumbnailDiskDir() string {
 	return thumbnailDiskDir
 }
 
-// readObjectBytes 读取对象原始字节（R2 优先，未配置时走本地磁盘）
+// readObjectBytes 读取对象原始字节：**本地优先**，本地没有才回落对象存储
 func readObjectBytes(ctx context.Context, objectKey string) ([]byte, error) {
-	if body, _, err := storage.GetObject(ctx, objectKey); err == nil && body != nil {
-		defer body.Close()
-		return io.ReadAll(io.LimitReader(body, 64<<20))
-	}
-	// 本地磁盘兜底
-	base := storage.GetLocalUploadDir()
-	if base == "" {
-		return nil, fmt.Errorf("对象存储与本地磁盘均不可用")
-	}
-	target := filepath.Join(base, filepath.FromSlash(objectKey))
-	if absBase, err := filepath.Abs(base); err == nil {
-		if absTarget, err := filepath.Abs(target); err == nil {
-			if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
-				return nil, fmt.Errorf("对象路径越界")
-			}
-		}
-	}
-	return os.ReadFile(target)
+	return storage.ReadObject(ctx, objectKey)
 }
 
 // makeThumbnail 生成缩略图字节

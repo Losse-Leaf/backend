@@ -227,8 +227,17 @@ func main() {
 	r.GET("/api/health", handlers.HealthCheck)
 	r.GET("/health", handlers.HealthCheck)
 
-	// 7. 本地媒体静态托管 (未配 R2 时服务 data/uploads/ 下的文件 RC-44)
-	uploadsDir := filepath.Join("data", "uploads")
+	// 7. 本地媒体静态托管
+	//
+	// 关键：目录必须与 `storage.GetLocalUploadDir()` **完全一致**且是绝对路径。
+	// 「本地磁盘为主」策略下，附件 URL 会直接指向本路由（/media/<object_key>），
+	// 客户端由此同机直读，不必绕道对象存储。
+	// 早先这里写的是相对路径 `data/uploads`，与进程工作目录耦合，
+	// 一旦以 systemd / 容器方式启动，静态路由与实际写入目录就会错位。
+	uploadsDir, err := filepath.Abs(storage.GetLocalUploadDir())
+	if err != nil {
+		uploadsDir = filepath.Join("data", "uploads")
+	}
 	_ = os.MkdirAll(uploadsDir, 0755)
 	r.Static("/media", uploadsDir)
 

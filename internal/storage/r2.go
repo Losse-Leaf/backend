@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"path"
@@ -510,6 +512,16 @@ func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) 
 		return ""
 	}
 
+	// 本地为主：文件就在同一台机器的磁盘上 → 直接给中枢自己的 /media 路由。
+	// 关键收益：客户端不必绕道对象存储。实测同一张 1.5MB 的相纸，
+	// 走对象存储要 4.4 秒，走本机路由是毫秒级。
+	if localPrimaryEnabled {
+		key := ExtractObjectKey(resourcePathOrKey)
+		if key != "" && ObjectExistsLocally(key) {
+			return "/media/" + key
+		}
+	}
+
 	// 若已经是外部非 R2 的 HTTP/HTTPS 链接，且不带签名，保持原样
 	if (strings.HasPrefix(resourcePathOrKey, "http://") || strings.HasPrefix(resourcePathOrKey, "https://")) &&
 		!strings.Contains(resourcePathOrKey, "r2.cloudflarestorage.com") &&
@@ -550,7 +562,15 @@ func GetLocalUploadDir() string {
 	return localUploadDir
 }
 
-// UploadObject 服务器端直接上传流到 R2，并在未配置 R2 时自动平滑回退写入本地存储
+// UploadObject 写入对象：**本地磁盘为主，R2 为备份**
+//
+// 关键（部署形态：中枢在 VPS 上，真正存储是 VPS 本地磁盘，R2 只做备份）：
+//   - 本地写入是**必须成功**的主路径
+//   - R2 写入是**尽力而为**的备份：失败只记日志，不影响上传结果
+//     （备份失败不该让用户「发不出照片」）
+//   - 读取与 URL 生成另有 `ReadObject` / `SignResourceURL` 统一按「本地优先」处理
+//
+// 旧行为（R2 为主）仍可通过环境变量 `LOCAL_MEDIA_PRIMARY=0` 保留。
 func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size int64, contentType string) error {
 	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
 	if objectKey == "" {
@@ -561,44 +581,57 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 		contentType = "application/octet-stream"
 	}
 
-	if isConfigured && s3Client != nil {
+	r2Ready := isConfigured && s3Client != nil
+
+	// 旧行为：R2 为主（且不写本地）
+	if !localPrimaryEnabled {
+		if r2Ready {
+			putInput := &s3.PutObjectInput{
+				Bucket:        aws.String(r2Bucket),
+				Key:           aws.String(objectKey),
+				Body:          reader,
+				ContentLength: aws.Int64(size),
+				ContentType:   aws.String(contentType),
+			}
+			_, err := s3Client.PutObject(ctx, putInput)
+			return err
+		}
+		return writeLocalObject(objectKey, reader, size)
+	}
+
+	// 新行为：本地为主
+	// 读入内存一份，好让 R2 备份能复用同一份字节（流只能读一次）
+	var payload []byte
+	if r2Ready {
+		limited := io.LimitReader(reader, 512<<20)
+		var readErr error
+		payload, readErr = io.ReadAll(limited)
+		if readErr != nil {
+			return fmt.Errorf("failed to read upload payload: %w", readErr)
+		}
+		if size > 0 && int64(len(payload)) != size {
+			return fmt.Errorf("上传字节数不符：期望 %d，实际 %d", size, len(payload))
+		}
+		if err := writeLocalObject(objectKey, bytes.NewReader(payload), int64(len(payload))); err != nil {
+			return err
+		}
+		// 备份：尽力而为
 		putInput := &s3.PutObjectInput{
 			Bucket:        aws.String(r2Bucket),
 			Key:           aws.String(objectKey),
-			Body:          reader,
-			ContentLength: aws.Int64(size),
+			Body:          bytes.NewReader(payload),
+			ContentLength: aws.Int64(int64(len(payload))),
 			ContentType:   aws.String(contentType),
 		}
-		_, err := s3Client.PutObject(ctx, putInput)
-		return err
-	}
-
-	// 离线/本地环境兜底写入 data/uploads/<objectKey>
-	localBase := GetLocalUploadDir()
-	targetPath := filepath.Join(localBase, filepath.FromSlash(objectKey))
-	// 兜底断言：解析后的绝对路径必须仍在上传根目录内，杜绝任何越界写 (BE-22)
-	if absBase, err := filepath.Abs(localBase); err == nil {
-		if absTarget, err := filepath.Abs(targetPath); err == nil {
-			if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
-				return fmt.Errorf("对象路径越界，已拒绝写入: %s", objectKey)
-			}
+		if _, err := s3Client.PutObject(ctx, putInput); err != nil {
+			// 备份失败不影响主流程，但必须留下痕迹
+			log.Printf("[storage] R2 备份失败（本地已写入成功）：key=%s err=%v", objectKey, err)
 		}
-	}
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return fmt.Errorf("failed to create upload dir: %w", err)
+		return nil
 	}
 
-	outFile, err := os.Create(targetPath)
-	if err != nil {
-		return fmt.Errorf("failed to create local file: %w", err)
-	}
-	defer outFile.Close()
-
-	if _, err := io.Copy(outFile, reader); err != nil {
-		return fmt.Errorf("failed to write local file: %w", err)
-	}
-
-	return nil
+	// 未配置 R2：只写本地
+	return writeLocalObject(objectKey, reader, size)
 }
 
 // BuildSafeObjectKey 构建安全、合规的 R2 存储相对路径 Key (例如 avatar/user.png, entries/2026/10/09/uuid-file.png)

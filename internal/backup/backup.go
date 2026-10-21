@@ -190,12 +190,8 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 			if cleanKey == "" || packedUploadKeys[cleanKey] {
 				continue
 			}
-			rc, _, err := storage.GetObject(ctx, cleanKey)
-			if err != nil || rc == nil {
-				continue
-			}
-			data, readErr := io.ReadAll(rc)
-			rc.Close()
+			// 打包媒体时与用户看到的保持一致：本地优先，本地没有才回落 R2
+			data, readErr := storage.ReadObject(ctx, cleanKey)
 			if readErr == nil {
 				if err := addBytesToZip(zipWriter, data, filepath.ToSlash(filepath.Join("uploads", cleanKey))); err == nil {
 					packedUploadKeys[cleanKey] = true
@@ -240,7 +236,8 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	// 6. 分流存储：优先上传已配置的 Cloudflare R2，否则落盘本地
 	if storage.IsConfigured() {
 		r2Key := "backups/" + filename
-		if err := storage.UploadObject(ctx, r2Key, tempZipFile, zipSize, "application/zip"); err != nil {
+		// 备份包的**存放位置**由这里显式指定为 R2，因此必须只写 R2
+		if err := storage.BackupObjectToR2(ctx, r2Key, tempZipFile, zipSize, "application/zip"); err != nil {
 			tempZipFile.Close()
 			return nil, fmt.Errorf("上传备份到 R2 失败: %w", err)
 		}

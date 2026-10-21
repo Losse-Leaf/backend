@@ -295,7 +295,10 @@ func MigrateStorageMedia(c *gin.Context) {
 			if ct == "" {
 				ct = "application/octet-stream"
 			}
-			uploadErr := storage.UploadObject(ctx, objectKey, f, info.Size(), ct)
+			// 关键：这里必须是**只写 R2**。
+			// 若用 UploadObject（本地为主），它会先截断本地文件再从自己读 ——
+			// 源文件就在本地，等于把自己覆盖成空，备份内容全毁。
+			uploadErr := storage.BackupObjectToR2(ctx, objectKey, f, info.Size(), ct)
 			f.Close()
 			if uploadErr == nil {
 				uploadedToR2++

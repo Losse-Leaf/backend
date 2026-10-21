@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"runtime"
@@ -572,15 +574,27 @@ func UpdateLifeEntry(c *gin.Context) {
 	}
 
 	var req UpdateEntryRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	rawBytes, _ := io.ReadAll(c.Request.Body)
+	if err := json.Unmarshal(rawBytes, &req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
 
-	if req.Type != "" {
+	// 关键：字段语义与 profile 更新一致 —— **请求携带该 key 即按其值写入**
+	//（空串 = 清空），不再把「空串」当作「未携带」。
+	// 原先 `if req.Title != ""` 的写法让用户把标题删干净后保存时
+	// **标题仍是旧值**，界面毫无提示 —— 典型的静默失败。
+	var rawKeys map[string]json.RawMessage
+	_ = json.Unmarshal(rawBytes, &rawKeys)
+	hasKey := func(k string) bool {
+		_, ok := rawKeys[k]
+		return ok
+	}
+
+	if req.Type != "" || hasKey("type") {
 		entry.Type = req.Type
 	}
-	if req.Title != "" {
+	if req.Title != "" || hasKey("title") {
 		entry.Title = strings.TrimSpace(req.Title)
 	}
 	if req.Content != "" {

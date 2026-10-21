@@ -374,4 +374,3 @@ func CheckSystemUpdate(c *gin.Context) {
 
 	Success(c, result)
 }
-

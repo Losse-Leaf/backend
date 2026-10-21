@@ -6,13 +6,13 @@ import (
 
 func TestResolveCityCodeAndName(t *testing.T) {
 	tests := []struct {
-		name         string
-		inCode       string
-		inName       string
-		inLoc        string
-		wantCode     string
-		wantName     string
-		wantLoc      string
+		name     string
+		inCode   string
+		inName   string
+		inLoc    string
+		wantCode string
+		wantName string
+		wantLoc  string
 	}{
 		{
 			name:     "标准6位代码与空名称",

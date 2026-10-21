@@ -701,5 +701,3 @@ func TestGlobalStatsRoleCacheIsolation(t *testing.T) {
 		t.Fatalf("expected month_expense=0 for guest after admin cache hit, got %v", guestResp.Data["month_expense"])
 	}
 }
-
-

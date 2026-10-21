@@ -69,22 +69,26 @@ func populateWishURLsBatch(wishes []models.Wish) {
 
 // CreateWishRequest 新建心愿请求
 type CreateWishRequest struct {
-	Title         string `json:"title" binding:"required"`
+	Title string `json:"title" binding:"required"`
 	// MOB-P1-35：省略即默认 item
-	Kind          string `json:"kind"` // item | travel | milestone
-	Note          string `json:"note"`
-	Spec          string `json:"spec"`
-	CityCode      string `json:"city_code"`
-	CityName      string `json:"city_name"`
-	Budget        int64  `json:"budget"`
-	TargetDate    string `json:"target_date"`
+	Kind       string `json:"kind"` // item | travel | milestone
+	Note       string `json:"note"`
+	Spec       string `json:"spec"`
+	CityCode   string `json:"city_code"`
+	CityName   string `json:"city_name"`
+	Budget     int64  `json:"budget"`
+	TargetDate string `json:"target_date"`
+	// PlantedAt 许下心愿的时刻（可选，支持补录过去的心愿）
+	PlantedAt     string `json:"planted_at"`
 	AttachmentIDs []uint `json:"attachment_ids"`
 }
 
 // UpdateWishRequest 更新心愿请求
 type UpdateWishRequest struct {
-	Title         string `json:"title"`
-	Kind          string `json:"kind"`
+	Title string `json:"title"`
+	Kind  string `json:"kind"`
+	// PlantedAt 许下心愿的时刻（可选，支持补档）
+	PlantedAt     string `json:"planted_at"`
 	Note          string `json:"note"`
 	Spec          string `json:"spec"`
 	CityCode      string `json:"city_code"`
@@ -99,16 +103,16 @@ type UpdateWishRequest struct {
 
 // ResolveWishRequest 归册仪式请求 (4种归册情景与多模块联动 RC-53)
 type ResolveWishRequest struct {
-	FulfilledAt            string `json:"fulfilled_at"` // 默认当前，支持历史补录，强制 <= now
-	ActualCost             int64  `json:"actual_cost"`  // 单位：分
-	ResolutionType         string `json:"resolution_type"` // exact(原配原价) | altered(改选替代) | relinquished(理性拔草)
-	ActualTitle            string `json:"actual_title"` // 实际购买物品名 (altered 专用)
-	CreateTransaction      bool   `json:"create_transaction"`
-	CreateGearAsset        bool   `json:"create_gear_asset"` // item 专属一键建入随身设备库
-	CreateLifeEntry        bool   `json:"create_life_entry"`
-	CreateFootprint        bool   `json:"create_footprint"`
-	EntryContent           string `json:"entry_content"`
-	AttachmentIDs          []uint `json:"attachment_ids"`
+	FulfilledAt       string `json:"fulfilled_at"`    // 默认当前，支持历史补录，强制 <= now
+	ActualCost        int64  `json:"actual_cost"`     // 单位：分
+	ResolutionType    string `json:"resolution_type"` // exact(原配原价) | altered(改选替代) | relinquished(理性拔草)
+	ActualTitle       string `json:"actual_title"`    // 实际购买物品名 (altered 专用)
+	CreateTransaction bool   `json:"create_transaction"`
+	CreateGearAsset   bool   `json:"create_gear_asset"` // item 专属一键建入随身设备库
+	CreateLifeEntry   bool   `json:"create_life_entry"`
+	CreateFootprint   bool   `json:"create_footprint"`
+	EntryContent      string `json:"entry_content"`
+	AttachmentIDs     []uint `json:"attachment_ids"`
 	// 分期付款支持 (RC-53)
 	IsInstallment          bool   `json:"is_installment"`
 	InstallmentChannelCode string `json:"installment_channel_code"`
@@ -237,6 +241,18 @@ func CreateWish(c *gin.Context) {
 		}
 	}
 
+	// 补档：许下时刻可指定为过去（省略则取当前）
+	var plantedAt *time.Time
+	if req.PlantedAt != "" {
+		if t, err := ParseFlexTime(req.PlantedAt); err == nil {
+			plantedAt = &t
+		}
+	}
+	plantedMoment := time.Now().In(config.BeijingLocation)
+	if plantedAt != nil {
+		plantedMoment = *plantedAt
+	}
+
 	// MOB-P1-35：省略 kind 时回落到默认 item
 	wishKind := strings.TrimSpace(req.Kind)
 	if wishKind == "" {
@@ -253,6 +269,7 @@ func CreateWish(c *gin.Context) {
 		Budget:     req.Budget,
 		Status:     "wanting",
 		TargetDate: targetDate,
+		PlantedAt:  plantedAt,
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
@@ -270,11 +287,14 @@ func CreateWish(c *gin.Context) {
 		}
 
 		companionEntry := models.LifeEntry{
-			Type:       "wish",
-			Title:      "许下心愿 · " + wish.Title,
-			Content:    entryContent,
-			OccurredAt: time.Now(),
+			Type:    "wish",
+			Title:   "许下心愿 · " + wish.Title,
+			Content: entryContent,
+			// 关键：伴生散页落在**实际许下的时刻**，补档的心愿才会出现在时间流的正确位置
+			OccurredAt: plantedMoment,
 			Location:   wish.CityName,
+			CityCode:   wish.CityCode,
+			CityName:   wish.CityName,
 			WishID:     &wish.ID,
 		}
 		if err := tx.Create(&companionEntry).Error; err != nil {
@@ -326,6 +346,7 @@ func UpdateWish(c *gin.Context) {
 	}
 
 	oldStatus := wish.Status
+	oldTitle := wish.Title
 
 	if req.Title != "" {
 		wish.Title = strings.TrimSpace(req.Title)
@@ -357,6 +378,12 @@ func UpdateWish(c *gin.Context) {
 	if req.TargetDate != "" {
 		if t, err := ParseFlexTime(req.TargetDate); err == nil {
 			wish.TargetDate = &t
+		}
+	}
+	// 补档：许下时刻可改写为过去的时间
+	if req.PlantedAt != "" {
+		if t, err := ParseFlexTime(req.PlantedAt); err == nil {
+			wish.PlantedAt = &t
 		}
 	}
 	if req.FulfilledAt != "" {
@@ -399,6 +426,23 @@ func UpdateWish(c *gin.Context) {
 			}
 			wish.LifeEntryID = &companionEntry.ID
 			syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs, tx)
+		}
+
+		// 普通编辑（未触发达成）时，同步更新「许下心愿」那条伴生散页，
+		// 避免时间流里留着旧标题 / 旧内容。
+		if !(wish.Status == "fulfilled" && oldStatus != "fulfilled") {
+			if err := syncWishCompanionEntry(tx, wish, oldTitle); err != nil {
+				return err
+			}
+			// 补档：许下时刻变了，伴生散页的 occurred_at 要跟着走，
+			// 否则补录的心愿仍然会落在今天。
+			if wish.PlantedAt != nil {
+				if err := tx.Model(&models.LifeEntry{}).
+					Where("wish_id = ? AND title = ?", wish.ID, companionWishPlantedTitlePrefix+wish.Title).
+					Update("occurred_at", *wish.PlantedAt).Error; err != nil {
+					return err
+				}
+			}
 		}
 
 		if err := tx.Save(&wish).Error; err != nil {
@@ -696,8 +740,10 @@ func DeleteWish(c *gin.Context) {
 	if purge {
 		db.DB.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-		db.DB.Model(&models.LifeEntry{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
 		db.DB.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+		// 关键：删除心愿时**一并软删除**它在时间流里的伴生散页。
+		// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
+		db.DB.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{})
 		if err := db.DB.Unscoped().Delete(&w).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return

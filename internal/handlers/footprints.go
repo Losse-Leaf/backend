@@ -1197,4 +1197,3 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		"ledger_summary": ledgerSummary,
 	})
 }
-

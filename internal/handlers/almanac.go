@@ -169,10 +169,10 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	txCount := len(txs)
 	finSpectrum := gin.H{
-		"total_income":       totalIncome,
-		"total_expense":      totalExpense,
-		"balance":            totalIncome - totalExpense,
-		"wish_expenses":      wishExpenses,
+		"total_income":        totalIncome,
+		"total_expense":       totalExpense,
+		"balance":             totalIncome - totalExpense,
+		"wish_expenses":       wishExpenses,
 		"wish_spending_ratio": wishRatio * 100.0, // 百分比，唯一权威键 (BE-38 去除同义双键)
 		"categories":          categories,
 	}

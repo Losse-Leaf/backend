@@ -162,8 +162,8 @@ func AssembleInstallmentTransaction(
 
 // CreditChannelRequest 信贷渠道新增与修改入参 (RC-53)
 type CreditChannelRequest struct {
-	Code         string `json:"code"`
-	Name         string `json:"name" binding:"required"`
+	Code string `json:"code"`
+	Name string `json:"name" binding:"required"`
 	// MOB-P1-35：省略即默认 10 号
 	RepaymentDay int    `json:"repayment_day"` // 1~31
 	Color        string `json:"color"`

@@ -18,7 +18,8 @@ type LifeEntry struct {
 	ProjectID   *uint        `gorm:"index" json:"project_id,omitempty"`
 	Project     *Project     `gorm:"-" json:"project,omitempty"` // 纯逻辑外键关联 ProjectID，不建物理外键约束
 	WishID      *uint        `gorm:"index" json:"wish_id,omitempty"`
-	Wish        *Wish        `gorm:"-" json:"wish,omitempty"` // 纯逻辑外键关联 WishID，不建物理外键约束
+	Wish        *Wish        `gorm:"-" json:"wish,omitempty"`        // 纯逻辑外键关联 WishID，不建物理外键约束
+	GearID      *string      `gorm:"index" json:"gear_id,omitempty"` // 器物伴生散页（器物 id 为字符串）
 	FootprintID *uint        `gorm:"index" json:"footprint_id,omitempty"`
 	Attachments []Attachment `gorm:"-" json:"attachments"` // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
 
@@ -66,16 +67,16 @@ type Project struct {
 
 // Transaction 独立记账记录 (单位：分，避免浮点数精度误差，如 1250 表示 12.50 元)
 type Transaction struct {
-	ID            uint   `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
-	Amount        int64  `gorm:"not null" json:"amount"`         // 分
-	Type          string `gorm:"index;index:idx_tx_type_occurred,priority:1;not null" json:"type"`     // "income" 或 "expense"
-	Category      string `gorm:"index;not null" json:"category"` // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
-	Title         string `json:"title"`
-	Note          string `json:"note"`
-	PaymentMethod string `json:"payment_method"`
-	WishID        *uint  `gorm:"index" json:"wish_id,omitempty"`
-	FootprintID   *uint  `gorm:"index" json:"footprint_id,omitempty"`
-	CityCode      string `gorm:"size:12;index" json:"city_code,omitempty"`
+	ID            uint      `gorm:"primaryKey;index:idx_tx_occurred_id,priority:2" json:"id"`
+	Amount        int64     `gorm:"not null" json:"amount"`                                           // 分
+	Type          string    `gorm:"index;index:idx_tx_type_occurred,priority:1;not null" json:"type"` // "income" 或 "expense"
+	Category      string    `gorm:"index;not null" json:"category"`                                   // 餐饮, 交通, 购物, 娱乐, 学习, 住房, 医疗, 其他
+	Title         string    `json:"title"`
+	Note          string    `json:"note"`
+	PaymentMethod string    `json:"payment_method"`
+	WishID        *uint     `gorm:"index" json:"wish_id,omitempty"`
+	FootprintID   *uint     `gorm:"index" json:"footprint_id,omitempty"`
+	CityCode      string    `gorm:"size:12;index" json:"city_code,omitempty"`
 	OccurredAt    time.Time `gorm:"index:idx_tx_occurred_id,priority:1;index:idx_tx_type_occurred,priority:2;index;not null" json:"occurred_at"`
 	// 分期付款核心字段 (RC-53)
 	IsInstallment           bool           `gorm:"default:false;index" json:"is_installment"`
@@ -130,15 +131,15 @@ type GearItem struct {
 
 // SiteConfig 站点全局配置 (RC-80)
 type SiteConfig struct {
-	ID                   uint      `gorm:"primaryKey" json:"id"`
-	SiteName             string    `json:"site_name"`
-	SiteSubtitle         string    `json:"site_subtitle,omitempty"`
-	CuratorName          string    `json:"curator_name,omitempty"`
-	DefaultLocation      string    `json:"default_location,omitempty"`
-	SiteDesc             string    `json:"site_desc,omitempty"`
-	Initialized          bool      `gorm:"default:false" json:"initialized"`
-	MasterPasscode       string    `gorm:"size:128" json:"-"`                       // 主理人记忆口令哈希
-	InitialLiquidBalance int64     `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
+	ID                   uint   `gorm:"primaryKey" json:"id"`
+	SiteName             string `json:"site_name"`
+	SiteSubtitle         string `json:"site_subtitle,omitempty"`
+	CuratorName          string `json:"curator_name,omitempty"`
+	DefaultLocation      string `json:"default_location,omitempty"`
+	SiteDesc             string `json:"site_desc,omitempty"`
+	Initialized          bool   `gorm:"default:false" json:"initialized"`
+	MasterPasscode       string `gorm:"size:128" json:"-"`                       // 主理人记忆口令哈希
+	InitialLiquidBalance int64  `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
 
 	// 对象存储动态配置 (支持通过管理后台在线配置 Cloudflare R2 / S3 兼容存储)
 	R2Disabled             bool   `gorm:"default:false" json:"-"`
@@ -150,8 +151,8 @@ type SiteConfig struct {
 	R2PublicDomain         string `gorm:"size:255" json:"-"`
 	R2PresignExpireSeconds int    `gorm:"default:1800" json:"-"`
 
-	CreatedAt            time.Time `json:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // CuratorProfile 主理人档案与身份中枢 (全端动态获取，禁止前端硬编码)
@@ -166,8 +167,8 @@ type CuratorProfile struct {
 	AvatarKey   string    `gorm:"-" json:"avatar_key,omitempty"` // 原始存储对象 Key / 相对路径 (如 avatar/user.png)
 	Motto       string    `json:"motto"`
 	Manifesto   string    `gorm:"type:text" json:"manifesto"`
-	Email       string    `gorm:"-" json:"email"`  // 从 SocialLinks 提取平铺下发 (RG-09)
-	Github      string    `gorm:"-" json:"github"` // 从 SocialLinks 提取平铺下发 (RG-09)
+	Email       string    `gorm:"-" json:"email"`     // 从 SocialLinks 提取平铺下发 (RG-09)
+	Github      string    `gorm:"-" json:"github"`    // 从 SocialLinks 提取平铺下发 (RG-09)
 	SocialLinks string    `gorm:"type:text" json:"-"` // JSON 格式存储
 	SocialData  any       `gorm:"-" json:"social_links"`
 	EDCGear     string    `gorm:"type:text" json:"-"` // JSON 格式存储
@@ -180,11 +181,11 @@ type CuratorProfile struct {
 type Device struct {
 	ID           uint      `gorm:"primaryKey" json:"id"`
 	DeviceID     string    `gorm:"uniqueIndex;size:64;not null" json:"device_id"` // e.g. "dev_ios_48b19a27"
-	Name         string    `json:"name"`                                         // e.g. "iPhone 16 Pro"
-	Platform     string    `gorm:"index;size:32" json:"platform"`                // ios, macos, android, web
-	DeviceModel  string    `json:"device_model,omitempty"`                       // e.g. "iPhone17,1"
-	TokenHash    string    `gorm:"uniqueIndex;size:64;not null" json:"-"`        // SHA-256 哈希，绝不存明文
-	Status       string    `gorm:"index;default:active;size:32" json:"status"`   // active, revoked
+	Name         string    `json:"name"`                                          // e.g. "iPhone 16 Pro"
+	Platform     string    `gorm:"index;size:32" json:"platform"`                 // ios, macos, android, web
+	DeviceModel  string    `json:"device_model,omitempty"`                        // e.g. "iPhone17,1"
+	TokenHash    string    `gorm:"uniqueIndex;size:64;not null" json:"-"`         // SHA-256 哈希，绝不存明文
+	Status       string    `gorm:"index;default:active;size:32" json:"status"`    // active, revoked
 	PairedAt     time.Time `json:"paired_at"`
 	LastActiveAt time.Time `gorm:"index" json:"last_active_at"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -207,45 +208,48 @@ type PairTicket struct {
 
 // Wish 三维心愿单表 (好物 item | 旅程 travel | 阶段里程碑 milestone)
 type Wish struct {
-	ID             uint           `gorm:"primaryKey" json:"id"`
-	Title          string         `gorm:"size:255;not null" json:"title"`
-	Kind           string         `gorm:"size:32;index;index:idx_wish_status_kind_created,priority:2;not null" json:"kind"` // item | travel | milestone
-	Note           string         `gorm:"type:text" json:"note"`
-	Spec           string         `gorm:"size:255" json:"spec,omitempty"`
-	CityCode       string         `gorm:"size:12;index" json:"city_code,omitempty"`
-	CityName       string         `gorm:"size:64" json:"city_name,omitempty"`
-	Budget         int64          `gorm:"default:0" json:"budget"`      // 单位：分
-	ActualCost     int64          `gorm:"default:0" json:"actual_cost"` // 单位：分
-	ResolutionType string         `gorm:"size:32;default:exact" json:"resolution_type"` // exact | altered | relinquished
-	ActualTitle    string         `gorm:"size:255" json:"actual_title,omitempty"`
-	TargetDate     *time.Time     `json:"target_date,omitempty"`
-	Status         string         `gorm:"size:32;index;index:idx_wish_status_kind_created,priority:1;index:idx_wish_status_fulfilled,priority:1;default:wanting" json:"status"` // wanting | fulfilled | relinquished | shelved
-	FulfilledAt    *time.Time     `gorm:"index;index:idx_wish_status_fulfilled,priority:2" json:"fulfilled_at,omitempty"`
-	TransactionID  *uint          `gorm:"index" json:"transaction_id,omitempty"`
-	LifeEntryID    *uint          `gorm:"index" json:"life_entry_id,omitempty"`
-	FootprintID    *uint          `gorm:"index" json:"footprint_id,omitempty"`
-	GearID         *string        `gorm:"size:64" json:"gear_id,omitempty"`
-	Attachments    []Attachment   `gorm:"-" json:"attachments"` // 纯逻辑外键关联 WishID，不建物理外键约束
-	CreatedAt      time.Time      `gorm:"index;index:idx_wish_status_kind_created,priority:3" json:"created_at"`
-	UpdatedAt      time.Time      `gorm:"index" json:"updated_at"`
-	DeletedAt      gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+	ID             uint       `gorm:"primaryKey" json:"id"`
+	Title          string     `gorm:"size:255;not null" json:"title"`
+	Kind           string     `gorm:"size:32;index;index:idx_wish_status_kind_created,priority:2;not null" json:"kind"` // item | travel | milestone
+	Note           string     `gorm:"type:text" json:"note"`
+	Spec           string     `gorm:"size:255" json:"spec,omitempty"`
+	CityCode       string     `gorm:"size:12;index" json:"city_code,omitempty"`
+	CityName       string     `gorm:"size:64" json:"city_name,omitempty"`
+	Budget         int64      `gorm:"default:0" json:"budget"`                      // 单位：分
+	ActualCost     int64      `gorm:"default:0" json:"actual_cost"`                 // 单位：分
+	ResolutionType string     `gorm:"size:32;default:exact" json:"resolution_type"` // exact | altered | relinquished
+	ActualTitle    string     `gorm:"size:255" json:"actual_title,omitempty"`
+	TargetDate     *time.Time `json:"target_date,omitempty"`
+	// PlantedAt 许下心愿的时刻（可回填为过去日期以支撑「补档」）；
+	// 伴生的一级散页以它作为 occurred_at，从而在时间流里落在正确的历史位置。
+	PlantedAt     *time.Time     `gorm:"index" json:"planted_at,omitempty"`
+	Status        string         `gorm:"size:32;index;index:idx_wish_status_kind_created,priority:1;index:idx_wish_status_fulfilled,priority:1;default:wanting" json:"status"` // wanting | fulfilled | relinquished | shelved
+	FulfilledAt   *time.Time     `gorm:"index;index:idx_wish_status_fulfilled,priority:2" json:"fulfilled_at,omitempty"`
+	TransactionID *uint          `gorm:"index" json:"transaction_id,omitempty"`
+	LifeEntryID   *uint          `gorm:"index" json:"life_entry_id,omitempty"`
+	FootprintID   *uint          `gorm:"index" json:"footprint_id,omitempty"`
+	GearID        *string        `gorm:"size:64" json:"gear_id,omitempty"`
+	Attachments   []Attachment   `gorm:"-" json:"attachments"` // 纯逻辑外键关联 WishID，不建物理外键约束
+	CreatedAt     time.Time      `gorm:"index;index:idx_wish_status_kind_created,priority:3" json:"created_at"`
+	UpdatedAt     time.Time      `gorm:"index" json:"updated_at"`
+	DeletedAt     gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // Footprint 城市旅游足迹与旅程档案表 (支持单日打卡或多日旅程挂载多条动态与多笔消费)
 type Footprint struct {
 	ID               uint           `gorm:"primaryKey;index:idx_fp_visited_id,priority:2" json:"id"`
-	CityCode         string         `gorm:"size:12;index;index:idx_fp_city_visited,priority:1;not null" json:"city_code"` // 6 位行政区划代码，如杭州 330100
-	CityName         string         `gorm:"size:64;not null" json:"city_name"`                                            // 城市名称，如 "杭州市"
-	Title            string         `gorm:"size:255" json:"title,omitempty"`                                              // 旅程标题，如 "2026 春日大理漫游"
+	CityCode         string         `gorm:"size:12;index;index:idx_fp_city_visited,priority:1;not null" json:"city_code"`                             // 6 位行政区划代码，如杭州 330100
+	CityName         string         `gorm:"size:64;not null" json:"city_name"`                                                                        // 城市名称，如 "杭州市"
+	Title            string         `gorm:"size:255" json:"title,omitempty"`                                                                          // 旅程标题，如 "2026 春日大理漫游"
 	VisitedAt        time.Time      `gorm:"index;index:idx_fp_city_visited,priority:2;index:idx_fp_visited_id,priority:1;not null" json:"visited_at"` // 到访/启程日期
-	DepartedAt       *time.Time     `gorm:"index" json:"departed_at,omitempty"`                                           // 返程/结束日期（多日旅程）
-	Note             string         `gorm:"type:text" json:"note"`                                                        // 足迹随笔或简注
-	LifeEntryID      *uint          `gorm:"index" json:"life_entry_id,omitempty"`                                         // 可选关联首条/伴生时间流条目
-	WishID           *uint          `gorm:"index" json:"wish_id,omitempty"`                                               // 可选关联溯源心愿
-	Attachments      []Attachment   `gorm:"-" json:"attachments"`                                                         // 纯逻辑外键关联 FootprintID，不建物理外键约束
-	EntriesCount     int            `gorm:"-" json:"entries_count,omitempty"`                                             // 该趟旅程下聚合的动态篇数
-	TotalSpent       int64          `gorm:"-" json:"total_spent,omitempty"`                                               // 该趟旅程下聚合的总花销(分，仅管理员下发)
-	TransactionCount int            `gorm:"-" json:"transaction_count,omitempty"`                                         // 该趟旅程下聚合的消费笔数(仅管理员下发)
+	DepartedAt       *time.Time     `gorm:"index" json:"departed_at,omitempty"`                                                                       // 返程/结束日期（多日旅程）
+	Note             string         `gorm:"type:text" json:"note"`                                                                                    // 足迹随笔或简注
+	LifeEntryID      *uint          `gorm:"index" json:"life_entry_id,omitempty"`                                                                     // 可选关联首条/伴生时间流条目
+	WishID           *uint          `gorm:"index" json:"wish_id,omitempty"`                                                                           // 可选关联溯源心愿
+	Attachments      []Attachment   `gorm:"-" json:"attachments"`                                                                                     // 纯逻辑外键关联 FootprintID，不建物理外键约束
+	EntriesCount     int            `gorm:"-" json:"entries_count,omitempty"`                                                                         // 该趟旅程下聚合的动态篇数
+	TotalSpent       int64          `gorm:"-" json:"total_spent,omitempty"`                                                                           // 该趟旅程下聚合的总花销(分，仅管理员下发)
+	TransactionCount int            `gorm:"-" json:"transaction_count,omitempty"`                                                                     // 该趟旅程下聚合的消费笔数(仅管理员下发)
 	CreatedAt        time.Time      `json:"created_at"`
 	UpdatedAt        time.Time      `gorm:"index" json:"updated_at"`
 	DeletedAt        gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`

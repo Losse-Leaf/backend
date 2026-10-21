@@ -775,10 +775,10 @@ func PresignUpload(c *gin.Context) {
 	}
 
 	Success(c, gin.H{
-		"upload_id":   uploadID,
-		"object_key":  objectKey,
-		"upload_url":  presignedURL,
-		"expires_in":  expiresIn,
+		"upload_id":  uploadID,
+		"object_key": objectKey,
+		"upload_url": presignedURL,
+		"expires_in": expiresIn,
 	})
 }
 
@@ -888,7 +888,7 @@ func GetStorageStatus(c *gin.Context) {
 // ==========================================
 
 type TransactionRequest struct {
-	Amount        int64  `json:"amount" binding:"required"` // 分
+	Amount int64 `json:"amount" binding:"required"` // 分
 	// MOB-P1-35：省略即默认 expense（与客户端默认值保持一致）
 	Type          string `json:"type"` // income, expense
 	Category      string `json:"category" binding:"required"`
@@ -1311,25 +1311,8 @@ func CreateProject(c *gin.Context) {
 		}
 
 		// 伴生创建机制：在【造物】立项时自动伴生创建一条对应时间的一级记录写入主时间流 (保证事务原子性)
-		entryContent := p.Description
-		if entryContent == "" {
-			entryContent = p.Story
-		}
-		if entryContent == "" {
-			entryContent = p.Subtitle
-		}
-		if entryContent == "" {
-			entryContent = fmt.Sprintf("立项开启造物项目「%s」。", p.Title)
-		}
-		companionEntry := models.LifeEntry{
-			Type:       "project",
-			Title:      p.Title,
-			Content:    entryContent,
-			OccurredAt: time.Now().In(config.BeijingLocation),
-			Featured:   p.Featured,
-			ProjectID:  &p.ID,
-		}
-		return tx.Create(&companionEntry).Error
+		_, err := createProjectCompanionEntry(tx, p)
+		return err
 	})
 	if err != nil {
 		Error(c, http.StatusInternalServerError, "创建项目及伴生记录失败: "+err.Error())
@@ -1447,6 +1430,7 @@ func UpdateProject(c *gin.Context) {
 
 	oldStory := p.Story
 	oldStatus := p.Status
+	oldTitle := p.Title
 
 	if req.Title != nil {
 		title := strings.TrimSpace(*req.Title)
@@ -1485,6 +1469,12 @@ func UpdateProject(c *gin.Context) {
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 关键：先把「立项」那条伴生散页同步到最新的标题 / 正文，
+		// 否则改了项目名，时间流里仍是旧标题。
+		if err := syncProjectCompanionEntry(tx, p, oldTitle); err != nil {
+			return err
+		}
+
 		if err := tx.Save(&p).Error; err != nil {
 			return err
 		}
@@ -1540,7 +1530,8 @@ func DeleteProject(c *gin.Context) {
 
 	if purge {
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
-			tx.Model(&models.LifeEntry{}).Where("project_id = ?", p.ID).Update("project_id", nil)
+			// 物理删除项目时，一并物理删除它在时间流里的伴生散页
+			tx.Unscoped().Where("project_id = ?", p.ID).Delete(&models.LifeEntry{})
 			return tx.Unscoped().Delete(&p).Error
 		})
 		if err != nil {
@@ -1553,7 +1544,11 @@ func DeleteProject(c *gin.Context) {
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		tx.Model(&models.LifeEntry{}).Where("project_id = ?", p.ID).Update("project_id", nil)
+		// 关键：软删除项目时一并软删除伴生散页，
+		// 否则时间流里会留下一条再也点不回项目的孤儿记录。
+		if err := deleteProjectCompanionEntries(tx, p.ID); err != nil {
+			return err
+		}
 		return tx.Delete(&p).Error
 	})
 	if err != nil {
@@ -1673,7 +1668,6 @@ func GetGlobalStats(c *gin.Context) {
 
 // ==========================================
 // 6. Global Site Configuration & Health Routes (站点全局配置与健康探针 RC-90)
-
 
 func GetConfigV1(c *gin.Context) {
 	var config models.SiteConfig

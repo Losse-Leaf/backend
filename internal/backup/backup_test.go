@@ -181,4 +181,3 @@ func TestDailySchedulerCalculation(t *testing.T) {
 		t.Errorf("Expected waitDuration in (0, 24h], got %v", waitDuration)
 	}
 }
-

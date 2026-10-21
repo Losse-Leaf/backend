@@ -422,4 +422,3 @@ func TestWishAndTravelModules(t *testing.T) {
 		}
 	})
 }
-

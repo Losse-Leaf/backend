@@ -25,15 +25,15 @@ import (
 
 // FileUploadResult 统一文件上传成功后返回给客户端的标准结构
 type FileUploadResult struct {
-	ObjectKey        string `json:"object_key"`        // R2 存储桶内相对路径 (例如 avatar/user.png, entries/2026/10/09/uuid-file.png)
-	URL              string `json:"url"`               // 当前生成的有时效的临时预签名访问 URL (默认 30 分钟)
-	ExpiresIn        int    `json:"expires_in"`        // 临时 URL 有效期 (秒)
-	Filename         string `json:"filename"`          // 原始文件名
-	MimeType         string `json:"mime_type"`         // 检测出的媒体 MIME 类型
-	Size             int64  `json:"size"`              // 文件物理大小 (字节)
-	Width            int    `json:"width,omitempty"`   // 图片宽度 (像素)
-	Height           int    `json:"height,omitempty"`  // 图片高度 (像素)
-	AttachmentID     uint   `json:"attachment_id"`     // 已持久化的关联附件 ID (便于 LifeEntry 快速关联)
+	ObjectKey    string `json:"object_key"`       // R2 存储桶内相对路径 (例如 avatar/user.png, entries/2026/10/09/uuid-file.png)
+	URL          string `json:"url"`              // 当前生成的有时效的临时预签名访问 URL (默认 30 分钟)
+	ExpiresIn    int    `json:"expires_in"`       // 临时 URL 有效期 (秒)
+	Filename     string `json:"filename"`         // 原始文件名
+	MimeType     string `json:"mime_type"`        // 检测出的媒体 MIME 类型
+	Size         int64  `json:"size"`             // 文件物理大小 (字节)
+	Width        int    `json:"width,omitempty"`  // 图片宽度 (像素)
+	Height       int    `json:"height,omitempty"` // 图片高度 (像素)
+	AttachmentID uint   `json:"attachment_id"`    // 已持久化的关联附件 ID (便于 LifeEntry 快速关联)
 }
 
 // allowedUploadFolders 统一文件直传允许的归类目录白名单 (与 docs/backend.md §四.5 路径约定一致)

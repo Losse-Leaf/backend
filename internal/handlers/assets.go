@@ -22,18 +22,18 @@ type ChannelLiabilitySummary struct {
 	ChannelName        string               `json:"channel_name"`
 	RepaymentDay       int                  `json:"repayment_day"`
 	Color              string               `json:"color"`
-	TotalDebt          int64                `json:"total_debt"`          // 该渠道剩余待还总额（分）
-	MonthlyPay         int64                `json:"monthly_pay"`         // 每月待还总额（分）
+	TotalDebt          int64                `json:"total_debt"`           // 该渠道剩余待还总额（分）
+	MonthlyPay         int64                `json:"monthly_pay"`          // 每月待还总额（分）
 	DaysUntilRepayment int                  `json:"days_until_repayment"` // 距离下次还款日天数倒计时
-	ActiveCount        int                  `json:"active_count"`        // 活跃分期笔数
-	Installments       []models.Transaction `json:"installments"`        // 关联分期账目流水列表
+	ActiveCount        int                  `json:"active_count"`         // 活跃分期笔数
+	Installments       []models.Transaction `json:"installments"`         // 关联分期账目流水列表
 }
 
 // GearSummary 随身与固定资产设备库摘要 (RC-53)
 type GearSummary struct {
 	TotalCount         int               `json:"total_count"`
 	ActiveCount        int               `json:"active_count"`
-	ActiveValue        int64             `json:"active_value"`         // 在用固资总价值（分）
+	ActiveValue        int64             `json:"active_value"` // 在用固资总价值（分）
 	SoldCount          int               `json:"sold_count"`
 	SoldRecoveredValue int64             `json:"sold_recovered_value"` // 二手转让回血总额（分）
 	Items              []models.GearItem `json:"items"`
@@ -41,14 +41,14 @@ type GearSummary struct {
 
 // AssetsOverviewResponse 资产大盘看板聚合响应 (RC-53, BE-15)
 type AssetsOverviewResponse struct {
-	NetWorth             int64                      `json:"net_worth"`              // 个人净资产 = 流动可用余额 + 固定资产沉淀 - 待还信贷负债
-	LiquidBalance        int64                      `json:"liquid_balance"`         // 流动可用现金余额
-	InitialLiquidBalance int64                      `json:"initial_liquid_balance"` // 初始流动现金底数 (BE-15)
-	FixedAssets          int64                      `json:"fixed_assets"`           // 在用固定设备资产沉淀
-	TotalLiabilities     int64                      `json:"total_liabilities"`      // 待还信贷分期总负债
-	MonthlyLiabilities   int64                      `json:"monthly_liabilities"`    // 每月固定还款支出
-	GearSummary          GearSummary                `json:"gear_summary"`           // 设备库全生命周期盘点
-	ChannelLiabilities   []ChannelLiabilitySummary  `json:"channel_liabilities"`    // 信贷渠道明细与独立还款日倒计时
+	NetWorth             int64                     `json:"net_worth"`              // 个人净资产 = 流动可用余额 + 固定资产沉淀 - 待还信贷负债
+	LiquidBalance        int64                     `json:"liquid_balance"`         // 流动可用现金余额
+	InitialLiquidBalance int64                     `json:"initial_liquid_balance"` // 初始流动现金底数 (BE-15)
+	FixedAssets          int64                     `json:"fixed_assets"`           // 在用固定设备资产沉淀
+	TotalLiabilities     int64                     `json:"total_liabilities"`      // 待还信贷分期总负债
+	MonthlyLiabilities   int64                     `json:"monthly_liabilities"`    // 每月固定还款支出
+	GearSummary          GearSummary               `json:"gear_summary"`           // 设备库全生命周期盘点
+	ChannelLiabilities   []ChannelLiabilitySummary `json:"channel_liabilities"`    // 信贷渠道明细与独立还款日倒计时
 }
 
 // calculateDaysUntilRepayment 计算距离每月独立还款日的天数倒计时（按北京时间计算 RC-134）
@@ -347,7 +347,7 @@ func SetInitialLiquidBalance(c *gin.Context) {
 
 // AddGearAssetRequest 录入新设备单品请求 (RC-53)
 type AddGearAssetRequest struct {
-	Name                   string `json:"name" binding:"required"`
+	Name string `json:"name" binding:"required"`
 	// MOB-P1-35：省略即默认「数码器材」
 	Category               string `json:"category"`
 	Spec                   string `json:"spec"`
@@ -404,6 +404,17 @@ func AddGearAsset(c *gin.Context) {
 		return append(list, newGear), nil
 	}); err != nil {
 		Error(c, http.StatusInternalServerError, "保存设备资产失败: "+err.Error())
+		return
+	}
+
+	// 伴生创建机制：添置器物时在时间流落一条对应的一级散页，
+	// 使「所有二级对象都能在时间流里查到」这一约定成立。
+	gearOccurredAt, parseErr := ParseFlexTime(purchaseDate)
+	if parseErr != nil {
+		gearOccurredAt = time.Now().In(config.BeijingLocation)
+	}
+	if _, err := createGearCompanionEntry(db.DB, newGear, gearOccurredAt); err != nil {
+		Error(c, http.StatusInternalServerError, "设备已录入但写入伴生记录失败: "+err.Error())
 		return
 	}
 
@@ -533,6 +544,20 @@ func SellGearAsset(c *gin.Context) {
 		return
 	}
 
+	// 同步器物伴生散页：转手后原记录要反映「已转手」，
+	// 否则时间流里的那条「添置器物 · xxx」看起来器物还在手上。
+	if err := db.DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Model(&models.LifeEntry{}).
+			Where("gear_id = ?", soldGear.ID).
+			Updates(map[string]any{
+				"content":    buildGearCompanionContent(soldGear) + fmt.Sprintf(" 已于 %s 转手，回血 ¥%.2f。", soldDate, float64(soldCents)/100),
+				"updated_at": time.Now(),
+			}).Error
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, "设备已转售但同步伴生记录失败: "+err.Error())
+		return
+	}
+
 	Success(c, soldGear)
 }
 
@@ -555,6 +580,14 @@ func DeleteGearAsset(c *gin.Context) {
 		} else {
 			Error(c, http.StatusInternalServerError, "删除设备失败: "+err.Error())
 		}
+		return
+	}
+
+	// 关键：删除器物时一并软删除它在时间流里的伴生散页，避免留下孤儿记录。
+	if err := db.DB.Transaction(func(tx *gorm.DB) error {
+		return deleteGearCompanionEntries(tx, gearID)
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, "设备已删除但清理伴生记录失败: "+err.Error())
 		return
 	}
 

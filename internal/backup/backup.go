@@ -37,12 +37,12 @@ type BackupItem struct {
 }
 
 type Manifest struct {
-	Version           string           `json:"version"`
-	ExportedAt        time.Time        `json:"exported_at"`
-	Generator         string           `json:"generator"`
-	Counts            map[string]int64 `json:"counts"`
-	ContainsDatabase  bool             `json:"contains_database"`
-	ContainsUploads   bool             `json:"contains_uploads"`
+	Version          string           `json:"version"`
+	ExportedAt       time.Time        `json:"exported_at"`
+	Generator        string           `json:"generator"`
+	Counts           map[string]int64 `json:"counts"`
+	ContainsDatabase bool             `json:"contains_database"`
+	ContainsUploads  bool             `json:"contains_uploads"`
 }
 
 var (

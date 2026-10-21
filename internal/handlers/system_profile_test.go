@@ -16,8 +16,8 @@ import (
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
-	"github.com/glebarez/sqlite"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -581,5 +581,3 @@ func TestSystemUpdateCheck(t *testing.T) {
 		}
 	})
 }
-
-

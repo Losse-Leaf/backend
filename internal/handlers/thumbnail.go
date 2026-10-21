@@ -76,18 +76,29 @@ func thumbnailCacheKey(objectKey string, width int) string {
 }
 
 // thumbnailDiskPath 磁盘缓存路径（两级散列目录，避免单目录文件过多）
+//
+// 关键：必须先调 `ensureThumbnailDiskDir()` —— 早先直接用还没初始化的
+// `thumbnailDiskDir`（空串），于是 `filepath.Join("", "9f")` 拼出**相对路径**，
+// 缓存文件就落在进程工作目录里（源码树中会冒出 `9f/`、`57/` 之类的杂物目录）。
 func thumbnailDiskPath(objectKey string, width int) string {
 	key := thumbnailCacheKey(objectKey, width)
-	dir := filepath.Join(thumbnailDiskDir, key[:2])
+	dir := filepath.Join(ensureThumbnailDiskDir(), key[:2])
 	return filepath.Join(dir, key+".jpg")
 }
 
 // ensureThumbnailDiskDir 惰性初始化磁盘缓存目录
+//
+// 关键：目录必须是**绝对路径**。
+// 早先用相对路径（`data/uploads/.thumbnails`），于是缓存目录会随进程工作目录
+// 漂移 —— `go test` 在包目录下跑就会在源码树里留下 `9f/`、`57/` 之类的杂物目录。
 func ensureThumbnailDiskDir() string {
 	thumbnailDiskOnce.Do(func() {
 		base := storage.GetLocalUploadDir()
 		if base == "" {
-			base = os.TempDir()
+			base = filepath.Join(os.TempDir(), "looseleaf")
+		}
+		if abs, err := filepath.Abs(base); err == nil {
+			base = abs
 		}
 		thumbnailDiskDir = filepath.Join(base, ".thumbnails")
 		_ = os.MkdirAll(thumbnailDiskDir, 0o755)

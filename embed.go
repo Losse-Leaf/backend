@@ -86,7 +86,9 @@ func setupFrontendStaticServing(r *gin.Engine) {
 				c.Header("Cache-Control", "no-cache")
 				c.File(filepath.Join(distDir, "sw.js"))
 			})
-			r.GET("/workbox/:file", func(c *gin.Context) {
+			// workbox 的产物文件名形如 workbox-f641ca17.js —— 是**连字符**，
+			// 不是子目录。所以按 /workbox-:file 匹配（Gin 的路由不支持路径中间通配）。
+			r.GET("/workbox-:file", func(c *gin.Context) {
 				c.Header("Cache-Control", "public, max-age=31536000, immutable")
 				c.File(filepath.Join(distDir, "workbox-"+c.Param("file")))
 			})

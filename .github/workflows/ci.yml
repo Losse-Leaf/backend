@@ -24,6 +24,28 @@ jobs:
       - name: Verify Go Module Dependencies
         run: go mod verify
 
+      # ── 展厅版本漂移护栏（提前到 CI 阶段）─────────────────────────
+      # 单二进制内嵌的是 WEB_VERSION 钉死版本的展厅产物。
+      # 原先 WEB_VERSION 停在 v1.3.11 而展厅已发到 v1.3.15 ——
+      # 线上「取消分期」所需的 clear_installment 根本没进 bundle，
+      # **展厅的取消分期一直在静默失效**。
+      # 在 CI 就把它挑出来，比等到发版才发现要便宜得多。
+      - name: Guard against web version drift
+        run: |
+          PINNED=$(cat WEB_VERSION | tr -d '[:space:]')
+          LATEST=$(curl -s --connect-timeout 10 --retry 2 \
+            "https://api.github.com/repos/Losse-Leaf/web/releases/latest" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
+          echo "钉住的展厅版本: ${PINNED} / 展厅最新版本: ${LATEST:-未知}"
+          if [ -z "${LATEST}" ]; then
+            echo "::warning::取不到展厅最新版本，跳过漂移检查"
+          elif [ "${PINNED}" != "${LATEST}" ]; then
+            echo "::error::展厅版本漂移：后端内嵌 ${PINNED}，展厅最新已是 ${LATEST}。请同步 WEB_VERSION。"
+            exit 1
+          else
+            echo "✅ 展厅版本一致（${PINNED}）"
+          fi
+
       - name: Static Code Analysis (go vet)
         run: go vet ./...
 

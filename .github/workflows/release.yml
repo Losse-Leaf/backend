@@ -26,6 +26,30 @@ jobs:
       - name: Read pinned web version
         run: echo "WEB_VERSION=$(cat WEB_VERSION | tr -d '[:space:]')" >> "$GITHUB_ENV"
 
+      # ── 展厅版本漂移护栏 ──────────────────────────────────────────
+      # 单二进制内嵌的是**钉死版本**的展厅产物（WEB_VERSION）。
+      # 原先 WEB_VERSION 一直停在 v1.3.11，而展厅已发到 v1.3.15 ——
+      # 于是线上「取消分期」所需的 clear_installment 字段根本没进 bundle，
+      # **展厅里的取消分期正在静默失效**（用户以为改成功了，服务端没变）。
+      #
+      # 这里把它**变成硬门禁**：钉住的版本必须等于展厅最新 Release，
+      # 否则直接拒绝构建 —— 宁可不发版，也不能悄悄发一个带旧展厅的后端。
+      - name: Guard against web version drift
+        run: |
+          PINNED="${WEB_VERSION}"
+          LATEST=$(curl -s --connect-timeout 10 --retry 2 \
+            "https://api.github.com/repos/Losse-Leaf/web/releases/latest" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
+          echo "钉住的展厅版本: ${PINNED} / 展厅最新版本: ${LATEST:-未知}"
+          if [ -z "${LATEST}" ]; then
+            echo "::warning::取不到展厅最新版本，跳过漂移检查（不阻断构建）"
+          elif [ "${PINNED}" != "${LATEST}" ]; then
+            echo "::error::展厅版本漂移！后端内嵌 ${PINNED}，但展厅最新已是 ${LATEST}。"
+            echo "请先发版展厅，再把 WEB_VERSION 改成 ${LATEST} 后重新构建后端。"
+            exit 1
+          else
+            echo "✅ 展厅版本一致（${PINNED}）"
+
       - name: Fetch pinned web dist (anonymous, public repo)
         run: |
           mkdir -p web/dist

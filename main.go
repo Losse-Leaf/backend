@@ -50,6 +50,9 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	handlers.EnsureEntryFootprintsSynced()
+	// 旅程花销的统计口径已收紧为「只统计**显式挂载**的账目」，
+	// 所以历史账目必须靠**挂载**才能继续计入 —— 启动时做一次全量回填。
+	handlers.EnsureFootprintTransactionsLinked()
 	handlers.LoadStorageConfigFromDB()
 
 	// 3. 生产模式或开发模式

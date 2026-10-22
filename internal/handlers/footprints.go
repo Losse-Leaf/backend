@@ -43,21 +43,82 @@ func autoLinkTransactionFootprint(tx *models.Transaction) {
 		}
 		return
 	}
-	if tx.CityCode != "" {
-		occ := tx.OccurredAt
-		if occ.IsZero() {
-			occ = time.Now()
+	if fpID, ok := bestFootprintFor(tx); ok {
+		idCopy := fpID
+		tx.FootprintID = &idCopy
+	}
+}
+
+// footprintLinkPadDays 账目自动挂载到旅程时的日期容差（前后各放宽几天）
+const footprintLinkPadDays = 2
+
+// bestFootprintFor 按「同城 + 旅程窗口（± 容差）+ 取最近的一趟」的规则，
+// 找出一条账目应当归属的旅程。
+//
+// 关键：**自动挂载与启动回填必须共用这一套规则**。
+// 否则会出现「老数据按一套口径挂、新数据按另一套口径挂」的割裂 ——
+// 旅程花销于是忽高忽低，且没人说得清为什么。
+func bestFootprintFor(tx *models.Transaction) (uint, bool) {
+	if tx == nil || tx.CityCode == "" {
+		return 0, false
+	}
+	occ := tx.OccurredAt
+	if occ.IsZero() {
+		occ = time.Now()
+	}
+	var cityFps []models.Footprint
+	db.DB.Where("city_code = ?", tx.CityCode).Order("visited_at DESC").Find(&cityFps)
+	for _, cand := range cityFps {
+		wStart, wEnd := footprintTripWindow(&cand, footprintLinkPadDays)
+		if !occ.Before(wStart) && !occ.After(wEnd) {
+			return cand.ID, true
 		}
-		var cityFps []models.Footprint
-		db.DB.Where("city_code = ?", tx.CityCode).Order("visited_at DESC").Find(&cityFps)
-		for _, cand := range cityFps {
-			wStart, wEnd := footprintTripWindow(&cand, 2)
-			if !occ.Before(wStart) && !occ.After(wEnd) {
-				idCopy := cand.ID
-				tx.FootprintID = &idCopy
-				return
-			}
+	}
+	return 0, false
+}
+
+// linkUnlinkedTransactions 把所有「未挂载、且按自动挂载规则能找到归属」的账目补挂上去。
+//
+// 关键：模糊匹配只用来**挂载**，不用来**直接计入花销**。
+// 原先统计口径是「显式挂载 ∪ 同城 ±1 天窗口」，
+// 于是同城的无关开销（旅程前一天在本地买的东西）会被算进旅程花销。
+// 现在口径收紧成「只统计显式挂载的账目」，
+// 模糊匹配的职责回归「把该挂的挂上」—— 历史数据因此不会丢。
+//
+// 归属规则与自动挂载**完全一致**（见 bestFootprintFor）：
+// 同城 + 旅程窗口（± 容差）+ 取最近的一趟。
+//
+// - Parameter onlyCityCode: 只处理该城市的账目（空 = 全部）
+// - Returns: 本次补挂的笔数
+func linkUnlinkedTransactions(onlyCityCode string) int {
+	q := db.DB.Where("(footprint_id IS NULL OR footprint_id = 0) AND city_code != ''")
+	if onlyCityCode != "" {
+		q = q.Where("city_code = ?", onlyCityCode)
+	}
+	var txs []models.Transaction
+	if err := q.Find(&txs).Error; err != nil {
+		return 0
+	}
+	linked := 0
+	for i := range txs {
+		if fpID, ok := bestFootprintFor(&txs[i]); ok {
+			db.DB.Model(&models.Transaction{}).
+				Where("id = ?", txs[i].ID).
+				Update("footprint_id", fpID)
+			linked++
 		}
+	}
+	return linked
+}
+
+// EnsureFootprintTransactionsLinked 启动时的全量回填。
+//
+// 关键：这是「统计只认显式挂载」的前提 ——
+// 口径收紧后，历史数据必须靠**挂载**才能继续计入旅程花销。
+func EnsureFootprintTransactionsLinked() {
+	linked := linkUnlinkedTransactions("")
+	if linked > 0 {
+		fmt.Printf("[Footprint] 启动回填：为 %d 笔历史账目补挂了旅程归属\n", linked)
 	}
 }
 
@@ -186,17 +247,24 @@ func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 	if f == nil || f.ID == 0 || !isAdmin {
 		return
 	}
-	wStart, wEnd := footprintTripWindow(f, 1)
+	// 关键：口径收紧为「**只统计显式挂载**到本旅程的账目」。
+	//
+	// 原先是「显式挂载 ∪ 同城 ±1 天窗口内的未挂载账目」——
+	// 于是**同城的无关开销**会被算进旅程花销：
+	// 旅程前一天在本地买的东西、旅程当天没出门却记的账，全都被算上，
+	// 旅程卡片上的「这趟花了多少」于是**虚高**。
+	//
+	// 模糊匹配并没有被丢掉 —— 它的职责回归「**把该挂的挂上**」：
+	// 见 linkUnlinkedTransactions 与启动时的全量回填，
+	// 历史数据因此不会凭空少算。
 	var stats struct {
 		TotalSpent       int64
 		TransactionCount int64
 	}
 	db.DB.Model(&models.Transaction{}).
 		Select("COALESCE(SUM(amount), 0) AS total_spent, COUNT(*) AS transaction_count").
-		Where(
-			"type = 'expense' AND (footprint_id = ? OR ((footprint_id IS NULL OR footprint_id = 0) AND city_code = ? AND occurred_at >= ? AND occurred_at <= ?))",
-			f.ID, f.CityCode, wStart, wEnd,
-		).Scan(&stats)
+		Where("type = 'expense' AND footprint_id = ?", f.ID).
+		Scan(&stats)
 
 	f.TotalSpent = stats.TotalSpent
 	f.TransactionCount = int(stats.TransactionCount)
@@ -643,6 +711,10 @@ func CreateFootprint(c *gin.Context) {
 	}
 
 	db.DB.First(&footprint, footprint.ID)
+	// 关键：统计口径已收紧为「只统计显式挂载的账目」，
+	// 所以新建旅程后立刻把同城的未挂载账目补挂上去 ——
+	// 否则这些历史账目会从旅程花销里凭空消失。
+	linkUnlinkedTransactions(footprint.CityCode)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
 
@@ -740,6 +812,8 @@ func UpdateFootprint(c *gin.Context) {
 	}
 
 	db.DB.First(&footprint, footprint.ID)
+	// 同上：改完旅程（城市/日期变了）也要重新补挂一次
+	linkUnlinkedTransactions(footprint.CityCode)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
 
@@ -926,7 +1000,7 @@ func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction
 	})
 
 	return gin.H{
-		"total_spent":       totalSpent,
+		"total_spent": totalSpent,
 		// 关键：计数与 total_spent **同口径**（只数支出）。
 		// 原先用 len(txs) 把**收入**也数了进去 ——
 		// 于是「4 笔消费」里混着一笔「二手回血」收入，与旁边的金额对不上。

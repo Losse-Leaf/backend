@@ -7,7 +7,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
@@ -128,6 +132,83 @@ func TestFilesHandler(t *testing.T) {
 		items := dataMap["items"].([]interface{})
 		if len(items) != 2 {
 			t.Fatalf("expected 2 signed items, got %d", len(items))
+		}
+	})
+
+	t.Run("本机主存储时批量换签必须走本机媒体签名（BE-45）", func(t *testing.T) {
+		// 背景：单发接口 `SignFileURL` 已修（本机为主时走本机媒体签名），
+		// 而**批量接口漏了** —— 它只走 R2 预签名，
+		// 于是在「R2 只是备份、真存储在 VPS 本地」的部署下
+		// `GeneratePresignedGetURL` 报错 ⇒ 回落到**没有签名**的公开地址
+		// ⇒ 换到的地址根本访问不了。
+		//
+		// 这里造一个**本机存在**的对象，验证批量换签给出的是
+		// 带签名（exp + sig）的本机媒体地址。
+		uploadDir := storage.GetLocalUploadDir()
+		relPath := "uploads/batch-sign-test.bin"
+		fullPath := filepath.Join(uploadDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(fullPath, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if !storage.ObjectExistsLocally(relPath) {
+			t.Fatalf("测试前提不成立：本机应存在 %s", relPath)
+		}
+		// 关键：批量换签对**非管理员**只允许签「已在系统登记」的对象（BE-21），
+		// 所以必须把它登记成一条挂在有效散页上的附件，否则请求会被直接过滤掉。
+		entry := models.LifeEntry{
+			Type:       "life",
+			Title:      "批量换签测试",
+			Content:    "测试用",
+			OccurredAt: time.Now(),
+		}
+		if err := db.DB.Create(&entry).Error; err != nil {
+			t.Fatalf("create entry: %v", err)
+		}
+		entryID := entry.ID
+		att := models.Attachment{
+			EntryID:   &entryID,
+			ObjectKey: relPath,
+			MimeType:  "application/octet-stream",
+			URL:       "/media/" + relPath,
+			CreatedAt: time.Now(),
+		}
+		if err := db.DB.Create(&att).Error; err != nil {
+			t.Fatalf("create attachment: %v", err)
+		}
+
+		body, _ := json.Marshal(map[string]interface{}{"keys": []string{relPath}})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/files/sign-batch", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp Response
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		dataMap := resp.Data.(map[string]interface{})
+		items := dataMap["items"].([]interface{})
+		if len(items) != 1 {
+			t.Fatalf("expected 1 signed item, got %d", len(items))
+		}
+		item := items[0].(map[string]interface{})
+		url, _ := item["url"].(string)
+		if url == "" {
+			t.Fatalf("批量换签必须给出非空 url，实际为空")
+		}
+		if !strings.Contains(url, "sig=") || !strings.Contains(url, "exp=") {
+			t.Errorf("本机媒体地址必须带签名参数（exp + sig），实际: %s", url)
+		}
+		// 缩略图地址也必须一并给出（客户端没法自己拼 —— 签名密钥只在服务端）
+		thumb, _ := item["thumbnail_url"].(string)
+		if thumb == "" {
+			t.Errorf("批量换签必须一并给出缩略图签名地址")
+		} else if !strings.Contains(thumb, "sig=") {
+			t.Errorf("缩略图地址也必须带签名参数，实际: %s", thumb)
 		}
 	})
 

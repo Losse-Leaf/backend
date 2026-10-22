@@ -283,7 +283,14 @@ func SignFilesBatch(c *gin.Context) {
 	type Item struct {
 		ObjectKey string `json:"object_key"`
 		URL       string `json:"url"`
-		ExpiresIn int    `json:"expires_in"`
+		// ThumbnailURL 缩略图签名地址
+		//
+		// 关键：缩略图地址**也必须签名**（否则它就是个公开的「按 key 取图」接口），
+		// 而它与原图是**两条不同的签名** —— 客户端没法自己拼出来
+		// （签名密钥只在服务端），所以批量接口必须一并给出，
+		// 否则客户端刷新了原图地址，缩略图地址却仍是过期的。
+		ThumbnailURL string `json:"thumbnail_url"`
+		ExpiresIn    int    `json:"expires_in"`
 	}
 
 	isAdmin := middleware.IsAdmin(c)
@@ -300,15 +307,34 @@ func SignFilesBatch(c *gin.Context) {
 			continue
 		}
 
-		signedURL, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
-		if err != nil {
-			signedURL = storage.GetPublicURL(cleanKey)
-			exp = 0
+		// 关键：本地磁盘为主时，签名走**本机媒体签名**，
+		// 而不是只走 R2 预签名。
+		//
+		// 与单发接口 `SignFileURL` 保持一致 —— 那条路径本轮已修，
+		// 而批量这条**漏了**，于是「本机为主、R2 仅备份」的部署下：
+		// `GeneratePresignedGetURL` 在未配置 R2 时报错 ⇒ 回落到
+		// `GetPublicURL`（一个**没有签名**的地址）⇒ 换到的地址**根本访问不了**。
+		var signedURL string
+		var expiresIn int
+		if storage.ObjectExistsLocally(cleanKey) {
+			signedURL = storage.SignLocalMediaURL(cleanKey, customDuration)
+			expiresIn = int(storage.LocalMediaSignatureTTL().Seconds())
+		} else {
+			url, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
+			if err != nil {
+				// 换签失败不致命：回落到公开地址，让客户端自己判断能不能用
+				signedURL = storage.GetPublicURL(cleanKey)
+				exp = 0
+			} else {
+				signedURL = url
+				expiresIn = exp
+			}
 		}
 		results = append(results, Item{
-			ObjectKey: cleanKey,
-			URL:       signedURL,
-			ExpiresIn: exp,
+			ObjectKey:    cleanKey,
+			URL:          signedURL,
+			ThumbnailURL: ThumbnailURLFor(cleanKey, 0),
+			ExpiresIn:    expiresIn,
 		})
 	}
 

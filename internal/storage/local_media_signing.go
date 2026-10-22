@@ -47,6 +47,9 @@ var (
 	mediaSigningSecret string
 )
 
+// LocalMediaSignatureTTL 返回本机媒体签名的默认有效期
+func LocalMediaSignatureTTL() time.Duration { return mediaSignatureTTL }
+
 // MediaSigningSecret 返回本机媒体签名密钥（不存在则生成一个并缓存）。
 //
 // 关键：密钥**只存在进程内存里**，不落盘。

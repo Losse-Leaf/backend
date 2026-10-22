@@ -234,10 +234,24 @@ func SignFileURL(c *gin.Context) {
 		}
 	}
 
-	signedURL, expiresIn, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
-	if err != nil {
-		Error(c, http.StatusInternalServerError, "生成临时签名 URL 失败: "+err.Error())
-		return
+	// 关键：本地磁盘为主时，签名走**本机媒体签名**，
+	// 而不是只走 R2 预签名。
+	// 否则在「R2 只是备份、真存储在 VPS 本地」的部署下，
+	// 这个公开接口会**必然失败**（GeneratePresignedGetURL 在未配置 R2 时报错），
+	// 访客换不到任何图片地址。
+	var signedURL string
+	var expiresIn int
+	if storage.ObjectExistsLocally(cleanKey) {
+		signedURL = storage.SignLocalMediaURL(cleanKey, customDuration)
+		expiresIn = int(storage.LocalMediaSignatureTTL().Seconds())
+	} else {
+		url, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
+		if err != nil {
+			Error(c, http.StatusInternalServerError, "生成临时签名 URL 失败: "+err.Error())
+			return
+		}
+		signedURL = url
+		expiresIn = exp
 	}
 
 	Success(c, gin.H{

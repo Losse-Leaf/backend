@@ -49,6 +49,7 @@ jobs:
             exit 1
           else
             echo "✅ 展厅版本一致（${PINNED}）"
+          fi
 
       - name: Fetch pinned web dist (anonymous, public repo)
         run: |

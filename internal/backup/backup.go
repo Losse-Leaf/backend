@@ -23,7 +23,12 @@ import (
 )
 
 const (
-	MaxBackupRetention = 7
+	// MaxBackupRetention 保留的备份份数
+	//
+	// 备份频率改为每 6 小时后，保留 12 份 ≈ 3 天历史
+	// （原先每日 1 次保留 7 份 ≈ 7 天；频率提高 4 倍，
+	// 份数相应上调以维持相近的历史深度，磁盘占用仍在可接受范围）。
+	MaxBackupRetention = 12
 	BackupFilePrefix   = "looseleaf-backup-"
 	BackupFileExt      = ".zip"
 	LocalBackupSubDir  = "backups"
@@ -592,7 +597,16 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 	return nil
 }
 
-// StartDailyBackupScheduler 启动每日自动定时备份任务 (北京时间 03:30)
+// BackupInterval 自动全量备份的间隔
+//
+// 关键（DEC-05 口径 B）：原先是**每日一次**（03:30）——
+// 于是 VPS 磁盘损坏时，最多**丢失一天**的记录。
+// 现在改为**每 6 小时一次**，把灾难时的数据损失从「一天」压到「六小时」。
+const BackupInterval = 6 * time.Hour
+
+// StartDailyBackupScheduler 启动周期性自动全量备份任务
+//
+// 保留旧函数名以免影响调用方，但内部已是**每 6 小时**一轮（见 BackupInterval）。
 func StartDailyBackupScheduler() {
 	go func() {
 		defer func() {
@@ -603,14 +617,14 @@ func StartDailyBackupScheduler() {
 
 		for {
 			now := time.Now().In(config.BeijingLocation)
-			// 计算下一个 03:30 的时刻
-			nextRun := time.Date(now.Year(), now.Month(), now.Day(), 3, 30, 0, 0, config.BeijingLocation)
-			if now.After(nextRun) {
-				nextRun = nextRun.Add(24 * time.Hour)
+			// 计算下一个整点后 6 小时刻度
+			nextRun := now.Truncate(time.Hour).Add(BackupInterval)
+			if !nextRun.After(now) {
+				nextRun = nextRun.Add(BackupInterval)
 			}
 
 			waitDuration := nextRun.Sub(now)
-			log.Printf("[Backup Scheduler] 下次每日全量自动备份定于: %s (等待 %s)",
+			log.Printf("[Backup Scheduler] 下次全量自动备份定于: %s (等待 %s)",
 				nextRun.Format("2006-01-02 15:04:05"), waitDuration.Round(time.Minute))
 
 			timer := time.NewTimer(waitDuration)

@@ -70,6 +70,38 @@ func CalculateElapsedInstallmentMonths(occurredAt time.Time, totalMonths int, re
 	return paidMonths, remainMonths
 }
 
+// InstallmentPeriodAmount 返回第 period 期（1 起）应还金额
+//
+// 关键（DEC-02 口径 A）：**前 N-1 期取整除，最后一期吃掉尾差**。
+// 于是「各期之和 == 总额」永远成立，账单对得上：
+//
+//	base = total / months
+//	rem  = total % months
+//	第 1..N-1 期各 base
+//	第 N 期 base + rem
+//
+// 这样「月供 × 期数 ≠ 总额」的矛盾就不存在了。
+func InstallmentPeriodAmount(totalAmount int64, totalMonths int, monthlyPay int64, period int) int64 {
+	if totalAmount <= 0 || totalMonths <= 0 {
+		return 0
+	}
+	if monthlyPay <= 0 {
+		monthlyPay = totalAmount / int64(totalMonths)
+	}
+	if period < 1 {
+		period = 1
+	}
+	if period > totalMonths {
+		period = totalMonths
+	}
+	remainder := totalAmount % int64(totalMonths)
+	if period == totalMonths {
+		// 最后一期吃掉尾差
+		return monthlyPay + remainder
+	}
+	return monthlyPay
+}
+
 // CalculateInstallmentAmounts 精确计算分期已还金额与剩余待还本金（消除整除尾差，保证 paidAmount + remainingDebt == totalAmount）
 func CalculateInstallmentAmounts(totalAmount int64, totalMonths int, monthlyPay int64, paidMonths int, remainMonths int) (paidAmount int64, remainingDebt int64) {
 	if totalAmount <= 0 {

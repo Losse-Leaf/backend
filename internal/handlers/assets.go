@@ -194,6 +194,8 @@ func GetAssetsOverview(c *gin.Context) {
 
 	var totalLiabilities int64
 	var monthlyLiabilities int64
+	// 已还分期款合计（逐期扣现金时要从流动余额里减掉）
+	var totalRepaid int64
 
 	// 加载所有信贷渠道配置
 	var channels []models.CreditChannel
@@ -250,12 +252,24 @@ func GetAssetsOverview(c *gin.Context) {
 		if totalAmount <= 0 {
 			totalAmount = tx.Amount
 		}
-		_, debt := CalculateInstallmentAmounts(totalAmount, tx.InstallmentMonths, tx.InstallmentMonthlyPay, paidMonths, tx.InstallmentRemainMonths)
+		paidAmount, debt := CalculateInstallmentAmounts(totalAmount, tx.InstallmentMonths, tx.InstallmentMonthlyPay, paidMonths, tx.InstallmentRemainMonths)
+		// 关键（DEC-01 口径 B：分期款**逐期**扣现金）：
+		// 每还一期，现金减一次、负债也减一次 ⇒ 净资产始终不变。
+		// 原先分期支出**完全不算**现金支出，而负债却逐月减少，
+		// 两套模型混用 ⇒ 净资产随还款进度**虚增**（涨的幅度恰好等于已还金额）。
+		totalRepaid += paidAmount
 
 		// 剩余期数 > 0 计入待还负债
 		if tx.InstallmentRemainMonths > 0 {
 			totalLiabilities += debt
-			monthlyLiabilities += tx.InstallmentMonthlyPay
+			// 关键（DEC-02 口径 A）：「本月应还」按**下一期的实际金额**算 ——
+			// 最后一期会多出整除的尾差。
+			// 早先直接累加 monthlyPay（整除值），
+			// 于是「月供 × 期数 ≠ 总额」，界面上两个数字对不上。
+			nextPeriod := paidMonths + 1
+			monthlyLiabilities += InstallmentPeriodAmount(
+				totalAmount, tx.InstallmentMonths, tx.InstallmentMonthlyPay, nextPeriod,
+			)
 
 			summary, exists := channelMap[chCode]
 			if !exists {
@@ -280,7 +294,10 @@ func GetAssetsOverview(c *gin.Context) {
 		}
 	}
 
-	liquidBalance := initialLiquid + totalIncome - nonInstallmentExpense
+	// 关键（DEC-01 口径 B）：流动可用余额要扣掉**已还的分期款**。
+	// 购入时现金不动（分期还没还），每还一期现金减一次、负债减一次，
+	// 于是净资产在整个分期周期内**恒定**。
+	liquidBalance := initialLiquid + totalIncome - nonInstallmentExpense - totalRepaid
 
 	var channelLiabilities []ChannelLiabilitySummary
 	for _, code := range channelOrder {

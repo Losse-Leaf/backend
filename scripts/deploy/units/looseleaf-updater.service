@@ -1,0 +1,9 @@
+[Unit]
+Description=Loose-Leaf Automated Release Updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/looseleaf
+ExecStart=/home/ubuntu/looseleaf/update.sh

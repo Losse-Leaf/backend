@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for Loose-Leaf Updates Every 6 Hours
+After=network.target
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

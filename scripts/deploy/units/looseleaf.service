@@ -1,0 +1,16 @@
+[Unit]
+Description=Loose-Leaf Life Archive Core
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/looseleaf
+ExecStart=/home/ubuntu/looseleaf/looseleaf
+Restart=always
+RestartSec=5
+Environment=PORT=8080
+Environment=GIN_MODE=release
+
+[Install]
+WantedBy=multi-user.target

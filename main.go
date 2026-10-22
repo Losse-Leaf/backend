@@ -166,6 +166,8 @@ func main() {
 			write.POST("/assets/gear", handlers.AddGearAsset)
 			write.POST("/assets/gear/:id/sell", handlers.SellGearAsset)
 			write.DELETE("/assets/gear/:id", handlers.DeleteGearAsset)
+			// 恢复被删除的随身设备（⌘Z 撤销用）：连同伴生散页一起恢复
+			write.POST("/assets/gear/restore", handlers.RestoreGearAsset)
 
 			// 信贷分期渠道配置与独立还款日 (RC-53)
 			write.GET("/credit-channels", handlers.GetCreditChannels)

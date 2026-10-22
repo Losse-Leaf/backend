@@ -578,6 +578,97 @@ func SellGearAsset(c *gin.Context) {
 	Success(c, soldGear)
 }
 
+// RestoreGearAssetRequest 恢复一件被删除的随身设备（⌘Z 撤销用）
+//
+// 关键：设备本体存在**档案的 JSON 列**里（`CuratorProfile.edcGear`），
+// 删除是「从数组里移除」—— 没有 deleted_at 可标记，也就**没有恢复的落点**。
+// 所以恢复时由客户端把**原始设备数据**带回来（撤销栈里还留着它），
+// 服务端按**原 id** 重新插回数组，并连带恢复它的伴生散页。
+type RestoreGearAssetRequest struct {
+	ID             string `json:"id" binding:"required"`
+	Name           string `json:"name" binding:"required"`
+	Spec           string `json:"spec"`
+	Category       string `json:"category"`
+	Status         string `json:"status"`
+	PriceCents     int64  `json:"price_cents"`
+	PurchaseDate   string `json:"purchase_date"`
+	SoldPriceCents int64  `json:"sold_price_cents"`
+	SoldDate       string `json:"sold_date"`
+	Note           string `json:"note"`
+	// Index 原先在档案数组中的位置（-1 = 追加到末尾）
+	Index int `json:"index"`
+}
+
+// RestoreGearAsset 恢复一件被删除的随身设备（连同它的伴生散页）
+//
+// 关键：这是「删除 ⌘Z 可撤销」的后端前提。
+// 原先删除是**硬删**（从 JSON 数组里移除），伴生散页也一并软删，
+// 而**软删除的散页没有任何恢复端点** —— 于是误删一件设备，
+// 它的照片与手记就**永久回不来了**。
+//
+// 现在恢复做两件事：
+// 1. 把设备按**原 id** 插回档案数组（原位置优先）；
+// 2. 把 `gear_id` 指向它的伴生散页**取消软删除**（`deleted_at` 置空）。
+func RestoreGearAsset(c *gin.Context) {
+	var req RestoreGearAssetRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "设备 id 与名称必填")
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		Error(c, http.StatusBadRequest, "设备 id 必填")
+		return
+	}
+
+	restored := false
+	err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
+		// 已经存在（可能重复提交）⇒ 幂等返回，不重复插入
+		for _, g := range list {
+			if g.ID == req.ID {
+				restored = true
+				return list, nil
+			}
+		}
+		item := models.GearItem{
+			ID:             req.ID,
+			Name:           strings.TrimSpace(req.Name),
+			Spec:           req.Spec,
+			Category:       req.Category,
+			Status:         req.Status,
+			PriceCents:     req.PriceCents,
+			PurchaseDate:   req.PurchaseDate,
+			SoldPriceCents: req.SoldPriceCents,
+			SoldDate:       req.SoldDate,
+			Note:           req.Note,
+		}
+		idx := req.Index
+		if idx < 0 || idx > len(list) {
+			idx = len(list)
+		}
+		restored = true
+		return append(list[:idx], append([]models.GearItem{item}, list[idx:]...)...), nil
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "恢复设备失败: "+err.Error())
+		return
+	}
+	if !restored {
+		Error(c, http.StatusNotFound, "设备不存在")
+		return
+	}
+
+	// 连带恢复伴生散页（软删除的清掉 deleted_at）
+	if err := db.DB.Unscoped().Model(&models.LifeEntry{}).
+		Where("gear_id = ?", req.ID).
+		Update("deleted_at", nil).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "设备已恢复但伴生记录恢复失败: "+err.Error())
+		return
+	}
+
+	Success(c, gin.H{"id": req.ID, "restored": true})
+}
+
 // DeleteGearAsset 从设备库中物理删除设备单品 (RC-53)
 func DeleteGearAsset(c *gin.Context) {
 	gearID := c.Param("id")

@@ -242,6 +242,13 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 	}
 }
 
+// footprintExpenseStatRow 旅程花销聚合查询的结果行
+type footprintExpenseStatRow struct {
+	FootprintID      uint
+	TotalSpent       int64
+	TransactionCount int64
+}
+
 // populateFootprintExpenseStats 为单次旅程计算关联的花销笔数与总额 (仅管理员可见)
 func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 	if f == nil || f.ID == 0 || !isAdmin {
@@ -268,6 +275,47 @@ func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 
 	f.TotalSpent = stats.TotalSpent
 	f.TransactionCount = int(stats.TransactionCount)
+}
+
+// populateFootprintExpenseStatsBatch 用**一条 GROUP BY 聚合查询**回填一组旅程的花销统计 (仅管理员)。
+//
+// 原先列表对每条足迹各跑一次 SUM/COUNT，列表越长 SQL 越多（N+1）。
+// 这里一次性聚合后在内存里按 footprint_id 回填，SQL 条数恒为 1。
+func populateFootprintExpenseStatsBatch(footprints []models.Footprint, isAdmin bool) {
+	if !isAdmin || len(footprints) == 0 {
+		return
+	}
+	ids := make([]uint, 0, len(footprints))
+	for i := range footprints {
+		if footprints[i].ID > 0 {
+			ids = append(ids, footprints[i].ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	var rows []footprintExpenseStatRow
+	if err := db.DB.Model(&models.Transaction{}).
+		Select("footprint_id, COALESCE(SUM(amount), 0) AS total_spent, COUNT(*) AS transaction_count").
+		Where("type = 'expense' AND footprint_id IN ?", ids).
+		Group("footprint_id").
+		Scan(&rows).Error; err != nil {
+		return
+	}
+
+	statsByFP := make(map[uint]footprintExpenseStatRow, len(rows))
+	for _, row := range rows {
+		statsByFP[row.FootprintID] = row
+	}
+	for i := range footprints {
+		row, ok := statsByFP[footprints[i].ID]
+		if !ok {
+			continue
+		}
+		footprints[i].TotalSpent = row.TotalSpent
+		footprints[i].TransactionCount = int(row.TransactionCount)
+	}
 }
 
 // CreateFootprintRequest 录入足迹/旅程请求
@@ -478,12 +526,24 @@ func EnsureEntryFootprintsSynced() {
 	}
 }
 
-// GetFootprints 列表查询足迹记录 (支持 city_code, year, since, ETag)
+// GetFootprints 列表查询足迹记录 (支持 city_code, year, since, limit, ETag)
+//
+// limit 是可选的，默认 0 = 返回全部（保持既有客户端行为不变）。
+// limit > 0 时最多返回 limit 条，并把响应包装成
+// `{footprints: [...], has_more: bool}`；未传 limit 时仍返回原来的数组。
 func GetFootprints(c *gin.Context) {
 	cityCode := c.Query("city_code")
 	yearStr := c.Query("year")
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+
+	// 可选分页：非法值或 <=0 一律视为「不限制」，避免客户端漏传时丢数据。
+	limit := 0
+	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
+		if n, err := strconv.Atoi(rawLimit); err == nil && n > 0 {
+			limit = n
+		}
+	}
 
 	dbScope := db.DB
 	if includeDeleted {
@@ -507,17 +567,32 @@ func GetFootprints(c *gin.Context) {
 		}
 	}
 
+	// 多取一条用于判断是否还有下一页，再截断到 limit，避免多一次 COUNT 查询。
+	if limit > 0 {
+		query = query.Limit(limit + 1)
+	}
+
 	var footprints []models.Footprint
 	if err := query.Find(&footprints).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取足迹列表失败")
 		return
 	}
 
+	hasMore := false
+	if limit > 0 {
+		if len(footprints) > limit {
+			footprints = footprints[:limit]
+			hasMore = true
+		}
+		if footprints == nil {
+			footprints = []models.Footprint{}
+		}
+	}
+
 	isAdmin := middleware.IsAdmin(c)
 	populateFootprintURLsBatch(footprints)
-	for i := range footprints {
-		populateFootprintExpenseStats(&footprints[i], isAdmin)
-	}
+	// 一条 GROUP BY 聚合回填全部旅程的花销，替代逐条 SUM/COUNT 的 N+1。
+	populateFootprintExpenseStatsBatch(footprints, isAdmin)
 
 	// ETag 与 304 缓存协商
 	var maxUpdated time.Time
@@ -537,6 +612,16 @@ func GetFootprints(c *gin.Context) {
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
+		return
+	}
+
+	// limit 未传时保持原契约：data 仍是足迹数组。
+	// 只有显式分页（limit > 0）才切换到带 has_more 的对象结构。
+	if limit > 0 {
+		Success(c, gin.H{
+			"footprints": footprints,
+			"has_more":   hasMore,
+		})
 		return
 	}
 
@@ -937,10 +1022,11 @@ type DrawerCategoryItem struct {
 // processDrawerFootprints 统一处理抽屉足迹相片签名、旅程花销统计并计算首访与最近到访日期
 func processDrawerFootprints(footprints []models.Footprint, isAdmin bool) (string, string, []uint) {
 	populateFootprintURLsBatch(footprints)
+	// 与列表接口一致：一条聚合查询回填全部花销统计，避免逐条 SUM/COUNT。
+	populateFootprintExpenseStatsBatch(footprints, isAdmin)
 	var firstVisit, latestVisit time.Time
 	fpIDs := make([]uint, 0, len(footprints))
-	for i, f := range footprints {
-		populateFootprintExpenseStats(&footprints[i], isAdmin)
+	for _, f := range footprints {
 		if f.ID > 0 {
 			fpIDs = append(fpIDs, f.ID)
 		}

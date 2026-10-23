@@ -36,6 +36,11 @@ import (
 const (
 	// mediaSignatureTTL 本机媒体签名 URL 的默认有效期
 	mediaSignatureTTL = 30 * time.Minute
+	// mediaSignatureWindowSeconds 签名过期时间的对齐窗口（秒）
+	//
+	// 关键：过期时间必须落在这个窗口的边界上，否则同一张图每序列化一次
+	// 就会得到不同的 exp/sig，而缩略图响应又声明了 immutable 缓存 —— 缓存永不命中。
+	mediaSignatureWindowSeconds int64 = 300
 	// mediaSignatureParamExpires 有效期参数名
 	mediaSignatureParamExpires = "exp"
 	// mediaSignatureParamSig 签名参数名
@@ -100,24 +105,47 @@ func thumbnailResource(objectKey string, width int) string {
 	return fmt.Sprintf("thumb:%s:%d", objectKey, width)
 }
 
-// SignLocalMediaURL 生成本机媒体的签名访问 URL
+// mediaSignatureExpiry 计算签名 URL 的过期时间（unix 秒）。
 //
-// 返回形如 `/media/<key>?exp=1700000000&sig=abcdef...`
-func SignLocalMediaURL(objectKey string, customDuration ...time.Duration) string {
+// 过期时间按 300 秒窗口对齐，使**同一窗口内**同一对象生成的 URL 完全一致，
+// 从而让 immutable 缓存真正命中。
+//
+// 实现要点：窗口锚点取「当前窗口的结束时刻」，再叠加 TTL 后向上取整。
+// 这样既保证 exp 恒定，又保证 exp >= now+ttl。
+// （若直接对 now+ttl 向上取整，当 TTL 恰好是 300 的整数倍时，
+// 窗口内第一秒与其余秒会落在不同的 300 秒档位上，URL 仍会变化。）
+func mediaSignatureExpiry(now time.Time, ttl time.Duration) int64 {
+	ttlSeconds := int64((ttl + time.Second - 1) / time.Second)
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	windowEnd := (now.Unix()/mediaSignatureWindowSeconds + 1) * mediaSignatureWindowSeconds
+	return ((windowEnd + ttlSeconds + mediaSignatureWindowSeconds - 1) / mediaSignatureWindowSeconds) * mediaSignatureWindowSeconds
+}
+
+// signLocalMediaURLAt 在指定时刻签发本机媒体 URL（便于测试窗口对齐）
+func signLocalMediaURLAt(objectKey string, ttl time.Duration, now time.Time) string {
 	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
 	if objectKey == "" {
 		return ""
 	}
-	ttl := mediaSignatureTTL
-	if len(customDuration) > 0 && customDuration[0] > 0 {
-		ttl = customDuration[0]
-	}
-	expiresAt := time.Now().Add(ttl).Unix()
+	expiresAt := mediaSignatureExpiry(now, ttl)
 	sig := computeMediaSignature(mediaResource(objectKey), expiresAt)
 	return fmt.Sprintf("/media/%s?%s=%d&%s=%s",
 		objectKey,
 		mediaSignatureParamExpires, expiresAt,
 		mediaSignatureParamSig, sig)
+}
+
+// SignLocalMediaURL 生成本机媒体的签名访问 URL
+//
+// 返回形如 `/media/<key>?exp=1700000000&sig=abcdef...`
+func SignLocalMediaURL(objectKey string, customDuration ...time.Duration) string {
+	ttl := mediaSignatureTTL
+	if len(customDuration) > 0 && customDuration[0] > 0 {
+		ttl = customDuration[0]
+	}
+	return signLocalMediaURLAt(objectKey, ttl, time.Now())
 }
 
 // VerifyLocalMediaSignature 校验本机媒体访问请求
@@ -150,11 +178,8 @@ func VerifyLocalMediaSignature(objectKey string, expRaw string, sigRaw string) b
 	return hmac.Equal([]byte(expected), []byte(sigRaw))
 }
 
-// SignLocalThumbnailURL 生成缩略图的签名访问 URL
-//
-// 关键：缩略图路由也必须签名 —— 否则它就是一个公开的「按 key 取图」接口，
-// 任何知道 object_key 的人都能拿到你的相纸。
-func SignLocalThumbnailURL(objectKey string, width int) string {
+// signLocalThumbnailURLAt 在指定时刻签发缩略图 URL（便于测试窗口对齐）
+func signLocalThumbnailURLAt(objectKey string, width int, now time.Time) string {
 	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
 	if objectKey == "" {
 		return ""
@@ -162,12 +187,22 @@ func SignLocalThumbnailURL(objectKey string, width int) string {
 	if width <= 0 {
 		width = 480
 	}
-	expiresAt := time.Now().Add(mediaSignatureTTL).Unix()
+	expiresAt := mediaSignatureExpiry(now, mediaSignatureTTL)
 	sig := computeMediaSignature(thumbnailResource(objectKey, width), expiresAt)
 	return fmt.Sprintf("/api/v1/files/thumbnail?key=%s&w=%d&%s=%d&%s=%s",
 		url.QueryEscape(objectKey), width,
 		mediaSignatureParamExpires, expiresAt,
 		mediaSignatureParamSig, sig)
+}
+
+// SignLocalThumbnailURL 生成缩略图的签名访问 URL
+//
+// 关键：缩略图路由也必须签名 —— 否则它就是一个公开的「按 key 取图」接口，
+// 任何知道 object_key 的人都能拿到你的相纸。
+//
+// 过期时间的窗口对齐规则与原图一致（见 mediaSignatureExpiry）。
+func SignLocalThumbnailURL(objectKey string, width int) string {
+	return signLocalThumbnailURLAt(objectKey, width, time.Now())
 }
 
 // VerifyLocalThumbnailSignature 校验缩略图访问请求

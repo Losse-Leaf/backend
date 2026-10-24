@@ -135,20 +135,27 @@ func saveProfileGear(profile *models.CuratorProfile, list []models.GearItem) err
 	return saveProfileGearWith(db.DB, profile, list)
 }
 
-// mutateProfileGear 在进程级互斥锁内完成 EDCGear 的读-改-写（事务外场景的统一入口）
-func mutateProfileGear(mutate func([]models.GearItem) ([]models.GearItem, error)) error {
-	profileGearMu.Lock()
-	defer profileGearMu.Unlock()
-
+// mutateProfileGearLocked 在**已持有 profileGearMu** 时用指定连接读写 EDCGear。
+//
+// 事务调用方必须先取锁再开启事务：锁序固定为 profileGearMu → DB 事务，
+// 否则「事务持写锁等互斥锁、持锁方等写锁」会在 SQLite 单写者模型下互相卡住。
+func mutateProfileGearLocked(dbTx *gorm.DB, mutate func([]models.GearItem) ([]models.GearItem, error)) error {
 	var profile models.CuratorProfile
-	if err := db.DB.First(&profile).Error; err != nil {
+	if err := dbTx.First(&profile).Error; err != nil {
 		return err
 	}
 	list, err := mutate(loadProfileGear(&profile))
 	if err != nil {
 		return err
 	}
-	return saveProfileGear(&profile, list)
+	return saveProfileGearWith(dbTx, &profile, list)
+}
+
+// mutateProfileGear 在进程级互斥锁内完成 EDCGear 的读-改-写（事务外场景的统一入口）
+func mutateProfileGear(mutate func([]models.GearItem) ([]models.GearItem, error)) error {
+	profileGearMu.Lock()
+	defer profileGearMu.Unlock()
+	return mutateProfileGearLocked(db.DB, mutate)
 }
 
 // GetAssetsOverview 资产管理大盘看板 (RC-53)
@@ -293,7 +300,10 @@ func GetAssetsOverview(c *gin.Context) {
 				channelOrder = append(channelOrder, chCode)
 			}
 			summary.TotalDebt += debt
-			summary.MonthlyPay += tx.InstallmentMonthlyPay
+			// 与「本月应还」同口径：按下一期的实际金额累加，末期限吃掉整除尾差。
+			summary.MonthlyPay += InstallmentPeriodAmount(
+				totalAmount, tx.InstallmentMonths, tx.InstallmentMonthlyPay, paidMonths+1,
+			)
 			summary.ActiveCount++
 			summary.Installments = append(summary.Installments, *tx)
 		}
@@ -520,29 +530,67 @@ func SellGearAsset(c *gin.Context) {
 
 	var soldGear models.GearItem
 	found := false
-	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
-		for i := range list {
-			if list[i].ID == gearID {
-				if list[i].Status == "sold" {
-					return nil, errGearAlreadySold
-				}
-				list[i].Status = "sold"
-				list[i].SoldPriceCents = soldCents
-				list[i].SoldDate = soldDate
-				if req.Note != "" {
-					if list[i].Note != "" {
-						list[i].Note += " | " + strings.TrimSpace(req.Note)
-					} else {
-						list[i].Note = strings.TrimSpace(req.Note)
+	occurred, err := ParseFlexTime(soldDate)
+	if err != nil {
+		occurred = time.Now()
+	}
+
+	// 设备状态、回血流水与伴生散页必须原子提交：任一失败都回滚，
+	// 否则会出现「已标记售出却没有收入」且重试被已售守卫永久拒绝。
+	// 先取器物互斥锁，再开启事务（锁序 profileGearMu → DB）。
+	profileGearMu.Lock()
+	defer profileGearMu.Unlock()
+
+	err = db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
+			for i := range list {
+				if list[i].ID == gearID {
+					if list[i].Status == "sold" {
+						return nil, errGearAlreadySold
 					}
+					list[i].Status = "sold"
+					list[i].SoldPriceCents = soldCents
+					list[i].SoldDate = soldDate
+					if req.Note != "" {
+						if list[i].Note != "" {
+							list[i].Note += " | " + strings.TrimSpace(req.Note)
+						} else {
+							list[i].Note = strings.TrimSpace(req.Note)
+						}
+					}
+					soldGear = list[i]
+					found = true
+					return list, nil
 				}
-				soldGear = list[i]
-				found = true
-				return list, nil
 			}
+			return nil, fmt.Errorf("设备不存在")
+		}); err != nil {
+			return err
 		}
-		return nil, fmt.Errorf("设备不存在")
-	}); err != nil {
+
+		incomeTx := models.Transaction{
+			Amount:        soldCents,
+			Type:          "income",
+			Category:      "二手回血",
+			Title:         "设备转售回血: " + soldGear.Name,
+			Note:          fmt.Sprintf("设备出二手流转回血 (%s)", strings.TrimSpace(req.Note)),
+			PaymentMethod: "二手转让",
+			OccurredAt:    occurred,
+		}
+		if err := tx.Create(&incomeTx).Error; err != nil {
+			return err
+		}
+
+		// 同步器物伴生散页：转手后原记录要反映「已转手」，
+		// 否则时间流里的那条「添置器物 · xxx」看起来器物还在手上。
+		return tx.Model(&models.LifeEntry{}).
+			Where("gear_id = ?", soldGear.ID).
+			Updates(map[string]any{
+				"content":    buildGearCompanionContent(soldGear) + fmt.Sprintf(" 已于 %s 转手，回血 ¥%.2f。", soldDate, float64(soldCents)/100),
+				"updated_at": time.Now(),
+			}).Error
+	})
+	if err != nil {
 		if errors.Is(err, errGearAlreadySold) {
 			// 跨端契约：重复转售按 400 拒绝，防双击/重试重复回血（发现 12）
 			Error(c, http.StatusBadRequest, errGearAlreadySold.Error())
@@ -551,45 +599,12 @@ func SellGearAsset(c *gin.Context) {
 		if !found {
 			Error(c, http.StatusNotFound, "设备不存在")
 		} else {
-			Error(c, http.StatusInternalServerError, "更新设备状态失败: "+err.Error())
+			Error(c, http.StatusInternalServerError, "转售失败，已回滚: "+err.Error())
 		}
 		return
 	}
 
-	// 自动生成一条「二手回血」收入流水，实时补充可用余额
-	occurred, err := ParseFlexTime(soldDate)
-	if err != nil {
-		occurred = time.Now()
-	}
-
-	incomeTx := models.Transaction{
-		Amount:        soldCents,
-		Type:          "income",
-		Category:      "二手回血",
-		Title:         "设备转售回血: " + soldGear.Name,
-		Note:          fmt.Sprintf("设备出二手流转回血 (%s)", strings.TrimSpace(req.Note)),
-		PaymentMethod: "二手转让",
-		OccurredAt:    occurred,
-	}
-	if err := db.DB.Create(&incomeTx).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "设备已转售但生成二手回血账单失败: "+err.Error())
-		return
-	}
-
-	// 同步器物伴生散页：转手后原记录要反映「已转手」，
-	// 否则时间流里的那条「添置器物 · xxx」看起来器物还在手上。
-	if err := db.DB.Transaction(func(tx *gorm.DB) error {
-		return tx.Model(&models.LifeEntry{}).
-			Where("gear_id = ?", soldGear.ID).
-			Updates(map[string]any{
-				"content":    buildGearCompanionContent(soldGear) + fmt.Sprintf(" 已于 %s 转手，回血 ¥%.2f。", soldDate, float64(soldCents)/100),
-				"updated_at": time.Now(),
-			}).Error
-	}); err != nil {
-		Error(c, http.StatusInternalServerError, "设备已转售但同步伴生记录失败: "+err.Error())
-		return
-	}
-
+	InvalidateStatsCache()
 	Success(c, soldGear)
 }
 

@@ -60,6 +60,36 @@ func TestBE13_AuthenticationBypassPrevention(t *testing.T) {
 	}
 }
 
+func assertEmbeddedWishRedacted(t *testing.T, entries []models.LifeEntry) {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Wish == nil {
+			continue
+		}
+		if entry.Wish.ActualCost != 0 || entry.Wish.TransactionID != nil || entry.Wish.GearID != nil {
+			t.Fatalf("访客响应中的嵌套心愿泄露财务字段: actual_cost=%d tx=%v gear=%v",
+				entry.Wish.ActualCost, entry.Wish.TransactionID, entry.Wish.GearID)
+		}
+		return
+	}
+	t.Fatal("测试夹具应包含一条嵌套心愿的散页")
+}
+
+func assertEmbeddedWishVisible(t *testing.T, entries []models.LifeEntry) {
+	t.Helper()
+	for _, entry := range entries {
+		if entry.Wish == nil {
+			continue
+		}
+		if entry.Wish.ActualCost != 1250000 || entry.Wish.TransactionID == nil || entry.Wish.GearID == nil {
+			t.Fatalf("管理员响应应保留嵌套心愿完整财务: actual_cost=%d tx=%v gear=%v",
+				entry.Wish.ActualCost, entry.Wish.TransactionID, entry.Wish.GearID)
+		}
+		return
+	}
+	t.Fatal("测试夹具应包含一条嵌套心愿的散页")
+}
+
 // TestBE14_PublicVisitorFinancialDesensitization 测试公开接口财务隐私脱敏 (BE-14)
 // 心愿单、城市回忆抽屉、年度生活年鉴公开只读接口在访客模式下必须严格脱敏
 func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
@@ -123,6 +153,15 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		FulfilledAt:    &txExpense.OccurredAt,
 	}
 	db.DB.Create(&fulfilledWish)
+
+	// 2b. 关联心愿的散页：嵌套心愿财务字段曾绕过年鉴高光与回忆抽屉的脱敏
+	wishEntry := models.LifeEntry{
+		Type: "life", Title: "心愿达成记", Content: "在上海把这台相机带回了家",
+		CityCode: "310100", CityName: "上海市", Location: "上海市",
+		OccurredAt: time.Date(2026, 5, 20, 18, 0, 0, 0, config.BeijingLocation),
+		WishID:     &fulfilledWish.ID,
+	}
+	db.DB.Create(&wishEntry)
 
 	// 3. 足迹数据
 	footprint := models.Footprint{
@@ -211,6 +250,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 					TransactionCount int           `json:"transaction_count"`
 					Categories       []interface{} `json:"categories"`
 				} `json:"ledger_summary"`
+				Entries []models.LifeEntry `json:"entries"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &drawerResp)
@@ -219,6 +259,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 			len(drawerResp.Data.LedgerSummary.Categories) != 0 {
 			t.Fatalf("BE-14 城市回忆抽屉访客泄露财务数据: %+v", drawerResp.Data.LedgerSummary)
 		}
+		assertEmbeddedWishRedacted(t, drawerResp.Data.Entries)
 
 		// 管理员视角
 		wAdmin := httptest.NewRecorder()
@@ -235,6 +276,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 					TransactionCount int           `json:"transaction_count"`
 					Categories       []interface{} `json:"categories"`
 				} `json:"ledger_summary"`
+				Entries []models.LifeEntry `json:"entries"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(wAdmin.Body.Bytes(), &adminDrawerResp)
@@ -242,6 +284,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 			adminDrawerResp.Data.LedgerSummary.TransactionCount != 1 {
 			t.Fatalf("BE-14 管理员城市回忆抽屉数据错误: %+v", adminDrawerResp.Data.LedgerSummary)
 		}
+		assertEmbeddedWishVisible(t, adminDrawerResp.Data.Entries)
 
 		// -------------------------------------------------------------
 		// B2. 检验省份回忆抽屉脱敏: GET /api/v1/footprints/provinces/:adcode/drawer (RC-91)
@@ -262,6 +305,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 					TransactionCount int           `json:"transaction_count"`
 					Categories       []interface{} `json:"categories"`
 				} `json:"ledger_summary"`
+				Entries []models.LifeEntry `json:"entries"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(wProv.Body.Bytes(), &provVisitorResp)
@@ -273,6 +317,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 			len(provVisitorResp.Data.LedgerSummary.Categories) != 0 {
 			t.Fatalf("BE-14 省份回忆抽屉访客泄露财务数据: %+v", provVisitorResp.Data.LedgerSummary)
 		}
+		assertEmbeddedWishRedacted(t, provVisitorResp.Data.Entries)
 
 		// 管理员视角：完整回显上海财务流水
 		wProvAdmin := httptest.NewRecorder()
@@ -289,6 +334,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 					TransactionCount int           `json:"transaction_count"`
 					Categories       []interface{} `json:"categories"`
 				} `json:"ledger_summary"`
+				Entries []models.LifeEntry `json:"entries"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(wProvAdmin.Body.Bytes(), &provAdminResp)
@@ -296,6 +342,7 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 			provAdminResp.Data.LedgerSummary.TransactionCount != 1 {
 			t.Fatalf("BE-14 管理员省份回忆抽屉数据错误: %+v", provAdminResp.Data.LedgerSummary)
 		}
+		assertEmbeddedWishVisible(t, provAdminResp.Data.Entries)
 	})
 
 	// -------------------------------------------------------------
@@ -319,6 +366,12 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 					TotalActual int64         `json:"total_actual"`
 					Wishes      []models.Wish `json:"wishes"`
 				} `json:"wishes"`
+				Highlights struct {
+					Spring *models.LifeEntry `json:"spring"`
+					Summer *models.LifeEntry `json:"summer"`
+					Autumn *models.LifeEntry `json:"autumn"`
+					Winter *models.LifeEntry `json:"winter"`
+				} `json:"highlights"`
 				Finances struct {
 					TotalIncome  int64 `json:"total_income"`
 					TotalExpense int64 `json:"total_expense"`
@@ -331,6 +384,16 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 		if almanacResp.Data.Prologue.TxCount != 0 {
 			t.Fatalf("BE-14 年鉴访客模式 Prologue 泄露 tx_count: %d", almanacResp.Data.Prologue.TxCount)
 		}
+		var highlightEntries []models.LifeEntry
+		for _, highlight := range []*models.LifeEntry{
+			almanacResp.Data.Highlights.Spring, almanacResp.Data.Highlights.Summer,
+			almanacResp.Data.Highlights.Autumn, almanacResp.Data.Highlights.Winter,
+		} {
+			if highlight != nil {
+				highlightEntries = append(highlightEntries, *highlight)
+			}
+		}
+		assertEmbeddedWishRedacted(t, highlightEntries)
 		if almanacResp.Data.Wishes.TotalActual != 0 {
 			t.Fatalf("BE-14 年鉴访客模式 Wishes 泄露 total_actual: %d", almanacResp.Data.Wishes.TotalActual)
 		}
@@ -358,6 +421,12 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 				Prologue struct {
 					TxCount int `json:"tx_count"`
 				} `json:"prologue"`
+				Highlights struct {
+					Spring *models.LifeEntry `json:"spring"`
+					Summer *models.LifeEntry `json:"summer"`
+					Autumn *models.LifeEntry `json:"autumn"`
+					Winter *models.LifeEntry `json:"winter"`
+				} `json:"highlights"`
 				Finances struct {
 					TotalIncome  int64 `json:"total_income"`
 					TotalExpense int64 `json:"total_expense"`
@@ -366,6 +435,16 @@ func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(wAdmin.Body.Bytes(), &adminAlmanacResp)
+		var adminHighlights []models.LifeEntry
+		for _, highlight := range []*models.LifeEntry{
+			adminAlmanacResp.Data.Highlights.Spring, adminAlmanacResp.Data.Highlights.Summer,
+			adminAlmanacResp.Data.Highlights.Autumn, adminAlmanacResp.Data.Highlights.Winter,
+		} {
+			if highlight != nil {
+				adminHighlights = append(adminHighlights, *highlight)
+			}
+		}
+		assertEmbeddedWishVisible(t, adminHighlights)
 		if adminAlmanacResp.Data.Prologue.TxCount == 0 {
 			t.Fatalf("BE-14 管理员年鉴 tx_count 应大于 0")
 		}

@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,6 +18,7 @@ import (
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
+	"loose-leaf/internal/storage"
 )
 
 // setupRestoreTestDB 建立隔离的临时库并返回一条基线记录。
@@ -24,12 +28,16 @@ func setupRestoreTestDB(t *testing.T) (string, models.LifeEntry) {
 	dbPath := filepath.Join(tempDir, "looseleaf.db")
 	previousPath := config.AppConfig.DBPath
 	config.AppConfig.DBPath = dbPath
-	t.Cleanup(func() {
+	closeCurrentDB := func() {
 		if db.DB != nil {
 			if sqlDB, err := db.DB.DB(); err == nil {
 				_ = sqlDB.Close()
 			}
 		}
+	}
+	closeCurrentDB()
+	t.Cleanup(func() {
+		closeCurrentDB()
 		config.AppConfig.DBPath = previousPath
 	})
 	database, err := db.InitDB(dbPath)
@@ -363,6 +371,89 @@ func TestRestoreAbortsWhenEmergencySnapshotFails(t *testing.T) {
 	matches, _ := filepath.Glob(dbPath + ".pre-restore-emergency-*")
 	if len(matches) != 0 {
 		t.Fatalf("失败的快照不得留下半成品: %v", matches)
+	}
+}
+
+func TestRestorePreflightFailureReleasesIsolation(t *testing.T) {
+	_, entry := setupRestoreTestDB(t)
+
+	zipPath := filepath.Join(t.TempDir(), "invalid.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	if _, err := zw.Create("uploads/only-media.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+
+	if err := RestoreFromZipStream(&zr.Reader); err == nil {
+		t.Fatal("缺少 database/looseleaf.db 的压缩包必须被拒绝")
+	}
+	if IsRestoring() {
+		t.Fatal("预检失败后必须解除隔离")
+	}
+	var kept models.LifeEntry
+	if err := db.DB.First(&kept, entry.ID).Error; err != nil {
+		t.Fatalf("预检失败不得影响原库: %v", err)
+	}
+	if kept.Title != entry.Title {
+		t.Fatalf("预检失败不得改动数据: %q", kept.Title)
+	}
+}
+
+func TestMirrorRestoredMediaUploadsCompleteFile(t *testing.T) {
+	original := storage.R2ConfigSnapshot()
+	t.Cleanup(func() { _ = storage.InitR2(original) })
+
+	var received []byte
+	var requestPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("读取上传体失败: %v", err)
+		}
+		received = body
+		w.Header().Set("ETag", `"test"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	if err := storage.InitR2(config.R2Config{
+		AccessKeyID: "test-access", SecretAccessKey: "test-secret",
+		BucketName: "test-bucket", Endpoint: server.URL, PresignExpireSeconds: 1800,
+	}); err != nil {
+		t.Fatalf("初始化测试对象存储失败: %v", err)
+	}
+
+	dir := t.TempDir()
+	mediaPath := filepath.Join(dir, "restored.bin")
+	payload := []byte("restored-media-payload")
+	if err := os.WriteFile(mediaPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mirrorRestoredMedia([]restoredMediaFile{{key: "entries/restored.bin", path: mediaPath}})
+
+	if requestPath != "/test-bucket/entries/restored.bin" {
+		t.Fatalf("镜像请求路径 = %q", requestPath)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("镜像内容不完整: got %q, want %q", received, payload)
+	}
+	if data, err := os.ReadFile(mediaPath); err != nil || !bytes.Equal(data, payload) {
+		t.Fatalf("镜像不得改写本地源文件: data=%q, err=%v", data, err)
 	}
 }
 

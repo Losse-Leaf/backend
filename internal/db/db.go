@@ -110,8 +110,9 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_wish_status_kind_created ON wishes(status, kind, created_at DESC);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_fp_city_visited ON footprints(city_code, visited_at DESC);").Error
 	// 器物伴生散页曾使用契约外的 type="gear"，任何分类视角都看不到它。
-	// 统一归入 life（gear_id 仍保留器物关联）。
-	_ = database.Exec("UPDATE life_entries SET type = 'life' WHERE type = 'gear'").Error
+	// 统一归入 life（gear_id 仍保留器物关联），并推进 updated_at，
+	// 否则已缓存旧 type 的客户端走增量同步永远收不到这次修正。
+	_ = database.Exec("UPDATE life_entries SET type = 'life', updated_at = ? WHERE type = 'gear'", config.NowInBeijing()).Error
 	seedData(database)
 	return database, nil
 }

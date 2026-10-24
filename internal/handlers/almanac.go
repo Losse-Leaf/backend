@@ -181,6 +181,8 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	if !isAdmin {
 		txCount = 0
 		totalWishActual = 0
+		// 四季高光直接引用 entries 中的元素；嵌套心愿同样必须与心愿列表同口径脱敏。
+		redactEmbeddedWishFinancesBatch(entries)
 		for i := range fulfilledWishes {
 			fulfilledWishes[i].ActualCost = 0
 			fulfilledWishes[i].TransactionID = nil

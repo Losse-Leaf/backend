@@ -10,10 +10,21 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 )
+
+func TestCalculateElapsedInstallmentMonthsUsesBeijingDate(t *testing.T) {
+	purchase := time.Date(2026, 6, 2, 0, 0, 0, 0, config.BeijingLocation)
+	// 北京时间 9/25 00:30（UTC 仍是 9/24）：9/25 这一期已经到期，应计 4 期。
+	checkTime := time.Date(2026, 9, 25, 0, 30, 0, 0, config.BeijingLocation).UTC()
+	paid, remain := CalculateElapsedInstallmentMonths(purchase, 12, 25, checkTime)
+	if paid != 4 || remain != 8 {
+		t.Fatalf("UTC 服务器应按北京时间切分还款日: paid=%d remain=%d, want 4/8", paid, remain)
+	}
+}
 
 func TestAssetsCreditAndDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)

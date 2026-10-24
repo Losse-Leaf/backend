@@ -520,9 +520,13 @@ func ExtractObjectKey(raw string) string {
 		if clean == "." || clean == "/" {
 			return ""
 		}
-		// 签名 URL / 公开 URL 里的路径可能带 %20 等转义，提取时还原成真实键。
-		if decoded, err := url.PathUnescape(clean); err == nil {
-			clean = decoded
+		// 只有中枢媒体路由或带查询串的 URL 路径需要还原转义；
+		// 原始 object_key 必须保持字面值 —— 否则键里的字面 %20 会被改成空格，
+		// 指向一个完全不同的对象，且写入/读取不再互逆。
+		if strings.HasPrefix(raw, "/media/") || strings.Contains(raw, "?") {
+			if decoded, err := url.PathUnescape(clean); err == nil {
+				clean = decoded
+			}
 		}
 		return clean
 	}

@@ -35,7 +35,9 @@ func CalculateElapsedInstallmentMonths(occurredAt time.Time, totalMonths int, re
 	occY, occM, occD := occInLoc.Date()
 	purchaseDate := time.Date(occY, occM, occD, 0, 0, 0, 0, loc)
 
-	nowY, nowM, nowD := now.Date()
+	// now 可能由 time.Now() 传入（服务器本地时区，海外 VPS 通常为 UTC）；
+	// 必须先换算到北京时间再切日期，否则北京时间凌晨会按前一天判定还款日。
+	nowY, nowM, nowD := now.In(loc).Date()
 	todayDate := time.Date(nowY, nowM, nowD, 0, 0, 0, 0, loc)
 
 	if !todayDate.After(purchaseDate) {

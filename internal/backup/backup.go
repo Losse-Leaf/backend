@@ -477,8 +477,24 @@ var restoringCount atomic.Int32
 // IsRestoring 当前是否正在执行整库恢复（所有请求应被 503 拒绝）
 func IsRestoring() bool { return restoringCount.Load() > 0 }
 
+type restoredMediaFile struct {
+	key  string
+	path string
+}
+
 // RestoreFromZipStream 从 ZIP 输入流执行整库还原与灾备回退
 func RestoreFromZipStream(zipReader *zip.Reader) error {
+	// 预检阶段就进入隔离态：否则预检期间的写入会在随后整库替换时被静默覆盖。
+	restoringCount.Add(1)
+	isolationReleased := false
+	releaseIsolation := func() {
+		if !isolationReleased {
+			isolationReleased = true
+			restoringCount.Add(-1)
+		}
+	}
+	defer releaseIsolation()
+
 	// 1. 扫描 ZIP 校验核心文件
 	var dbZipFile *zip.File
 	var uploadFiles []*zip.File
@@ -530,111 +546,154 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 		return fmt.Errorf("备份数据库完整性校验未通过 (%s)，已拒绝覆盖", checkResult)
 	}
 
-	// 校验通过后才进入隔离态：无效备份不应让全站短暂不可用。
-	restoringCount.Add(1)
-	defer restoringCount.Add(-1)
-
 	// 写锁覆盖「排空在途读写 → 快照 → 替换 → 重连 → 媒体解压」全过程。
 	// 锁序固定为 lifecycle → backupMutex；反向会与持读锁的手动备份互相等待。
-	db.LockWrite()
-	defer db.UnlockWrite()
+	var restoredMedia []restoredMediaFile
+	err = func() error {
+		db.LockWrite()
+		defer db.UnlockWrite()
 
-	backupMutex.Lock()
-	defer backupMutex.Unlock()
+		backupMutex.Lock()
+		defer backupMutex.Unlock()
 
-	if db.DB == nil {
-		return errors.New("数据库尚未初始化，无法执行恢复")
-	}
-
-	// 3. 终极自保措施：在覆盖既有数据库前，生成一份紧急快照副本 (pre-restore-emergency)
-	//
-	// 关键：绝不能用 copyFile 直接复制主库文件 —— 主库运行在 WAL 模式，
-	// 已提交但尚未 checkpoint 的事务只存在于 -wal 中，直接复制会得到**缺数据**的
-	// 「保底副本」（恢复失败时它反而会覆盖掉唯一的好库）。
-	// VACUUM INTO 读取的是一致性快照，会把 WAL 中的内容一并写入独立文件。
-	currentDBPath := config.AppConfig.DBPath
-	emergencyBackupPath := fmt.Sprintf("%s.pre-restore-emergency-%d", currentDBPath, time.Now().UnixNano())
-	if err := db.DB.Exec("VACUUM INTO ?", emergencyBackupPath).Error; err != nil {
-		_ = os.Remove(emergencyBackupPath)
-		return fmt.Errorf("生成当前在用库紧急快照失败，已中止恢复: %w", err)
-	}
-	log.Printf("[Backup] 已生成当前在用库紧急保底副本: %s", emergencyBackupPath)
-	// 关键：**只保留最近一份**。
-	// 原先每执行一次「回滚还原」就在库旁多一个完整数据库副本
-	// （含全部私人内容与 R2 密钥），代码里**没有任何地方删除**它们 ——
-	// 10 次恢复就是 10 份全量档案堆积在磁盘上。
-	pruneEmergencyCopies(currentDBPath, 1)
-
-	// 4. 关闭旧连接池，清理残留 WAL / SHM 日志，覆写当前数据库文件
-	if sqlDB, err := db.DB.DB(); err == nil {
-		_ = sqlDB.Close()
-	}
-	_ = os.Remove(currentDBPath + "-wal")
-	_ = os.Remove(currentDBPath + "-shm")
-
-	// 替换数据库文件
-	if err := copyFile(tempExtractedPath, currentDBPath); err != nil {
-		// 尝试重新开启旧连接
-		_, _ = db.InitDB(currentDBPath)
-		return fmt.Errorf("覆写主数据库文件失败: %w", err)
-	}
-
-	// 5. 解压媒体资源到本地 uploads 目录
-	localUploadDir := storage.GetLocalUploadDir()
-	for _, uf := range uploadFiles {
-		relPath := strings.TrimPrefix(filepath.ToSlash(uf.Name), "uploads/")
-		cleanRel := filepath.Clean(relPath)
-		if strings.HasPrefix(cleanRel, "..") {
-			continue
+		if db.DB == nil {
+			return errors.New("数据库尚未初始化，无法执行恢复")
 		}
-		targetPath := filepath.Join(localUploadDir, cleanRel)
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+
+		// 3. 终极自保措施：在覆盖既有数据库前，生成一份紧急快照副本 (pre-restore-emergency)
+		//
+		// 关键：绝不能用 copyFile 直接复制主库文件 —— 主库运行在 WAL 模式，
+		// 已提交但尚未 checkpoint 的事务只存在于 -wal 中，直接复制会得到**缺数据**的
+		// 「保底副本」（恢复失败时它反而会覆盖掉唯一的好库）。
+		// VACUUM INTO 读取的是一致性快照，会把 WAL 中的内容一并写入独立文件。
+		currentDBPath := config.AppConfig.DBPath
+		emergencyBackupPath := fmt.Sprintf("%s.pre-restore-emergency-%d", currentDBPath, time.Now().UnixNano())
+		if err := db.DB.Exec("VACUUM INTO ?", emergencyBackupPath).Error; err != nil {
+			_ = os.Remove(emergencyBackupPath)
+			return fmt.Errorf("生成当前在用库紧急快照失败，已中止恢复: %w", err)
+		}
+		log.Printf("[Backup] 已生成当前在用库紧急保底副本: %s", emergencyBackupPath)
+		// 关键：**只保留最近一份**。
+		// 原先每执行一次「回滚还原」就在库旁多一个完整数据库副本
+		// （含全部私人内容与 R2 密钥），代码里**没有任何地方删除**它们 ——
+		// 10 次恢复就是 10 份全量档案堆积在磁盘上。
+		pruneEmergencyCopies(currentDBPath, 1)
+
+		// 4. 关闭旧连接池，清理残留 WAL / SHM 日志，覆写当前数据库文件
+		if sqlDB, err := db.DB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+		_ = os.Remove(currentDBPath + "-wal")
+		_ = os.Remove(currentDBPath + "-shm")
+
+		// 替换数据库文件
+		if err := copyFile(tempExtractedPath, currentDBPath); err != nil {
+			// 尝试重新开启旧连接
 			_, _ = db.InitDB(currentDBPath)
-			return fmt.Errorf("创建媒体恢复目录失败: %w", err)
+			return fmt.Errorf("覆写主数据库文件失败: %w", err)
 		}
-		urc, err := uf.Open()
-		if err != nil {
-			_, _ = db.InitDB(currentDBPath)
-			return fmt.Errorf("读取备份媒体文件失败: %w", err)
-		}
-		out, err := os.Create(targetPath)
-		if err != nil {
-			urc.Close()
-			_, _ = db.InitDB(currentDBPath)
-			return fmt.Errorf("写入恢复媒体文件失败: %w", err)
-		}
-		if _, copyErr := io.Copy(out, io.LimitReader(urc, maxExtractSize)); copyErr != nil {
+
+		// 5. 解压媒体资源到本地 uploads 目录
+		localUploadDir := storage.GetLocalUploadDir()
+		for _, uf := range uploadFiles {
+			relPath := strings.TrimPrefix(filepath.ToSlash(uf.Name), "uploads/")
+			cleanRel := filepath.Clean(relPath)
+			if strings.HasPrefix(cleanRel, "..") {
+				continue
+			}
+			targetPath := filepath.Join(localUploadDir, cleanRel)
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				_, _ = db.InitDB(currentDBPath)
+				return fmt.Errorf("创建媒体恢复目录失败: %w", err)
+			}
+			urc, err := uf.Open()
+			if err != nil {
+				_, _ = db.InitDB(currentDBPath)
+				return fmt.Errorf("读取备份媒体文件失败: %w", err)
+			}
+			out, err := os.Create(targetPath)
+			if err != nil {
+				urc.Close()
+				_, _ = db.InitDB(currentDBPath)
+				return fmt.Errorf("写入恢复媒体文件失败: %w", err)
+			}
+			if _, copyErr := io.Copy(out, io.LimitReader(urc, maxExtractSize)); copyErr != nil {
+				out.Close()
+				urc.Close()
+				_, _ = db.InitDB(currentDBPath)
+				return fmt.Errorf("解压媒体文件失败: %w", copyErr)
+			}
 			out.Close()
 			urc.Close()
-			_, _ = db.InitDB(currentDBPath)
-			return fmt.Errorf("解压媒体文件失败: %w", copyErr)
+			restoredMedia = append(restoredMedia, restoredMediaFile{
+				key:  filepath.ToSlash(cleanRel),
+				path: targetPath,
+			})
 		}
-		out.Close()
-		urc.Close()
 
-		if storage.IsConfigured() {
-			if rf, err := os.Open(targetPath); err == nil {
-				if stat, statErr := rf.Stat(); statErr == nil {
-					_ = storage.UploadObject(context.Background(), filepath.ToSlash(cleanRel), rf, stat.Size(), "")
-				}
-				rf.Close()
-			}
+		// 6. 重新连接数据库
+		if _, err := db.InitDB(currentDBPath); err != nil {
+			return fmt.Errorf("重载数据库连接失败: %w", err)
 		}
+
+		// 7. 恢复后的存储配置保全（发现 4b）：
+		// 脱敏备份里的 R2 配置必然为空；若照单全收，进程一重启
+		// LoadStorageConfigFromDB 读到空配置 → 对象存储**静默失效**（回落纯本地）。
+		// 若当前运行时已有可用 R2 配置且还原库未显式禁用（R2Disabled），把它回写进还原库。
+		preserveRuntimeStorageConfig()
+
+		log.Printf("[Backup] 恭喜！已成功从备份完整恢复数据库与 %d 项媒体资源", len(uploadFiles))
+		return nil
+	}()
+	if err != nil {
+		return err
 	}
 
-	// 6. 重新连接数据库
-	if _, err := db.InitDB(currentDBPath); err != nil {
-		return fmt.Errorf("重载数据库连接失败: %w", err)
-	}
-
-	// 7. 恢复后的存储配置保全（发现 4b）：
-	// 脱敏备份里的 R2 配置必然为空；若照单全收，进程一重启
-	// LoadStorageConfigFromDB 读到空配置 → 对象存储**静默失效**（回落纯本地）。
-	// 若当前运行时已有可用 R2 配置且还原库未显式禁用（R2Disabled），把它回写进还原库。
-	preserveRuntimeStorageConfig()
-
-	log.Printf("[Backup] 恭喜！已成功从备份完整恢复数据库与 %d 项媒体资源", len(uploadFiles))
+	// 数据库与本地媒体已一致，先解除隔离；R2 异地镜像是尽力而为的后续动作，
+	// 绝不能放在写锁内做网络上传 —— R2 慢或不可达会把全站 503 拖到请求超时。
+	releaseIsolation()
+	mirrorRestoredMedia(restoredMedia)
 	return nil
+}
+
+// mirrorRestoredMedia 把已恢复到本地的媒体按单向备份补传到 R2。
+//
+// 只在恢复写锁释放后调用；使用 BackupObjectToR2 而非 UploadObject，
+// 避免「本地为主」模式把刚恢复的文件再读入内存并原路径重写一遍。
+// 失败仅记日志：本地磁盘才是主存储，R2 是异地副本。
+func mirrorRestoredMedia(files []restoredMediaFile) {
+	if len(files) == 0 || !storage.IsConfigured() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	mirrored := 0
+	for _, file := range files {
+		if ctx.Err() != nil {
+			log.Printf("[Backup] 媒体异地镜像超时，已停止（本地副本已恢复）")
+			break
+		}
+		rf, err := os.Open(file.path)
+		if err != nil {
+			log.Printf("[Backup] 媒体镜像打开失败 %s: %v", file.key, err)
+			continue
+		}
+		stat, err := rf.Stat()
+		if err != nil {
+			rf.Close()
+			log.Printf("[Backup] 媒体镜像读取元数据失败 %s: %v", file.key, err)
+			continue
+		}
+		err = storage.BackupObjectToR2(ctx, file.key, rf, stat.Size(), "")
+		rf.Close()
+		if err != nil {
+			log.Printf("[Backup] 媒体镜像失败 %s: %v", file.key, err)
+			continue
+		}
+		mirrored++
+	}
+	log.Printf("[Backup] 媒体异地镜像完成: %d/%d", mirrored, len(files))
 }
 
 // preserveRuntimeStorageConfig 恢复后把运行时的对象存储配置回写进还原库。
@@ -711,8 +770,19 @@ func StartDailyBackupScheduler() {
 				log.Println("[Backup Scheduler] 定时备份任务已唤醒，开始生成全量归档...")
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 				defer cancel()
-				if item, err := CreateBackup(ctx); err != nil {
-					log.Printf("[Backup Scheduler] 自动备份执行失败: %v", err)
+
+				// 定时备份与整库恢复共用数据库生命周期锁。读锁必须在 backupMutex
+				// 之前取得（锁序 lifecycle → backupMutex），否则恢复会持写锁等备份，
+				// 把本可并行的备份窗口放大成整站 503。
+				var item *BackupItem
+				var backupErr error
+				func() {
+					db.LockRead()
+					defer db.UnlockRead()
+					item, backupErr = CreateBackup(ctx)
+				}()
+				if backupErr != nil {
+					log.Printf("[Backup Scheduler] 自动备份执行失败: %v", backupErr)
 				} else {
 					log.Printf("[Backup Scheduler] 自动备份成功完成: %s (%s, %d 字节)",
 						item.Filename, item.StorageType, item.Size)

@@ -385,7 +385,7 @@ func UpdateWish(c *gin.Context) {
 	oldStatus := wish.Status
 	oldTitle := wish.Title
 
-	if hasKey("title") {
+	if hasJSONValue(rawKeys, "title") {
 		title := strings.TrimSpace(req.Title)
 		if title == "" {
 			Error(c, http.StatusBadRequest, "心愿标题不能为空")
@@ -397,30 +397,27 @@ func UpdateWish(c *gin.Context) {
 		wish.Kind = strings.TrimSpace(req.Kind)
 	}
 	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
-	// 缺省 / null = 保持原值」。原先 `if req.Note != ""` 让「删光备注/规格后保存」静默失败。
-	if req.Note != "" || hasKey("note") {
+	// 缺省 / null = 保持原值」。原先 `if req.Note != ""` 让「删光备注/规格后保存」静默失败，
+	// 而只判断 key 是否存在又会把 JSON null 当成清空。
+	if req.Note != "" || hasJSONValue(rawKeys, "note") {
 		wish.Note = strings.TrimSpace(req.Note)
 	}
-	if req.Spec != "" || hasKey("spec") {
+	if req.Spec != "" || hasJSONValue(rawKeys, "spec") {
 		wish.Spec = strings.TrimSpace(req.Spec)
 	}
 	// 契约 C：城市同样支持显式清空（空串 = 清空），否则用户删掉目的地后
 	// 保存提示成功、下次拉取又把旧城市“复活”。
-	if hasKey("city_code") || req.CityCode != "" {
+	if hasJSONValue(rawKeys, "city_code") || req.CityCode != "" {
 		wish.CityCode = strings.TrimSpace(req.CityCode)
 	}
-	if hasKey("city_name") || req.CityName != "" {
+	if hasJSONValue(rawKeys, "city_name") || req.CityName != "" {
 		wish.CityName = strings.TrimSpace(req.CityName)
 	}
-	if hasKey("city_code") && req.CityCode == "" {
+	if hasJSONValue(rawKeys, "city_code") && req.CityCode == "" {
 		wish.CityName = ""
 	}
-	// 关键：预算要能改成 0。
-	// 原先 `if req.Budget != 0` 把「改成 0」当成「未携带」——
-	// 用户把预算清空想改成 ¥0，后端忽略，预算仍是旧值，
-	// 「心愿统计」的预算合计也多算这一笔。
-	// 改成与 profile 一致的语义：请求携带该 key 即按其值写入。
-	if req.Budget != 0 || hasKey("budget") {
+	// 关键：预算要能改成 0；null 保持原值。
+	if req.Budget != 0 || hasJSONValue(rawKeys, "budget") {
 		wish.Budget = req.Budget
 	}
 	if req.ActualCost != nil {
@@ -845,9 +842,16 @@ func DeleteWish(c *gin.Context) {
 		}
 
 		if purge {
-			tx.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-			tx.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-			tx.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+			// 解绑错误必须上抛：吞掉后事务仍会提交，留下指向已删心愿的逻辑外键。
+			if err := tx.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
+				return err
+			}
 			if err := tx.Unscoped().Delete(&w).Error; err != nil {
 				return err
 			}

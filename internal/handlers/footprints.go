@@ -1019,7 +1019,7 @@ func UpdateFootprint(c *gin.Context) {
 	if req.CityName != "" {
 		footprint.CityName = strings.TrimSpace(req.CityName)
 	}
-	if req.Title != "" {
+	if hasJSONValue(rawKeys, "title") {
 		footprint.Title = strings.TrimSpace(req.Title)
 	}
 	if req.VisitedAt != "" {
@@ -1060,10 +1060,10 @@ func UpdateFootprint(c *gin.Context) {
 				entry.CityName = footprint.CityName
 				entry.Location = footprint.CityName
 				entry.OccurredAt = footprint.VisitedAt
-				if req.Title != "" {
+				if hasJSONValue(rawKeys, "title") {
 					entry.Title = footprint.Title
 				}
-				if req.Note != "" {
+				if hasJSONValue(rawKeys, "note") {
 					entry.Content = footprint.Note
 				}
 				if err := tx.Save(&entry).Error; err != nil {
@@ -1398,6 +1398,9 @@ func GetCityMemoryDrawer(c *gin.Context) {
 	}
 
 	populateEntryURLsBatch(entries)
+	if !isAdmin {
+		redactEmbeddedWishFinancesBatch(entries)
+	}
 
 	// 3. 关联该城市及旅程的消费账单光谱 (仅管理员查询聚合 RC-81, BE-14)
 	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {
@@ -1592,6 +1595,9 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 	}
 
 	populateEntryURLsBatch(entries)
+	if !isAdmin {
+		redactEmbeddedWishFinancesBatch(entries)
+	}
 
 	// 3. 关联该省份及旅程的消费账单光谱 (仅管理员下发 RC-81, RC-91, RC-93)
 	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {

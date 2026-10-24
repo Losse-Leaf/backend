@@ -429,39 +429,53 @@ func CreateLifeEntry(c *gin.Context) {
 	if req.Type == "project" && req.ProjectID != nil && *req.ProjectID > 0 {
 		var existing models.LifeEntry
 		if err := db.DB.Where("project_id = ? AND type = 'project'", *req.ProjectID).Order("id DESC").Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
-			if time.Since(existing.CreatedAt) < 10*time.Second && (existing.Title == title || title == "") {
-				if title != "" {
-					existing.Title = title
-				}
-				if content != "" {
-					existing.Content = content
-				}
-				if req.OccurredAt != "" {
-					existing.OccurredAt = occurred
-				}
-				if location != "" {
-					existing.Location = location
-				}
-				if cityCode != "" {
-					existing.CityCode = cityCode
-					existing.CityName = cityName
-				}
-				if req.FootprintID != nil {
-					existing.FootprintID = req.FootprintID
-				}
-				_ = db.DB.Save(&existing).Error
-				if len(req.AttachmentIDs) > 0 {
-					// 归属校验 + 绑定：已挂到其他实体的附件直接 400，防「偷照片」（发现 15）
-					if err := claimAttachments(db.DB, req.AttachmentIDs, map[string]any{"entry_id": existing.ID}); err != nil {
-						if errors.Is(err, errAttachmentClaimConflict) {
-							Error(c, http.StatusBadRequest, "绑定附件失败: "+err.Error())
-						} else {
-							Error(c, http.StatusInternalServerError, "绑定附件失败: "+err.Error())
-						}
-						return
+			keyCompatible := clientRequestID == "" || existing.ClientRequestID == nil || *existing.ClientRequestID == clientRequestID
+			if time.Since(existing.CreatedAt) < 10*time.Second && (existing.Title == title || title == "") && keyCompatible {
+				// 复用刚伴生创建的记录时，必须把本次幂等键登记到它上面；
+				// 否则超过 10 秒的重试既查不到键、也匹配不到复用窗口，会再建一条。
+				reuseErr := db.DB.Transaction(func(tx *gorm.DB) error {
+					if clientRequestID != "" && existing.ClientRequestID == nil {
+						existing.ClientRequestID = &clientRequestID
 					}
+					if title != "" {
+						existing.Title = title
+					}
+					if content != "" {
+						existing.Content = content
+					}
+					if req.OccurredAt != "" {
+						existing.OccurredAt = occurred
+					}
+					if location != "" {
+						existing.Location = location
+					}
+					if cityCode != "" {
+						existing.CityCode = cityCode
+						existing.CityName = cityName
+					}
+					if req.FootprintID != nil {
+						existing.FootprintID = req.FootprintID
+					}
+					if err := tx.Save(&existing).Error; err != nil {
+						return err
+					}
+					if len(req.AttachmentIDs) > 0 {
+						// 归属校验 + 绑定：已挂到其他实体的附件直接 400，防「偷照片」（发现 15）
+						if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{"entry_id": existing.ID}); err != nil {
+							return err
+						}
+					}
+					syncFootprintFromLifeEntry(&existing, req.AttachmentIDs, tx)
+					return nil
+				})
+				if reuseErr != nil {
+					if errors.Is(reuseErr, errAttachmentClaimConflict) {
+						Error(c, http.StatusBadRequest, "绑定附件失败: "+reuseErr.Error())
+					} else {
+						Error(c, http.StatusInternalServerError, "更新项目伴生记录失败: "+reuseErr.Error())
+					}
+					return
 				}
-				syncFootprintFromLifeEntry(&existing, req.AttachmentIDs)
 				db.DB.First(&existing, existing.ID)
 				populateEntryURLs(&existing)
 				InvalidateStatsCache()
@@ -838,7 +852,9 @@ func UpdateLifeEntry(c *gin.Context) {
 			}
 		}
 	}
-	if entry.CityCode != "" && entry.Location == "" {
+	// 只有请求未显式清空 location 时才用城市名回填；
+	// 否则「保留城市、删掉具体地点」会被旧逻辑静默复活。
+	if entry.CityCode != "" && entry.Location == "" && !hasJSONValue(rawKeys, "location") {
 		entry.Location = entry.CityName
 	}
 	// 指针字段：携带 key 才写（null = 解绑）
@@ -1242,7 +1258,7 @@ func CreateTransaction(c *gin.Context) {
 		txType = "expense"
 	}
 
-	tx := models.Transaction{
+	record := models.Transaction{
 		Amount:        req.Amount,
 		Type:          txType,
 		Category:      strings.TrimSpace(req.Category),
@@ -1255,15 +1271,15 @@ func CreateTransaction(c *gin.Context) {
 		OccurredAt:    occurred,
 	}
 	if clientRequestID != "" {
-		tx.ClientRequestID = &clientRequestID
+		record.ClientRequestID = &clientRequestID
 	}
 
 	// 若选择了关联旅程 (FootprintID) 或带有城市代码，自动对齐城市并尝试归并到对应旅程
-	autoLinkTransactionFootprint(&tx)
+	autoLinkTransactionFootprint(&record)
 
 	if req.IsInstallment != nil && *req.IsInstallment {
 		AssembleInstallmentTransaction(
-			&tx,
+			&record,
 			true,
 			req.InstallmentChannelCode,
 			req.InstallmentTotalAmount,
@@ -1276,7 +1292,62 @@ func CreateTransaction(c *gin.Context) {
 		)
 	}
 
-	if err := db.DB.Create(&tx).Error; err != nil {
+	// 账目、设备联动与心愿归册必须同生共死：任一环节失败都回滚整笔记账，
+	// 否则「账已记上、联动失败」的幂等重试会被顶部查重直接放行，联动永久缺失。
+	linkGear := req.LinkGearAsset
+	if linkGear {
+		// 先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB），
+		// 避免与其它器物写操作互等 SQLite 的唯一写者名额。
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
+	}
+
+	err = db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&record).Error; err != nil {
+			return err
+		}
+
+		if linkGear {
+			gearCategory := strings.TrimSpace(req.GearCategory)
+			if gearCategory == "" {
+				gearCategory = record.Category
+			}
+			newGear := models.GearItem{
+				ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
+				Name:         record.Title,
+				Spec:         strings.TrimSpace(req.GearSpec),
+				Category:     gearCategory,
+				Status:       "active",
+				PriceCents:   record.Amount,
+				PurchaseDate: record.OccurredAt.In(config.BeijingLocation).Format("2006-01-02"),
+				Note:         record.Note,
+			}
+			if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
+				return append(list, newGear), nil
+			}); err != nil {
+				return err
+			}
+		}
+
+		// 关联心愿单时同步闭环流转归册 (RG-14)
+		if req.WishID != nil && *req.WishID > 0 {
+			var wish models.Wish
+			if err := tx.First(&wish, *req.WishID).Error; err == nil && wish.Status == "wanting" {
+				wish.Status = "fulfilled"
+				occ := record.OccurredAt
+				wish.FulfilledAt = &occ
+				wish.TransactionID = &record.ID
+				if wish.ActualCost == 0 {
+					wish.ActualCost = record.Amount
+				}
+				if err := tx.Save(&wish).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		// 并发重复提交：client_request_id 唯一索引兜底，回读已有记录按幂等语义返回
 		//（含已被软删除的记录——该请求确实处理过，不该再记一笔）。
 		if clientRequestID != "" {
@@ -1289,10 +1360,11 @@ func CreateTransaction(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "记账失败: "+err.Error())
 		return
 	}
+
 	// 新账目可能挂在某趟旅程上：旅程花销统计随之变化，必须推进 footprints.updated_at，
 	// 否则足迹列表的 ETag 不变，客户端会一直拿到 304 的旧花销。
-	if tx.FootprintID != nil {
-		touchFootprintTimestamps(db.DB, *tx.FootprintID)
+	if record.FootprintID != nil {
+		touchFootprintTimestamps(db.DB, *record.FootprintID)
 	}
 	// 关键：让 /stats 的 30 秒缓存失效。
 	// 否则记完账立刻打开统计弹窗，弹窗显示的是**缓存里的旧数字**，
@@ -1300,51 +1372,7 @@ func CreateTransaction(c *gin.Context) {
 	// 同一个 App 里两个「本月支出」当场打架。
 	InvalidateStatsCache()
 
-	// 路径 B：记账大件同步收录至随身设备库 (RC-53)
-	if req.LinkGearAsset {
-		gearCategory := strings.TrimSpace(req.GearCategory)
-		if gearCategory == "" {
-			gearCategory = tx.Category
-		}
-		newGear := models.GearItem{
-			ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
-			Name:         tx.Title,
-			Spec:         strings.TrimSpace(req.GearSpec),
-			Category:     gearCategory,
-			Status:       "active",
-			PriceCents:   tx.Amount,
-			PurchaseDate: tx.OccurredAt.In(config.BeijingLocation).Format("2006-01-02"),
-			Note:         tx.Note,
-		}
-		if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
-			return append(list, newGear), nil
-		}); err != nil {
-			Error(c, http.StatusInternalServerError, "记账成功但收录设备资产失败: "+err.Error())
-			return
-		}
-	}
-
-	// 关联心愿单时同步闭环流转归册 (RG-14)
-	if req.WishID != nil && *req.WishID > 0 {
-		var wish models.Wish
-		if err := db.DB.First(&wish, *req.WishID).Error; err == nil {
-			if wish.Status == "wanting" {
-				wish.Status = "fulfilled"
-				occ := tx.OccurredAt
-				wish.FulfilledAt = &occ
-				wish.TransactionID = &tx.ID
-				if wish.ActualCost == 0 {
-					wish.ActualCost = tx.Amount
-				}
-				if err := db.DB.Save(&wish).Error; err != nil {
-					Error(c, http.StatusInternalServerError, "记账成功但关联心愿状态更新失败: "+err.Error())
-					return
-				}
-			}
-		}
-	}
-
-	Success(c, tx)
+	Success(c, record)
 }
 
 // GetTransactions 列表查询账目 (支持按年、按月、增量游标与 ETag 缓存协商 BE-05)

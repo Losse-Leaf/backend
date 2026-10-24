@@ -12,6 +12,7 @@ import (
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -43,20 +44,23 @@ type BootstrapRequest struct {
 	HubURL          string `json:"hub_url"`
 }
 
-// BootstrapSystem 发起首次装帧：双次确认密钥并签发首台设备配对工单 (BE-18, BE-19)
-// 注意：本接口仅保存主理人信息与密钥 SHA-256 哈希，保持 initialized = false；
-// 需待首台设备调用 POST /api/v1/auth/pair/confirm 完成握手后，才将 initialized 置为 true。
 func BootstrapSystem(c *gin.Context) {
 	var cfg models.SiteConfig
-	db.DB.Limit(1).Find(&cfg)
-
-	// 关键（发现 4a）：判定「禁止二次初始化」必须看 `initialized && 密码非空`。
-	// 恢复脱敏备份后 initialized=true 但 master_passcode 为空 —— 此时若仍一刀切 403，
-	// 而全部管理接口又没有任何「重设密码」端点，实例将**永久锁死**。
-	// 恢复场景因此允许重新走装帧设定密码（窗口由主人掌控：恢复本身就是主人发起的操作）。
-	if cfg.Initialized && strings.TrimSpace(cfg.MasterPasscode) != "" {
-		Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "读取站点初始化状态失败")
 		return
+	}
+
+	if cfg.Initialized {
+		if strings.TrimSpace(cfg.MasterPasscode) != "" {
+			Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
+			return
+		}
+		// 脱敏恢复后的空密码不是首次初始化，必须由仍有效的配对设备授权。
+		if !middleware.IsAdmin(c) {
+			Error(c, http.StatusUnauthorized, "恢复后重设管理员密钥需要有效的已配对设备凭据")
+			return
+		}
 	}
 
 	var req BootstrapRequest

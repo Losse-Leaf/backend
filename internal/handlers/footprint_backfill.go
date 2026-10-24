@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"loose-leaf/internal/db"
 )
 
 // StartFootprintBackfill 在 HTTP server 启动后异步执行启动回填。
@@ -20,6 +22,11 @@ func StartFootprintBackfill() {
 					log.Printf("[Footprint Backfill] 启动回填异常崩溃: %v", r)
 				}
 			}()
+
+			// 后台回填跨越多次查询与事务，必须与整库恢复互斥：
+			// 否则恢复替换数据库时它可能把旧库数据写进新库，或撞上被关闭的连接池。
+			db.LockRead()
+			defer db.UnlockRead()
 
 			start := time.Now()
 			log.Println("[Footprint Backfill] 启动回填开始（后台执行，不阻塞 HTTP 监听）")

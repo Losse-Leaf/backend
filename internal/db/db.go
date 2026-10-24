@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"loose-leaf/internal/config"
@@ -16,6 +17,27 @@ import (
 )
 
 var DB *gorm.DB
+
+// lifecycleMu 保护 DB 连接池与磁盘文件的「代际」不被整库恢复打断。
+//
+// 约定：
+//   - 任何会使用 DB 的请求或后台任务，在操作期间持读锁；
+//   - 整库恢复持写锁，覆盖关闭旧池、替换文件、重连与解压媒体；
+//   - 锁序固定为 lifecycle → backupMutex，禁止反向；
+//   - 读锁不可重入：已持读锁的代码不得再调用 LockRead（写锁排队时会死锁）。
+var lifecycleMu sync.RWMutex
+
+// LockRead 获取数据库生命周期读锁
+func LockRead() { lifecycleMu.RLock() }
+
+// UnlockRead 释放数据库生命周期读锁
+func UnlockRead() { lifecycleMu.RUnlock() }
+
+// LockWrite 获取数据库生命周期写锁（仅整库恢复使用）
+func LockWrite() { lifecycleMu.Lock() }
+
+// UnlockWrite 释放数据库生命周期写锁
+func UnlockWrite() { lifecycleMu.Unlock() }
 
 // InitDB 初始化 SQLite 数据库
 func InitDB(dbPath string) (*gorm.DB, error) {
@@ -32,10 +54,13 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	// 已存在的目录也收紧一次（老部署可能是 0755）
 	_ = os.Chmod(dir, 0700)
 
-	// 启用 WAL 模式、5秒忙碌重试与普通同步模式，避免并发写锁死
+	// 启用 WAL 模式、5 秒忙碌重试与普通同步模式，避免并发写锁死。
+	// 注意：glebarez/go-sqlite 只认 `_pragma` 查询参数，
+	// 早期写的 `_journal_mode=WAL&_busy_timeout=...` 会被驱动**静默忽略** ——
+	// 库实际一直跑在 rollback journal 模式下，与 WAL 相关的恢复/并发假设都不成立。
 	dsn := dbPath
 	if !strings.Contains(dsn, "?") {
-		dsn += "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
+		dsn += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
 	}
 
 	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{

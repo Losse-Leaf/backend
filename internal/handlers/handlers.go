@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -265,17 +266,26 @@ func parseIDParam(c *gin.Context) (uint64, bool) {
 // 待绑定附件已归属其他实体（entry / wish / footprint），拒绝绑定。
 var errAttachmentClaimConflict = errors.New("附件已绑定到其他实体")
 
-// claimAttachments 校验归属后把一批附件绑定到当前实体（跨端统一契约：防附件抢占）。
-//
-// targets 的键只允许 entry_id / wish_id / footprint_id。
-// 绑定规则：每个附件的三个归属列必须为 NULL，或恰好等于本次要写入的目标值；
-// 已挂到其他实体上的附件一律拒绝（返回 errAttachmentClaimConflict 包装错误），
-// 否则一条误传的 attachment_ids 会把别家照片静默「偷走」——原先的
-// `WHERE id IN ? AND (entry_id IS NULL OR entry_id = ?)` 弱校验只看本实体列，
-// 既不校验另外两个归属列，也把冲突静默跳过（客户端毫无感知）。
 func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
 	if len(ids) == 0 || dbTx == nil {
 		return nil
+	}
+	allowedTargets := make(map[string]any, len(targets)+2)
+	for key, value := range targets {
+		allowedTargets[key] = value
+	}
+	if entryID, ok := targets["entry_id"].(uint); ok && entryID > 0 {
+		var entry models.LifeEntry
+		if err := dbTx.Select("id", "footprint_id", "wish_id").First(&entry, entryID).Error; err != nil {
+			return err
+		}
+		// 允许保留散页已关联的旅程与心愿归属，不将这些归属写入新附件。
+		if _, explicit := targets["footprint_id"]; !explicit && entry.FootprintID != nil {
+			allowedTargets["footprint_id"] = *entry.FootprintID
+		}
+		if _, explicit := targets["wish_id"]; !explicit && entry.WishID != nil {
+			allowedTargets["wish_id"] = *entry.WishID
+		}
 	}
 	var atts []models.Attachment
 	if err := dbTx.Where("id IN ?", ids).Find(&atts).Error; err != nil {
@@ -290,7 +300,18 @@ func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
 		if !ok {
 			return fmt.Errorf("附件 #%d 不存在或已被清理", id)
 		}
-		if err := assertAttachmentBindable(att, targets); err != nil {
+		bindingTargets := allowedTargets
+		if att.EntryID != nil && targets["entry_id"] == *att.EntryID {
+			// 保留当前散页已有照片不应改动其他归属，新照片仍须校验真实关联。
+			bindingTargets = maps.Clone(allowedTargets)
+			if _, explicit := targets["footprint_id"]; !explicit && att.FootprintID != nil {
+				bindingTargets["footprint_id"] = *att.FootprintID
+			}
+			if _, explicit := targets["wish_id"]; !explicit && att.WishID != nil {
+				bindingTargets["wish_id"] = *att.WishID
+			}
+		}
+		if err := assertAttachmentBindable(att, bindingTargets); err != nil {
 			return err
 		}
 	}
@@ -720,6 +741,11 @@ type UpdateEntryRequest struct {
 	ClearCity bool `json:"clear_city"`
 }
 
+func hasJSONValue(fields map[string]json.RawMessage, key string) bool {
+	value, exists := fields[key]
+	return exists && strings.TrimSpace(string(value)) != "null"
+}
+
 // UpdateLifeEntry 更新生活记录
 func UpdateLifeEntry(c *gin.Context) {
 	id := c.Param("id")
@@ -742,10 +768,6 @@ func UpdateLifeEntry(c *gin.Context) {
 	// **标题仍是旧值**，界面毫无提示 —— 典型的静默失败。
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
-	hasKey := func(k string) bool {
-		_, ok := rawKeys[k]
-		return ok
-	}
 
 	// type 是**筛选维度**，不是可清空字段。
 	// 关键：绝不能用「携带即写入」的语义 ——
@@ -756,13 +778,13 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.Type = req.Type
 	}
 	// titleKeyPresent：请求是否显式携带了 title
-	titleKeyPresent := hasKey("title")
+	titleKeyPresent := hasJSONValue(rawKeys, "title")
 	if req.Title != "" || titleKeyPresent {
 		entry.Title = strings.TrimSpace(req.Title)
 	}
 	// content 同样采用「携带 key 即写入」：空串 = 清空正文。
 	// 原先 `if req.Content != ""` 让「删光正文后保存」静默失败。
-	if hasKey("content") || req.Content != "" {
+	if hasJSONValue(rawKeys, "content") || req.Content != "" {
 		entry.Content = strings.TrimSpace(req.Content)
 		// 标题原本就是从正文首行派生的（朋友圈式发布）→ 正文改了，标题跟着改。
 		// 关键：**只有请求未携带 title 时**才允许回填派生标题。
@@ -777,18 +799,18 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.CityCode = ""
 		entry.CityName = ""
 		entry.Location = ""
-	} else if hasKey("location") || hasKey("city_code") || hasKey("city_name") ||
+	} else if hasJSONValue(rawKeys, "location") || hasJSONValue(rawKeys, "city_code") || hasJSONValue(rawKeys, "city_name") ||
 		req.Location != "" || req.CityCode != "" || req.CityName != "" {
 		curCode := entry.CityCode
-		if hasKey("city_code") || req.CityCode != "" {
+		if hasJSONValue(rawKeys, "city_code") || req.CityCode != "" {
 			curCode = req.CityCode
 		}
 		curName := entry.CityName
-		if hasKey("city_name") || req.CityName != "" {
+		if hasJSONValue(rawKeys, "city_name") || req.CityName != "" {
 			curName = req.CityName
 		}
 		curLoc := entry.Location
-		if hasKey("location") || req.Location != "" {
+		if hasJSONValue(rawKeys, "location") || req.Location != "" {
 			curLoc = req.Location
 		}
 		if strings.TrimSpace(curCode) == "" && strings.TrimSpace(curName) == "" && strings.TrimSpace(curLoc) == "" {
@@ -820,10 +842,10 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.Location = entry.CityName
 	}
 	// 指针字段：携带 key 才写（null = 解绑）
-	if hasKey("project_id") {
+	if _, present := rawKeys["project_id"]; present {
 		entry.ProjectID = req.ProjectID
 	}
-	if hasKey("wish_id") {
+	if _, present := rawKeys["wish_id"]; present {
 		entry.WishID = req.WishID
 	}
 
@@ -841,28 +863,13 @@ func UpdateLifeEntry(c *gin.Context) {
 		if err := tx.Save(&entry).Error; err != nil {
 			return err
 		}
-		if req.ClearAttachments {
-			// 契约 A：显式解绑全部附件；若同时携带 attachment_ids，则下面再绑定新列表
-			if err := tx.Model(&models.Attachment{}).
-				Where("entry_id = ?", entry.ID).
-				Update("entry_id", nil).Error; err != nil {
-				return err
+		if req.ClearAttachments || req.AttachmentIDs != nil {
+			query := tx.Model(&models.Attachment{}).Where("entry_id = ?", entry.ID)
+			if len(req.AttachmentIDs) > 0 {
+				query = query.Where("id NOT IN ?", req.AttachmentIDs)
 			}
-		} else if req.AttachmentIDs != nil {
-			// 空数组语义 = 解除该条目的全部附件绑定（不可退化为 NOT IN 空集，那样解绑一条都不发生）
-			if len(req.AttachmentIDs) == 0 {
-				if err := tx.Model(&models.Attachment{}).
-					Where("entry_id = ?", entry.ID).
-					Update("entry_id", nil).Error; err != nil {
-					return err
-				}
-			} else {
-				// 解除未包含的附件
-				if err := tx.Model(&models.Attachment{}).
-					Where("entry_id = ? AND id NOT IN ?", entry.ID, req.AttachmentIDs).
-					Update("entry_id", nil).Error; err != nil {
-					return err
-				}
+			if err := query.Update("entry_id", nil).Error; err != nil {
+				return err
 			}
 		}
 		if len(req.AttachmentIDs) > 0 {
@@ -1498,10 +1505,6 @@ func UpdateTransaction(c *gin.Context) {
 	}
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
-	hasKey := func(k string) bool {
-		_, ok := rawKeys[k]
-		return ok
-	}
 	oldFootprintID := uint(0)
 	if tx.FootprintID != nil {
 		oldFootprintID = *tx.FootprintID
@@ -1529,13 +1532,13 @@ func UpdateTransaction(c *gin.Context) {
 	tx.Category = strings.TrimSpace(req.Category)
 	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
 	// 缺省 / null = 保持原值」。原先无条件覆盖，客户端省略 note 时会把备注清掉。
-	if req.Title != "" || hasKey("title") {
+	if req.Title != "" || hasJSONValue(rawKeys, "title") {
 		tx.Title = strings.TrimSpace(req.Title)
 	}
-	if req.Note != "" || hasKey("note") {
+	if req.Note != "" || hasJSONValue(rawKeys, "note") {
 		tx.Note = strings.TrimSpace(req.Note)
 	}
-	if req.PaymentMethod != "" || hasKey("payment_method") {
+	if req.PaymentMethod != "" || hasJSONValue(rawKeys, "payment_method") {
 		tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
 	}
 	if req.WishID != nil {

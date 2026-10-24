@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -37,9 +38,8 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	device := models.Device{
 		DeviceID: "dev_contract_unified", Name: "契约测试设备", Platform: "web",
 		TokenHash: middleware.HashToken(token), Status: "active",
-		// 关键：LastActiveAt 置为当前时刻，避免 AdminAuthRequired 的节流 goroutine
-		// 在测试结束后仍异步写库（写的是已被下一个测试替换/清理的临时库，
-		// 会与 t.TempDir 的 RemoveAll 竞态，导致偶发的 "directory not empty" 失败）。
+		// 关键：LastActiveAt 置为当前时刻，跳过 AdminAuthRequired 的活跃时间节流更新，
+		// 避免测试请求额外写入本用例的临时库。
 		LastActiveAt: time.Now(),
 	}
 	if err := db.DB.Create(&device).Error; err != nil {
@@ -54,6 +54,8 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	r.PUT("/api/v1/entries/:id", middleware.AdminAuthRequired(), UpdateLifeEntry)
 	r.POST("/api/v1/transactions", middleware.AdminAuthRequired(), CreateTransaction)
 	r.PUT("/api/v1/transactions/:id", middleware.AdminAuthRequired(), UpdateTransaction)
+	r.GET("/api/v1/footprints/:id", GetFootprintByID)
+	r.PUT("/api/v1/footprints/:id", middleware.AdminAuthRequired(), UpdateFootprint)
 	r.POST("/api/v1/assets/gear", middleware.AdminAuthRequired(), AddGearAsset)
 	r.POST("/api/v1/assets/gear/:id/sell", middleware.AdminAuthRequired(), SellGearAsset)
 	return r, token
@@ -331,5 +333,313 @@ func TestPublicDetailEndpointsRejectNonNumericID(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("非数字 id 应 400, 实际 %d", w.Code)
+	}
+}
+
+func TestUpdateEntryTextFieldsPreserveNull(t *testing.T) {
+	r, token := setupContractRouter(t)
+	entry := models.LifeEntry{Type: "life", Title: "原标题", Content: "原正文", Location: "原地点"}
+	if err := db.DB.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/entries/" + u64(entry.ID)
+	w := doJSON(r, http.MethodPut, path, token, map[string]any{
+		"title": nil, "content": nil, "location": nil,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
+	}
+	var kept models.LifeEntry
+	if err := db.DB.First(&kept, entry.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if kept.Title != entry.Title || kept.Content != entry.Content || kept.Location != entry.Location {
+		t.Fatalf("null 不得清空文本: title=%q content=%q location=%q", kept.Title, kept.Content, kept.Location)
+	}
+	w = doJSON(r, http.MethodPut, path, token, map[string]any{
+		"title": "", "content": "", "location": "",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("清空失败: %d %s", w.Code, w.Body.String())
+	}
+	var cleared models.LifeEntry
+	if err := db.DB.First(&cleared, entry.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Title != "" || cleared.Content != "" || cleared.Location != "" {
+		t.Fatalf("显式空串应清空文本: %+v", cleared)
+	}
+}
+
+func TestUpdateTransactionTextFieldsPreserveNull(t *testing.T) {
+	r, token := setupContractRouter(t)
+	transaction := models.Transaction{Amount: 100, Type: "expense", Category: "餐饮", Title: "原标题", Note: "原备注", PaymentMethod: "现金"}
+	if err := db.DB.Create(&transaction).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(r, http.MethodPut, "/api/v1/transactions/"+u64(transaction.ID), token, map[string]any{
+		"amount": 200, "category": "餐饮", "title": nil, "note": nil, "payment_method": nil,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
+	}
+	var kept models.Transaction
+	if err := db.DB.First(&kept, transaction.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if kept.Amount != 200 || kept.Title != transaction.Title || kept.Note != transaction.Note || kept.PaymentMethod != transaction.PaymentMethod {
+		t.Fatalf("金额应更新且 null 文本应保留: %+v", kept)
+	}
+}
+
+func TestUpdateFootprintNotePreservesNull(t *testing.T) {
+	r, token := setupContractRouter(t)
+	footprint := models.Footprint{CityCode: "330100", CityName: "杭州市", Title: "标题", Note: "原随笔", VisitedAt: time.Now()}
+	if err := db.DB.Create(&footprint).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(r, http.MethodPut, "/api/v1/footprints/"+u64(footprint.ID), token, map[string]any{"note": nil})
+	if w.Code != http.StatusOK {
+		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
+	}
+	var kept models.Footprint
+	if err := db.DB.First(&kept, footprint.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if kept.Note != footprint.Note {
+		t.Fatalf("null 不得清空随笔: %q", kept.Note)
+	}
+}
+
+func TestUpdateEntryAttachmentOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		owner      string
+		related    bool
+		clearFirst bool
+		detachWish bool
+		unbound    bool
+	}{
+		{name: "related_footprint", owner: "footprint", related: true},
+		{name: "related_footprint_rebind", owner: "footprint", related: true, clearFirst: true},
+		{name: "related_wish", owner: "wish", related: true},
+		{name: "detach_wish_keep_image", owner: "wish", related: true, detachWish: true},
+		{name: "detach_wish_rebind_image", owner: "wish", related: true, detachWish: true, clearFirst: true},
+		{name: "detached_wish_rejects_new_image", owner: "wish", related: true, detachWish: true, unbound: true},
+		{name: "foreign_footprint", owner: "footprint"},
+		{name: "foreign_wish", owner: "wish"},
+		{name: "foreign_entry", owner: "entry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, token := setupContractRouter(t)
+			ownerID := uint(700)
+			entry := models.LifeEntry{Type: "life", Title: "原记录", Content: "原内容"}
+			if tc.related && tc.owner == "footprint" {
+				entry.FootprintID = &ownerID
+			}
+			if tc.related && tc.owner == "wish" {
+				entry.WishID = &ownerID
+			}
+			if err := db.DB.Create(&entry).Error; err != nil {
+				t.Fatal(err)
+			}
+			attachment := models.Attachment{ObjectKey: "entries/ownership.png", MimeType: "image/png"}
+			if tc.related && !tc.unbound {
+				attachment.EntryID = &entry.ID
+			}
+			switch tc.owner {
+			case "footprint":
+				attachment.FootprintID = &ownerID
+			case "wish":
+				attachment.WishID = &ownerID
+			case "entry":
+				attachment.EntryID = &ownerID
+			}
+			if err := db.DB.Create(&attachment).Error; err != nil {
+				t.Fatal(err)
+			}
+			payload := map[string]any{
+				"content": "修订正文", "attachment_ids": []uint{attachment.ID}, "clear_attachments": tc.clearFirst,
+			}
+			if tc.detachWish {
+				payload["wish_id"] = nil
+			}
+			w := doJSON(r, http.MethodPut, "/api/v1/entries/"+u64(entry.ID), token, payload)
+			wantStatus := http.StatusBadRequest
+			if tc.related && !tc.unbound {
+				wantStatus = http.StatusOK
+			}
+			if w.Code != wantStatus {
+				t.Fatalf("归属校验状态应为 %d: %d %s", wantStatus, w.Code, w.Body.String())
+			}
+			var reloaded models.Attachment
+			if err := db.DB.First(&reloaded, attachment.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			sameID := func(a, b *uint) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
+			if !sameID(reloaded.EntryID, attachment.EntryID) || !sameID(reloaded.FootprintID, attachment.FootprintID) || !sameID(reloaded.WishID, attachment.WishID) {
+				t.Fatalf("原有附件归属不得被改写: %+v", reloaded)
+			}
+			var updated models.LifeEntry
+			if err := db.DB.First(&updated, entry.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if wantStatus == http.StatusBadRequest && updated.Content != entry.Content {
+				t.Fatal("归属冲突应回滚正文修改")
+			}
+			if wantStatus == http.StatusOK && tc.detachWish && updated.WishID != nil {
+				t.Fatal("引用 null 仍应解绑心愿")
+			}
+		})
+	}
+}
+
+func TestFootprintAttachmentReadUnion(t *testing.T) {
+	for _, primaryOnly := range []bool{false, true} {
+		t.Run(fmt.Sprint(primaryOnly), func(t *testing.T) {
+			r, token := setupContractRouter(t)
+			entry := models.LifeEntry{Type: "travel", Content: "共享记录", OccurredAt: time.Now()}
+			if err := db.DB.Create(&entry).Error; err != nil {
+				t.Fatal(err)
+			}
+			footprints := []models.Footprint{
+				{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now(), LifeEntryID: &entry.ID},
+				{CityCode: "510100", CityName: "成都市", VisitedAt: time.Now()},
+			}
+			if err := db.DB.Create(&footprints).Error; err != nil {
+				t.Fatal(err)
+			}
+			entryOwner := footprints[0].ID
+			if primaryOnly {
+				entryOwner = footprints[1].ID
+			}
+			if err := db.DB.Model(&entry).Update("footprint_id", entryOwner).Error; err != nil {
+				t.Fatal(err)
+			}
+			attachment := models.Attachment{ObjectKey: "entries/mixed.png", EntryID: &entry.ID, FootprintID: &footprints[1].ID}
+			if err := db.DB.Create(&attachment).Error; err != nil {
+				t.Fatal(err)
+			}
+			w := doJSON(r, http.MethodPut, "/api/v1/footprints/"+u64(footprints[0].ID), token,
+				map[string]any{"attachment_ids": []uint{attachment.ID}})
+			if w.Code != http.StatusOK {
+				t.Fatalf("保留共享图片失败: %d %s", w.Code, w.Body.String())
+			}
+			populateFootprintURLsBatch(footprints)
+			for _, fp := range footprints {
+				if len(fp.Attachments) != 1 || fp.Attachments[0].ID != attachment.ID {
+					t.Fatalf("批量返回应保留图片 #%d: footprint=%d attachments=%+v", attachment.ID, fp.ID, fp.Attachments)
+				}
+				populateFootprintURLs(&fp)
+				if len(fp.Attachments) != 1 || fp.Attachments[0].ID != attachment.ID {
+					t.Fatalf("详情与批量应一致: footprint=%d attachments=%+v", fp.ID, fp.Attachments)
+				}
+			}
+			var kept models.Attachment
+			if err := db.DB.First(&kept, attachment.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if kept.EntryID == nil || *kept.EntryID != entry.ID || kept.FootprintID == nil || *kept.FootprintID != footprints[1].ID {
+				t.Fatalf("保留图片不得改写原归属: %+v", kept)
+			}
+		})
+	}
+}
+
+func TestUpdateFootprintAttachmentSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		clear   bool
+		replace bool
+	}{
+		{name: "clear_flag", clear: true},
+		{name: "empty_list"},
+		{name: "replace", replace: true},
+		{name: "clear_then_replace", clear: true, replace: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, token := setupContractRouter(t)
+			entries := []models.LifeEntry{
+				{Type: "travel", Content: "旅程主记录", OccurredAt: time.Now()},
+				{Type: "travel", Content: "旅程另一条记录", OccurredAt: time.Now()},
+				{Type: "life", Content: "无关记录", OccurredAt: time.Now()},
+			}
+			if err := db.DB.Create(&entries).Error; err != nil {
+				t.Fatal(err)
+			}
+			fp := models.Footprint{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now(), LifeEntryID: &entries[0].ID}
+			if err := db.DB.Create(&fp).Error; err != nil {
+				t.Fatal(err)
+			}
+			linkedIDs := []uint{entries[0].ID, entries[1].ID}
+			if err := db.DB.Model(&models.LifeEntry{}).Where("id IN ?", linkedIDs).Update("footprint_id", fp.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			wishID := uint(800)
+			attachments := []models.Attachment{
+				{ObjectKey: "entries/primary.png", EntryID: &entries[0].ID, FootprintID: &fp.ID, WishID: &wishID},
+				{ObjectKey: "entries/extra.png", EntryID: &entries[1].ID},
+				{ObjectKey: "entries/unrelated.png", EntryID: &entries[2].ID},
+				{ObjectKey: "entries/new.png"},
+			}
+			if err := db.DB.Create(&attachments).Error; err != nil {
+				t.Fatal(err)
+			}
+			payload := map[string]any{"clear_attachments": tc.clear}
+			if tc.replace {
+				payload["attachment_ids"] = []uint{attachments[1].ID, attachments[3].ID}
+			} else if !tc.clear {
+				payload["attachment_ids"] = []uint{}
+			}
+			path := "/api/v1/footprints/" + u64(fp.ID)
+			w := doJSON(r, http.MethodPut, path, token, payload)
+			if w.Code != http.StatusOK {
+				t.Fatalf("清理旅程图片失败: %d %s", w.Code, w.Body.String())
+			}
+			wantCount := 0
+			if tc.replace {
+				wantCount = 2
+			}
+			for _, method := range []string{http.MethodPut, http.MethodGet} {
+				if method == http.MethodGet {
+					w = doJSON(r, method, path, token, nil)
+				}
+				var response struct {
+					Data models.Footprint `json:"data"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if w.Code != http.StatusOK || len(response.Data.Attachments) != wantCount {
+					t.Fatalf("%s 应返回 %d 张图片: %d %s", method, wantCount, w.Code, w.Body.String())
+				}
+			}
+			batch := []models.Footprint{fp}
+			populateFootprintURLsBatch(batch)
+			if len(batch[0].Attachments) != wantCount {
+				t.Fatalf("列表与详情图片应一致: %d", len(batch[0].Attachments))
+			}
+			var removed, extra, unrelated models.Attachment
+			for _, item := range []struct {
+				id  uint
+				dst *models.Attachment
+			}{{attachments[0].ID, &removed}, {attachments[1].ID, &extra}, {attachments[2].ID, &unrelated}} {
+				if err := db.DB.First(item.dst, item.id).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if removed.EntryID != nil || removed.FootprintID != nil || removed.WishID == nil || *removed.WishID != wishID {
+				t.Fatalf("已移除图片应解绑当前旅程及散页，保留心愿归属: %+v", removed)
+			}
+			if tc.replace && (extra.EntryID == nil || *extra.EntryID != entries[1].ID) {
+				t.Fatal("保留图片不得从其他旅程记录迁移到主记录")
+			}
+			if !tc.replace && extra.EntryID != nil {
+				t.Fatal("清空图片应同时解绑该旅程其他记录的图片")
+			}
+			if unrelated.EntryID == nil || *unrelated.EntryID != entries[2].ID {
+				t.Fatal("不得修改无关记录的图片")
+			}
+		})
 	}
 }

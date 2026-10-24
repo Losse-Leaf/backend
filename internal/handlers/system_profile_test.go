@@ -459,7 +459,100 @@ func TestSystemBootstrapPairingAndVerifyLifecycle(t *testing.T) {
 	})
 }
 
-// TestSystemUpdateCheck 测试主理人系统版本更新检查 (需管理员鉴权，访客零感知)
+func TestBootstrapRestoredSystemRequiresTrustedDevice(t *testing.T) {
+	const token = "lldt_restore_test_device"
+	for _, tc := range []struct {
+		name       string
+		status     string
+		headers    map[string]string
+		cookie     bool
+		queryToken bool
+		wantStatus int
+	}{
+		{name: "anonymous", status: "active", wantStatus: http.StatusUnauthorized},
+		{name: "unknown_token", status: "active", headers: map[string]string{"X-Device-Token": "unknown"}, wantStatus: http.StatusUnauthorized},
+		{name: "revoked_device", status: "revoked", headers: map[string]string{"X-Device-Token": token}, wantStatus: http.StatusUnauthorized},
+		{name: "pending_device", status: "pending", headers: map[string]string{"X-Device-Token": token}, wantStatus: http.StatusUnauthorized},
+		{name: "query_token_rejected", status: "active", queryToken: true, wantStatus: http.StatusUnauthorized},
+		{name: "device_header", status: "active", headers: map[string]string{"X-Device-Token": token}, wantStatus: http.StatusOK},
+		{name: "bearer_header", status: "active", headers: map[string]string{"Authorization": "Bearer " + token}, wantStatus: http.StatusOK},
+		{name: "admin_header", status: "active", headers: map[string]string{"X-Admin-Key": token}, wantStatus: http.StatusOK},
+		{name: "session_cookie", status: "active", cookie: true, wantStatus: http.StatusOK},
+		{name: "invalid_header_overrides_cookie", status: "active", headers: map[string]string{"X-Device-Token": "unknown"}, cookie: true, wantStatus: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			setupTestFullDB(t)
+			cfg := models.SiteConfig{Initialized: true, CuratorName: "原主理人", DefaultLocation: "原城市"}
+			profile := models.CuratorProfile{Name: "原主理人", Location: "原城市", CurrentCity: "原城市"}
+			device := models.Device{DeviceID: "restore-test-device", TokenHash: middleware.HashToken(token), Status: tc.status, LastActiveAt: time.Now()}
+			for _, value := range []any{&cfg, &profile, &device} {
+				if err := db.DB.Create(value).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := gin.New()
+			r.POST("/api/v1/system/bootstrap", BootstrapSystem)
+			body, err := json.Marshal(BootstrapRequest{
+				CuratorName: "恢复主理人", Location: "恢复城市",
+				MasterPasscode: "restored-test-passcode", ConfirmPasscode: "restored-test-passcode",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := "/api/v1/system/bootstrap"
+			if tc.queryToken {
+				path += "?admin_key=" + token
+			}
+			request := func() *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				for name, value := range tc.headers {
+					req.Header.Set(name, value)
+				}
+				if tc.cookie {
+					req.AddCookie(&http.Cookie{Name: middleware.SessionCookieName, Value: token})
+				}
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+				return w
+			}
+			w := request()
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			var saved models.SiteConfig
+			var savedProfile models.CuratorProfile
+			var ticketCount int64
+			if err := db.DB.First(&saved, cfg.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.DB.First(&savedProfile, profile.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.DB.Model(&models.PairTicket{}).Count(&ticketCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if !saved.Initialized {
+				t.Fatal("restored system must remain initialized")
+			}
+			if tc.wantStatus != http.StatusOK {
+				if saved.MasterPasscode != "" || saved.CuratorName != cfg.CuratorName || saved.DefaultLocation != cfg.DefaultLocation ||
+					savedProfile.Name != profile.Name || savedProfile.Location != profile.Location || ticketCount != 0 {
+					t.Fatal("denied recovery must not change the passcode, profile, or pairing tickets")
+				}
+				return
+			}
+			if !CheckPasscode("restored-test-passcode", saved.MasterPasscode) || saved.CuratorName != "恢复主理人" || savedProfile.Name != "恢复主理人" || ticketCount != 1 {
+				t.Fatal("authorized recovery must set the passcode and issue one pairing ticket")
+			}
+			if repeated := request(); repeated.Code != http.StatusForbidden {
+				t.Fatalf("repeated bootstrap must be forbidden after recovery: %d %s", repeated.Code, repeated.Body.String())
+			}
+		})
+	}
+}
+
 func TestSystemUpdateCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)

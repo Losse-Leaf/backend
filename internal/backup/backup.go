@@ -466,24 +466,19 @@ func GetBackupStream(ctx context.Context, filename string) (io.ReadCloser, int64
 	return f, fi.Size(), nil
 }
 
-// restoring 恢复进行中标志（发现 10）。
-// 恢复期间数据库连接池会被关闭重建、主库文件被整体覆写 ——
-// 并发写入要么报错、要么写到被替换前的旧文件上而**静默丢失**。
-// main.go 路由层据此对全部非 GET 写请求返回 503。
-var restoring atomic.Bool
+// restoringCount 恢复进行中的请求数。
+//
+// 恢复期间连接池会被关闭重建、主库与媒体文件会被整体覆写 ——
+// 在途读写要么报错、要么落到被替换前的旧文件上而**静默丢失**。
+// 用计数而非布尔：并发提交的第二次恢复在等待写锁期间也必须让新请求继续 503，
+// 不能被先完成的那次提前放行。
+var restoringCount atomic.Int32
 
-// IsRestoring 当前是否正在执行整库恢复（写请求应被 503 拒绝）
-func IsRestoring() bool { return restoring.Load() }
+// IsRestoring 当前是否正在执行整库恢复（所有请求应被 503 拒绝）
+func IsRestoring() bool { return restoringCount.Load() > 0 }
 
 // RestoreFromZipStream 从 ZIP 输入流执行整库还原与灾备回退
 func RestoreFromZipStream(zipReader *zip.Reader) error {
-	backupMutex.Lock()
-	defer backupMutex.Unlock()
-
-	// 恢复窗口内静默写操作（发现 10）；defer 保证任何失败路径都会放开
-	restoring.Store(true)
-	defer restoring.Store(false)
-
 	// 1. 扫描 ZIP 校验核心文件
 	var dbZipFile *zip.File
 	var uploadFiles []*zip.File
@@ -535,19 +530,40 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 		return fmt.Errorf("备份数据库完整性校验未通过 (%s)，已拒绝覆盖", checkResult)
 	}
 
-	// 3. 终极自保措施：在覆盖既有数据库前，生成一份紧急快照副本 (pre-restore-emergency)
-	currentDBPath := config.AppConfig.DBPath
-	emergencyBackupPath := fmt.Sprintf("%s.pre-restore-emergency-%d", currentDBPath, time.Now().Unix())
-	if err := copyFile(currentDBPath, emergencyBackupPath); err != nil {
-		log.Printf("[Backup] 生成当前在用库紧急保底副本失败: %v (继续执行)", err)
-	} else {
-		log.Printf("[Backup] 已生成当前在用库紧急保底副本: %s", emergencyBackupPath)
-		// 关键：**只保留最近一份**。
-		// 原先每执行一次「回滚还原」就在库旁多一个完整数据库副本
-		// （含全部私人内容与 R2 密钥），代码里**没有任何地方删除**它们 ——
-		// 10 次恢复就是 10 份全量档案堆积在磁盘上。
-		pruneEmergencyCopies(currentDBPath, 1)
+	// 校验通过后才进入隔离态：无效备份不应让全站短暂不可用。
+	restoringCount.Add(1)
+	defer restoringCount.Add(-1)
+
+	// 写锁覆盖「排空在途读写 → 快照 → 替换 → 重连 → 媒体解压」全过程。
+	// 锁序固定为 lifecycle → backupMutex；反向会与持读锁的手动备份互相等待。
+	db.LockWrite()
+	defer db.UnlockWrite()
+
+	backupMutex.Lock()
+	defer backupMutex.Unlock()
+
+	if db.DB == nil {
+		return errors.New("数据库尚未初始化，无法执行恢复")
 	}
+
+	// 3. 终极自保措施：在覆盖既有数据库前，生成一份紧急快照副本 (pre-restore-emergency)
+	//
+	// 关键：绝不能用 copyFile 直接复制主库文件 —— 主库运行在 WAL 模式，
+	// 已提交但尚未 checkpoint 的事务只存在于 -wal 中，直接复制会得到**缺数据**的
+	// 「保底副本」（恢复失败时它反而会覆盖掉唯一的好库）。
+	// VACUUM INTO 读取的是一致性快照，会把 WAL 中的内容一并写入独立文件。
+	currentDBPath := config.AppConfig.DBPath
+	emergencyBackupPath := fmt.Sprintf("%s.pre-restore-emergency-%d", currentDBPath, time.Now().UnixNano())
+	if err := db.DB.Exec("VACUUM INTO ?", emergencyBackupPath).Error; err != nil {
+		_ = os.Remove(emergencyBackupPath)
+		return fmt.Errorf("生成当前在用库紧急快照失败，已中止恢复: %w", err)
+	}
+	log.Printf("[Backup] 已生成当前在用库紧急保底副本: %s", emergencyBackupPath)
+	// 关键：**只保留最近一份**。
+	// 原先每执行一次「回滚还原」就在库旁多一个完整数据库副本
+	// （含全部私人内容与 R2 密钥），代码里**没有任何地方删除**它们 ——
+	// 10 次恢复就是 10 份全量档案堆积在磁盘上。
+	pruneEmergencyCopies(currentDBPath, 1)
 
 	// 4. 关闭旧连接池，清理残留 WAL / SHM 日志，覆写当前数据库文件
 	if sqlDB, err := db.DB.DB(); err == nil {

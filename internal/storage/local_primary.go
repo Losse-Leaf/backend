@@ -20,7 +20,6 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -248,7 +247,7 @@ func MirrorObjectToLocal(ctx context.Context, objectKey string) error {
 // UploadObject 区分开。
 // 关键：若误用 UploadObject，当源文件就在本地时，它会**先截断再从自己读**
 // —— 文件被自己覆盖成空，备份内容全毁。
-func BackupObjectToR2(ctx context.Context, objectKey string, reader io.Reader, size int64, contentType string) error {
+func BackupObjectToR2(ctx context.Context, objectKey string, reader io.ReadSeeker, size int64, contentType string) error {
 	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
 	if objectKey == "" {
 		return errors.New("object_key 不能为空")
@@ -261,15 +260,32 @@ func BackupObjectToR2(ctx context.Context, objectKey string, reader io.Reader, s
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	payload, err := io.ReadAll(io.LimitReader(reader, 512<<20))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if size < 0 {
+		return fmt.Errorf("payload size must be non-negative: %d", size)
+	}
+	start, err := reader.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return fmt.Errorf("failed to read payload: %w", err)
+		return fmt.Errorf("failed to get payload offset: %w", err)
+	}
+	end, seekErr := reader.Seek(0, io.SeekEnd)
+	_, restoreErr := reader.Seek(start, io.SeekStart)
+	if seekErr != nil || restoreErr != nil {
+		return fmt.Errorf("failed to measure or restore payload: %w", errors.Join(seekErr, restoreErr))
+	}
+	if start < 0 || end < start || end-start != size {
+		return fmt.Errorf("payload size mismatch: declared %d, remaining %d", size, end-start)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	putInput := &s3.PutObjectInput{
 		Bucket:        aws.String(snap.bucket),
 		Key:           aws.String(objectKey),
-		Body:          bytes.NewReader(payload),
-		ContentLength: aws.Int64(int64(len(payload))),
+		Body:          reader,
+		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
 	}
 	_, err = snap.client.PutObject(ctx, putInput)

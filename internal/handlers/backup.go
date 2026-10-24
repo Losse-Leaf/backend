@@ -10,9 +10,19 @@ import (
 	"strings"
 
 	"loose-leaf/internal/backup"
+	"loose-leaf/internal/db"
 
 	"github.com/gin-gonic/gin"
 )
+
+// finalizeRestore 在数据库生命周期读锁内刷新恢复后的内存缓存与存储配置，
+// 避免与并发发起的第二次恢复的替换窗口交错。
+func finalizeRestore() {
+	db.LockRead()
+	defer db.UnlockRead()
+	InvalidateStatsCache()
+	LoadStorageConfigFromDB()
+}
 
 // CreateBackupNow 主理人手动立即触发一次全量备份 (POST /api/v1/system/backup/now)
 func CreateBackupNow(c *gin.Context) {
@@ -126,8 +136,7 @@ func RestoreBackup(c *gin.Context) {
 			Error(c, http.StatusInternalServerError, fmt.Sprintf("恢复备份失败: %v", err))
 			return
 		}
-		InvalidateStatsCache()
-		LoadStorageConfigFromDB()
+		finalizeRestore()
 
 		Success(c, gin.H{
 			"message":  "已成功从上传的压缩包完整恢复数据库与媒体资源",
@@ -178,8 +187,7 @@ func RestoreBackup(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, fmt.Sprintf("恢复备份失败: %v", err))
 		return
 	}
-	InvalidateStatsCache()
-	LoadStorageConfigFromDB()
+	finalizeRestore()
 
 	Success(c, gin.H{
 		"message":  fmt.Sprintf("已成功恢复备份快照 %s", filename),

@@ -135,14 +135,12 @@ func AdminAuthRequired() gin.HandlerFunc {
 			tHash := HashToken(token)
 			var device models.Device
 			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).Limit(1).Find(&device).Error; err == nil && device.ID > 0 {
-				// 异步轻量更新设备的最近活跃时间 (带 60 秒节流防抖 BE-03)
+				// 最近活跃时间在请求内同步更新（60 秒节流 BE-03）。
+				// 不能放进 goroutine：它可能活过整库恢复，把旧设备写进新库，
+				// 或是撞上正在关闭的连接池。
 				now := time.Now()
 				if now.Sub(device.LastActiveAt) > time.Minute {
-					go func(dID uint, activeTime time.Time) {
-						if db.DB != nil {
-							_ = db.DB.Model(&models.Device{}).Where("id = ?", dID).Update("last_active_at", activeTime).Error
-						}
-					}(device.ID, now)
+					_ = db.DB.Model(&models.Device{}).Where("id = ?", device.ID).Update("last_active_at", now).Error
 				}
 
 				c.Set("auth_type", "device")

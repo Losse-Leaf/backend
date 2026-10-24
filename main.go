@@ -97,6 +97,17 @@ func main() {
 	// 5. API v1 路由组 (标准结构化数据与持久化服务)
 	v1 := r.Group("/api/v1")
 	{
+		// 整库恢复与健康探针必须在生命周期准入之前注册：
+		//   - 恢复自身要拿数据库写锁，若再经读锁准入会自锁；
+		//   - 探针不访问数据库，不能因长恢复而超时。
+		restore := v1.Group("")
+		restore.Use(restoreAdmission())
+		restore.POST("/system/backup/restore", handlers.RestoreBackup)
+
+		v1.GET("/health", handlers.HealthCheck)
+
+		v1.Use(lifecycleGuard())
+
 		// === 公开只读接口 ===
 		v1.GET("/entries", handlers.GetLifeEntriesV1)
 		v1.GET("/entries/on-this-day", handlers.GetOnThisDayEntries)
@@ -151,20 +162,6 @@ func main() {
 		// === 管理员写权限受保护接口 ===
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
-		// 整库恢复窗口静默写操作（发现 10）：恢复期间数据库连接池被关闭重建、
-		// 主库文件被整体覆写，并发写入要么报错、要么落到被替换前的旧文件上**静默丢失**。
-		// 非GET/HEAD 一律 503，恢复结束后自动放开。
-		write.Use(func(c *gin.Context) {
-			if backup.IsRestoring() && c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
-				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-					"code":    http.StatusServiceUnavailable,
-					"message": "系统正在从备份恢复，写操作暂时不可用，请稍后重试",
-					"data":    nil,
-				})
-				return
-			}
-			c.Next()
-		})
 		{
 			// 统一文件直传接口 (支持 multipart/form-data，返回 R2 相对路径与临时预签名 URL)
 			write.POST("/files/upload", handlers.UnifiedUploadFile)
@@ -241,7 +238,6 @@ func main() {
 			write.GET("/system/backup/list", handlers.GetBackupList)
 			write.GET("/system/backup/download/:filename", handlers.DownloadBackup)
 			write.DELETE("/system/backup/:filename", handlers.DeleteBackup)
-			write.POST("/system/backup/restore", handlers.RestoreBackup)
 
 			// 对象存储在线配置与连通性测试 (热重载)
 			write.POST("/storage/test", handlers.TestStorageConfig)
@@ -250,8 +246,6 @@ func main() {
 			write.POST("/storage/migrate", handlers.MigrateStorageMedia)
 		}
 
-		// Health Check
-		v1.GET("/health", handlers.HealthCheck)
 	}
 
 	// 探针路由 (对齐 docs/backend.md §5.1)
@@ -273,7 +267,8 @@ func main() {
 	// 关键：媒体路由**带签名校验**（原先是无鉴权的静态托管 ——
 	// 任何知道中枢地址的人都能翻阅全部照片）。
 	// 放行条件：URL 自带有效签名，或携带有效的设备令牌 / 会话 Cookie。
-	r.GET("/media/*filepath", handlers.ServeLocalMedia)
+	// ServeLocalMedia 会查库鉴权，因此同样受数据库生命周期准入保护。
+	r.GET("/media/*filepath", lifecycleGuard(), handlers.ServeLocalMedia)
 
 	// 8. 前端静态文件托管（支持 //go:embed 单二进制内嵌与本地磁盘双模，docs/ecosystem.md §10.4）
 	setupFrontendStaticServing(r)
@@ -315,6 +310,64 @@ func main() {
 	}
 
 	log.Println("Loose-Leaf server exited cleanly.")
+}
+
+// lifecycleGuard 为每个访问数据库的请求持有生命周期读锁。
+//
+// 恢复进行中直接 503；若恢复已开始但尚未拿到写锁（例如在等在途读写排空），
+// 二次检查同样返回 503，避免请求挂在锁上直到 HTTP 超时。
+func lifecycleGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if backup.IsRestoring() {
+			abortRestoring(c)
+			return
+		}
+		db.LockRead()
+		defer db.UnlockRead()
+		if backup.IsRestoring() {
+			abortRestoring(c)
+			return
+		}
+		c.Next()
+	}
+}
+
+// restoreAdmission 整库恢复的专用准入：先 503 拦截并发恢复，再在短读锁内完成鉴权。
+//
+// 这条路由不能套 lifecycleGuard（否则恢复的写锁会与请求自身的读锁自锁），
+// 但鉴权要查 devices 表，仍必须避开数据库文件替换窗口。
+func restoreAdmission() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if backup.IsRestoring() {
+			abortRestoring(c)
+			return
+		}
+		db.LockRead()
+		if backup.IsRestoring() {
+			db.UnlockRead()
+			abortRestoring(c)
+			return
+		}
+		authorized := middleware.IsAdmin(c)
+		db.UnlockRead()
+		if !authorized {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"code":    http.StatusUnauthorized,
+				"message": "未授权的操作：缺少有效的访问凭证",
+				"data":    nil,
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func abortRestoring(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"code":    http.StatusServiceUnavailable,
+		"message": "系统正在从备份恢复，读写操作暂时不可用，请稍后重试",
+		"data":    nil,
+	})
 }
 
 // hasArg 判断命令行是否包含任一目标参数（支持 --flag / -flag / --flag=true）。

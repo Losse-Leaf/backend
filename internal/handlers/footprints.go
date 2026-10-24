@@ -249,7 +249,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 
 	fpIDs := make([]uint, 0, len(footprints))
 	entrySetByFP := make(map[uint]map[uint]bool, len(footprints))
-	entryFP := make(map[uint]uint)
+	entryFP := make(map[uint][]uint)
 	for i := range footprints {
 		f := &footprints[i]
 		if f.ID > 0 {
@@ -257,7 +257,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 			entrySetByFP[f.ID] = make(map[uint]bool)
 			if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
 				entrySetByFP[f.ID][*f.LifeEntryID] = true
-				entryFP[*f.LifeEntryID] = f.ID
+				entryFP[*f.LifeEntryID] = append(entryFP[*f.LifeEntryID], f.ID)
 			}
 		}
 	}
@@ -278,7 +278,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 					entrySetByFP[*r.FootprintID] = make(map[uint]bool)
 				}
 				entrySetByFP[*r.FootprintID][r.ID] = true
-				entryFP[r.ID] = *r.FootprintID
+				entryFP[r.ID] = append(entryFP[r.ID], *r.FootprintID)
 			}
 		}
 	}
@@ -296,13 +296,17 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 			db.DB.Where("footprint_id IN ?", fpIDs).Order("id ASC").Find(&atts)
 		}
 		for _, att := range atts {
-			switch {
-			case att.FootprintID != nil && *att.FootprintID > 0:
-				attByFP[*att.FootprintID] = append(attByFP[*att.FootprintID], att)
-			case att.EntryID != nil:
-				if fid, ok := entryFP[*att.EntryID]; ok {
-					attByFP[fid] = append(attByFP[fid], att)
+			owners := make(map[uint]bool)
+			if att.FootprintID != nil && *att.FootprintID > 0 {
+				owners[*att.FootprintID] = true
+			}
+			if att.EntryID != nil {
+				for _, fid := range entryFP[*att.EntryID] {
+					owners[fid] = true
 				}
+			}
+			for fid := range owners {
+				attByFP[fid] = append(attByFP[fid], att)
 			}
 		}
 	}
@@ -1006,14 +1010,8 @@ func UpdateFootprint(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
-	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
-	// 缺省 / null = 保持原值」。note 是旅程随笔，必须能清空。
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
-	hasKey := func(k string) bool {
-		_, ok := rawKeys[k]
-		return ok
-	}
 
 	if req.CityCode != "" {
 		footprint.CityCode = strings.TrimSpace(req.CityCode)
@@ -1037,7 +1035,7 @@ func UpdateFootprint(c *gin.Context) {
 			footprint.DepartedAt = &t
 		}
 	}
-	if req.Note != "" || hasKey("note") {
+	if hasJSONValue(rawKeys, "note") {
 		footprint.Note = strings.TrimSpace(req.Note)
 	}
 	if req.LifeEntryID != nil {
@@ -1074,30 +1072,77 @@ func UpdateFootprint(c *gin.Context) {
 			}
 		}
 
-		// 契约 A：clear_attachments 显式解绑全部相片；旧语义「空数组 = 清空」保持兼容
-		if req.ClearAttachments || (req.AttachmentIDs != nil && len(req.AttachmentIDs) == 0) {
-			if err := tx.Model(&models.Attachment{}).
-				Where("footprint_id = ?", footprint.ID).
-				Update("footprint_id", nil).Error; err != nil {
+		if req.ClearAttachments || req.AttachmentIDs != nil {
+			var entryIDs []uint
+			if err := tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", footprint.ID).Pluck("id", &entryIDs).Error; err != nil {
 				return err
-			}
-		}
-		if len(req.AttachmentIDs) > 0 {
-			// 解除未包含的附件
-			if err := tx.Model(&models.Attachment{}).
-				Where("footprint_id = ? AND id NOT IN ?", footprint.ID, req.AttachmentIDs).
-				Update("footprint_id", nil).Error; err != nil {
-				return err
-			}
-			updates := map[string]any{
-				"footprint_id": footprint.ID,
 			}
 			if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
-				updates["entry_id"] = *footprint.LifeEntryID
+				entryIDs = append(entryIDs, *footprint.LifeEntryID)
 			}
-			// 归属校验后绑定：抢占其他实体的附件直接 400（发现 15）
-			if err := claimAttachments(tx, req.AttachmentIDs, updates); err != nil {
+			entrySet := make(map[uint]bool, len(entryIDs))
+			for _, entryID := range entryIDs {
+				entrySet[entryID] = true
+			}
+
+			// 读取口径包含关联散页；移除照片时必须同时解除这些入口的关联。
+			query := tx.Where("footprint_id = ?", footprint.ID)
+			if len(entryIDs) > 0 {
+				query = query.Or("entry_id IN ?", entryIDs)
+			}
+			var current []models.Attachment
+			if err := query.Find(&current).Error; err != nil {
 				return err
+			}
+			selected := make(map[uint]bool, len(req.AttachmentIDs))
+			for _, attachmentID := range req.AttachmentIDs {
+				selected[attachmentID] = true
+			}
+			existing := make(map[uint]bool, len(current))
+			var removedIDs, changedEntryIDs []uint
+			for _, attachment := range current {
+				existing[attachment.ID] = true
+				if !selected[attachment.ID] {
+					removedIDs = append(removedIDs, attachment.ID)
+					if attachment.EntryID != nil && entrySet[*attachment.EntryID] {
+						changedEntryIDs = append(changedEntryIDs, *attachment.EntryID)
+					}
+				}
+			}
+			if len(removedIDs) > 0 {
+				if err := tx.Model(&models.Attachment{}).
+					Where("id IN ? AND footprint_id = ?", removedIDs, footprint.ID).
+					Update("footprint_id", nil).Error; err != nil {
+					return err
+				}
+				if len(changedEntryIDs) > 0 {
+					if err := tx.Model(&models.Attachment{}).
+						Where("id IN ? AND entry_id IN ?", removedIDs, changedEntryIDs).
+						Update("entry_id", nil).Error; err != nil {
+						return err
+					}
+					if err := tx.Model(&models.LifeEntry{}).Where("id IN ?", changedEntryIDs).
+						Update("updated_at", config.NowInBeijing()).Error; err != nil {
+						return err
+					}
+				}
+			}
+
+			var newIDs []uint
+			for _, attachmentID := range req.AttachmentIDs {
+				if !existing[attachmentID] {
+					newIDs = append(newIDs, attachmentID)
+					existing[attachmentID] = true
+				}
+			}
+			if len(newIDs) > 0 {
+				updates := map[string]any{"footprint_id": footprint.ID}
+				if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
+					updates["entry_id"] = *footprint.LifeEntryID
+				}
+				if err := claimAttachments(tx, newIDs, updates); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

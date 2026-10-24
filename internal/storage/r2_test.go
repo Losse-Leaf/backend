@@ -1,12 +1,56 @@
 package storage
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"loose-leaf/internal/config"
 )
+
+func TestPresignCacheDoesNotServeNearlyExpiredURLs(t *testing.T) {
+	original := R2ConfigSnapshot()
+	t.Cleanup(func() {
+		_ = InitR2(original)
+		ClearPresignCache()
+	})
+	if err := InitR2(config.R2Config{
+		AccessKeyID: "test-access", SecretAccessKey: "test-secret",
+		BucketName: "test-bucket", Endpoint: "http://127.0.0.1:1", PresignExpireSeconds: 1800,
+	}); err != nil {
+		t.Fatalf("初始化测试对象存储失败: %v", err)
+	}
+	ClearPresignCache()
+
+	const key = "entries/presign-cache-test.png"
+	_, firstExpires, err := GeneratePresignedGetURL(key)
+	if err != nil {
+		t.Fatalf("首次签名失败: %v", err)
+	}
+	if firstExpires != 1800 {
+		t.Fatalf("首次签名有效期 = %d, want 1800", firstExpires)
+	}
+
+	cacheKey := fmt.Sprintf("%s|%d", key, firstExpires)
+	presignCacheMu.Lock()
+	item, ok := presignCache[cacheKey]
+	if !ok {
+		presignCacheMu.Unlock()
+		t.Fatal("签名缓存未写入")
+	}
+	item.expiresAt = time.Now().Add(10 * time.Minute)
+	presignCache[cacheKey] = item
+	presignCacheMu.Unlock()
+
+	_, secondExpires, err := GeneratePresignedGetURL(key)
+	if err != nil {
+		t.Fatalf("二次签名失败: %v", err)
+	}
+	if secondExpires < 1700 {
+		t.Fatalf("剩余有效期不足 ETag 窗口时必须重新签发，实际剩余 %d 秒", secondExpires)
+	}
+}
 
 func TestStorageHelpers(t *testing.T) {
 	// Initialize with empty config (unconfigured mode)

@@ -464,9 +464,9 @@ func expandFootprintDateRange(fp *models.Footprint, t time.Time) bool {
 // 1. 若 LifeEntry 已指定 FootprintID，直接挂载至该趟旅程并按需扩展起止日期；
 // 2. 若未指定，优先查找同一城市在连续日期窗口 (±7天) 内已有的旅程 Footprint 并自动归并；
 // 3. 若无相近旅程，则新建一次旅程 Footprint。
-func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, dbTx ...*gorm.DB) {
+func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, dbTx ...*gorm.DB) error {
 	if entry == nil || entry.ID == 0 {
-		return
+		return nil
 	}
 	targetDB := db.DB
 	if len(dbTx) > 0 && dbTx[0] != nil {
@@ -475,7 +475,7 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 
 	cityCode := strings.TrimSpace(entry.CityCode)
 	if cityCode == "" || entry.Type == "reflection" || entry.Type == "wish" {
-		return
+		return nil
 	}
 
 	cityName := strings.TrimSpace(entry.CityName)
@@ -545,7 +545,7 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 		}
 		if needSave {
 			if err := targetDB.Save(&fp).Error; err != nil {
-				log.Printf("[Footprint Sync] 更新足迹失败 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
+				return fmt.Errorf("更新足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
 			}
 		}
 	} else {
@@ -559,7 +559,7 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 			WishID:      entry.WishID,
 		}
 		if err := targetDB.Create(&fp).Error; err != nil {
-			log.Printf("[Footprint Sync] 创建足迹失败 entry=%d: %v", entry.ID, err)
+			return fmt.Errorf("创建足迹失败 entry=%d: %w", entry.ID, err)
 		}
 	}
 
@@ -568,7 +568,7 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 			fpID := fp.ID
 			entry.FootprintID = &fpID
 			if err := targetDB.Model(&models.LifeEntry{}).Where("id = ?", entry.ID).Update("footprint_id", fp.ID).Error; err != nil {
-				log.Printf("[Footprint Sync] 回填散页 footprint_id 失败 entry=%d: %v", entry.ID, err)
+				return fmt.Errorf("回填散页 footprint_id 失败 entry=%d: %w", entry.ID, err)
 			}
 		}
 		if len(attachmentIDs) > 0 {
@@ -578,7 +578,10 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 				"footprint_id": fp.ID,
 				"entry_id":     entry.ID,
 			}); err != nil {
-				log.Printf("[Footprint Sync] 附件挂载足迹失败 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
+				if !errors.Is(err, errAttachmentClaimConflict) {
+					return fmt.Errorf("附件挂载足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
+				}
+				log.Printf("[Footprint Sync] 附件归属冲突，已跳过 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
 			}
 		} else {
 			// 仅为本散页自己的、且尚未挂旅程的附件补挂（发现 15 归属校验语义）
@@ -590,10 +593,14 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 				"footprint_id": fp.ID,
 				"entry_id":     entry.ID,
 			}); err != nil {
-				log.Printf("[Footprint Sync] 附件挂载足迹失败 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
+				if !errors.Is(err, errAttachmentClaimConflict) {
+					return fmt.Errorf("附件挂载足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
+				}
+				log.Printf("[Footprint Sync] 附件归属冲突，已跳过 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
 			}
 		}
 	}
+	return nil
 }
 
 var syncFootprintLock sync.Mutex
@@ -635,7 +642,9 @@ func EnsureEntryFootprintsSynced() {
 		batchLastID := batch[len(batch)-1].ID
 		if err := db.DB.Transaction(func(tx *gorm.DB) error {
 			for i := range batch {
-				syncFootprintFromLifeEntry(&batch[i], nil, tx)
+				if err := syncFootprintFromLifeEntry(&batch[i], nil, tx); err != nil {
+					log.Printf("[Footprint Backfill] 下渗失败 entry=%d: %v", batch[i].ID, err)
+				}
 			}
 			return nil
 		}); err != nil {

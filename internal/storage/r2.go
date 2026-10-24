@@ -615,16 +615,17 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 
 	// 内存复用近期签发有效凭证，消除响应体动态扰动，确保 ETag / 304 缓存生效 (BE-04)
 	cacheKey := fmt.Sprintf("%s|%d", cleanKey, expiresIn)
+	// 年鉴/列表的 ETag 缓存窗口为 25 分钟：复用旧签名时必须保证交给客户端的
+	// 剩余有效期覆盖该窗口，否则 304 缓存里的图片会在下一次刷新前先失效。
+	minRemaining := 25 * time.Minute
+	if duration <= minRemaining {
+		minRemaining = duration / 2
+	}
 	presignCacheMu.RLock()
 	if item, ok := presignCache[cacheKey]; ok {
-		buffer := 5 * time.Minute
-		if duration < 10*time.Minute {
-			buffer = duration / 5
-		}
-		if time.Now().Add(buffer).Before(item.expiresAt) {
+		if remaining := time.Until(item.expiresAt); remaining >= minRemaining {
 			presignCacheMu.RUnlock()
-			remaining := int(time.Until(item.expiresAt).Seconds())
-			return item.url, remaining, nil
+			return item.url, int(remaining.Seconds()), nil
 		}
 	}
 	presignCacheMu.RUnlock()

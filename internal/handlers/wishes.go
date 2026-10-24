@@ -491,7 +491,9 @@ func UpdateWish(c *gin.Context) {
 				return err
 			}
 			wish.LifeEntryID = &companionEntry.ID
-			syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs, tx)
+			if err := syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs, tx); err != nil {
+				return err
+			}
 		}
 
 		// 普通编辑（未触发达成）时，同步更新「许下心愿」那条伴生散页，

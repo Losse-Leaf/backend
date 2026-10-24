@@ -424,6 +424,39 @@ func TestCreateTransactionRollsBackWhenGearLinkFails(t *testing.T) {
 	}
 }
 
+func TestCreateEntryRollsBackWhenFootprintSyncFails(t *testing.T) {
+	r, token := setupContractRouter(t)
+	if err := db.DB.Exec("DROP TABLE footprints").Error; err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"type": "travel", "content": "下渗失败回滚",
+		"city_code": "510100", "city_name": "成都市",
+		"occurred_at": "2026-10-24T08:00", "client_request_id": "crid-fp-fail-0001",
+	}
+	w := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("足迹下渗失败时应整体回滚并返回 500，实际 %d %s", w.Code, w.Body.String())
+	}
+	var count int64
+	db.DB.Model(&models.LifeEntry{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("足迹下渗失败不得留下散页，实际 %d 条", count)
+	}
+
+	if err := db.DB.AutoMigrate(&models.Footprint{}); err != nil {
+		t.Fatal(err)
+	}
+	w2 := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("修复后重试应成功: %d %s", w2.Code, w2.Body.String())
+	}
+	db.DB.Model(&models.LifeEntry{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("重试后应只有一条散页，实际 %d 条", count)
+	}
+}
+
 func TestCreateEntryProjectCompanionPersistsIdempotencyKey(t *testing.T) {
 	r, token := setupContractRouter(t)
 	projectID := uint(42)

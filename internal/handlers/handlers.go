@@ -465,7 +465,9 @@ func CreateLifeEntry(c *gin.Context) {
 							return err
 						}
 					}
-					syncFootprintFromLifeEntry(&existing, req.AttachmentIDs, tx)
+					if err := syncFootprintFromLifeEntry(&existing, req.AttachmentIDs, tx); err != nil {
+						return err
+					}
 					return nil
 				})
 				if reuseErr != nil {
@@ -517,7 +519,9 @@ func CreateLifeEntry(c *gin.Context) {
 				return err
 			}
 		}
-		syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx)
+		if err := syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -894,7 +898,9 @@ func UpdateLifeEntry(c *gin.Context) {
 				return err
 			}
 		}
-		syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx)
+		if err := syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/handlers"
 	"loose-leaf/internal/middleware"
+	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
 	"github.com/gin-contrib/cors"
@@ -49,10 +50,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	handlers.EnsureEntryFootprintsSynced()
-	// 旅程花销的统计口径已收紧为「只统计**显式挂载**的账目」，
-	// 所以历史账目必须靠**挂载**才能继续计入 —— 启动时做一次全量回填。
-	handlers.EnsureFootprintTransactionsLinked()
+	// 本机自救：`./looseleaf --reset-passcode`
+	// 恢复脱敏备份后主密码会被清空；若配对设备也丢失，管理员将无法登录。
+	// 该命令必须在服务器 shell 上执行（等价于 README 里的 sqlite3 重置），
+	// 不接受任何网络请求，因此不会成为远程重置后门。
+	if hasArg("--reset-passcode", "-reset-passcode") {
+		if err := db.DB.Model(&models.SiteConfig{}).
+			Where("1 = 1").
+			Updates(map[string]interface{}{"initialized": false, "master_passcode": ""}).Error; err != nil {
+			log.Fatalf("重置管理员密钥失败: %v", err)
+		}
+		log.Println("管理员密钥与初始化标记已重置。重启服务后可在 Web 欢迎扉页重新装帧。")
+		return
+	}
+
+	// BE-5：启动回填不再阻塞监听，改到 HTTP server 起来之后后台执行。
 	handlers.LoadStorageConfigFromDB()
 
 	// 3. 生产模式或开发模式
@@ -139,6 +151,20 @@ func main() {
 		// === 管理员写权限受保护接口 ===
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
+		// 整库恢复窗口静默写操作（发现 10）：恢复期间数据库连接池被关闭重建、
+		// 主库文件被整体覆写，并发写入要么报错、要么落到被替换前的旧文件上**静默丢失**。
+		// 非GET/HEAD 一律 503，恢复结束后自动放开。
+		write.Use(func(c *gin.Context) {
+			if backup.IsRestoring() && c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+					"code":    http.StatusServiceUnavailable,
+					"message": "系统正在从备份恢复，写操作暂时不可用，请稍后重试",
+					"data":    nil,
+				})
+				return
+			}
+			c.Next()
+		})
 		{
 			// 统一文件直传接口 (支持 multipart/form-data，返回 R2 相对路径与临时预签名 URL)
 			write.POST("/files/upload", handlers.UnifiedUploadFile)
@@ -273,6 +299,9 @@ func main() {
 		}
 	}()
 
+	// BE-5：HTTP 已开始监听后再后台回填历史散页/账目（分批 + 幂等 + sync.Once）。
+	handlers.StartFootprintBackfill()
+
 	// 8. 优雅停机 (Graceful Shutdown)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -286,4 +315,16 @@ func main() {
 	}
 
 	log.Println("Loose-Leaf server exited cleanly.")
+}
+
+// hasArg 判断命令行是否包含任一目标参数（支持 --flag / -flag / --flag=true）。
+func hasArg(names ...string) bool {
+	for _, arg := range os.Args[1:] {
+		for _, name := range names {
+			if arg == name || strings.HasPrefix(arg, name+"=") {
+				return true
+			}
+		}
+	}
+	return false
 }

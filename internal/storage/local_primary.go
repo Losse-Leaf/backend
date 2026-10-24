@@ -150,6 +150,29 @@ func writeLocalObject(objectKey string, reader io.Reader, size int64) error {
 		return fmt.Errorf("本地写入字节数不符：期望 %d，实际 %d", size, written)
 	}
 	InvalidateLocalObjectCache(objectKey)
+	// 上传会改变 /storage/status 的文件数/字节数缓存（BE-7）。
+	InvalidateStorageStatsCache()
+	return nil
+}
+
+// DeleteLocalObject 删除本地磁盘上的对象（不存在视为成功）。
+//
+// 物理清理附件时必须调用：此前只删 R2 对象，本地主存储的文件会永久残留，
+// 既占空间，也让「已删除」的照片仍能被旧签名 URL 读到。
+func DeleteLocalObject(objectKey string) error {
+	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
+	if objectKey == "" {
+		return nil
+	}
+	target := LocalObjectPath(objectKey)
+	if target == "" {
+		return errors.New("对象路径越界，已拒绝删除")
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	InvalidateLocalObjectCache(objectKey)
+	InvalidateStorageStatsCache()
 	return nil
 }
 
@@ -230,7 +253,9 @@ func BackupObjectToR2(ctx context.Context, objectKey string, reader io.Reader, s
 	if objectKey == "" {
 		return errors.New("object_key 不能为空")
 	}
-	if !IsConfigured() {
+	// 快照获取客户端与桶名（发现 11）：不与 InitR2 热更新竞争裸读全局
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
 		return errors.New("对象存储未配置")
 	}
 	if contentType == "" {
@@ -241,12 +266,12 @@ func BackupObjectToR2(ctx context.Context, objectKey string, reader io.Reader, s
 		return fmt.Errorf("failed to read payload: %w", err)
 	}
 	putInput := &s3.PutObjectInput{
-		Bucket:        aws.String(r2Bucket),
+		Bucket:        aws.String(snap.bucket),
 		Key:           aws.String(objectKey),
 		Body:          bytes.NewReader(payload),
 		ContentLength: aws.Int64(int64(len(payload))),
 		ContentType:   aws.String(contentType),
 	}
-	_, err = s3Client.PutObject(ctx, putInput)
+	_, err = snap.client.PutObject(ctx, putInput)
 	return err
 }

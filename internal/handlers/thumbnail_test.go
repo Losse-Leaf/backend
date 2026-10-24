@@ -11,7 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
@@ -158,5 +161,165 @@ func TestThumbnailEndpointDownscales(t *testing.T) {
 	// 缩略图必须显著小于原图
 	if w.Body.Len() >= raw.Len() {
 		t.Errorf("缩略图 (%d B) 应显著小于原图 (%d B)", w.Body.Len(), raw.Len())
+	}
+}
+
+// resetThumbnailTestCaches 让每个缩略图用例使用独立的上传/磁盘缓存目录。
+func resetThumbnailTestCaches(t *testing.T, dir string) {
+	t.Helper()
+	oldDir := storage.GetLocalUploadDir()
+	storage.SetLocalUploadDir(dir)
+
+	thumbnailMemoryMu.Lock()
+	thumbnailMemory = map[string]thumbnailEntry{}
+	thumbnailMemoryMu.Unlock()
+
+	thumbnailInflightMu.Lock()
+	thumbnailInflight = map[string]*thumbnailInflightCall{}
+	thumbnailInflightMu.Unlock()
+
+	thumbnailDiskOnce = sync.Once{}
+	thumbnailDiskDir = ""
+
+	t.Cleanup(func() {
+		storage.SetLocalUploadDir(oldDir)
+		thumbnailDiskOnce = sync.Once{}
+		thumbnailDiskDir = ""
+	})
+}
+
+func writeThumbnailJPEG(t *testing.T, dir, key string, img image.Image) {
+	t.Helper()
+	var raw bytes.Buffer
+	if err := jpeg.Encode(&raw, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatalf("encode source jpeg: %v", err)
+	}
+	target := filepath.Join(dir, filepath.FromSlash(key))
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, raw.Bytes(), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+}
+
+// BE-6：If-None-Match 命中时返回 304 且不写 body；Cache-Control 不超过签名 TTL。
+func TestBE6_ThumbnailIfNoneMatchReturns304(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	resetThumbnailTestCaches(t, dir)
+
+	img := image.NewRGBA(image.Rect(0, 0, 640, 480))
+	for y := 0; y < 480; y++ {
+		for x := 0; x < 640; x++ {
+			img.Set(x, y, color.RGBA{uint8(x % 255), uint8(y % 255), 100, 255})
+		}
+	}
+	key := "entries/2026/10/23/be6-304.jpg"
+	writeThumbnailJPEG(t, dir, key, img)
+
+	r := gin.New()
+	r.GET("/api/v1/files/thumbnail", ThumbnailFile)
+	signed := storage.SignLocalThumbnailURL(key, 240)
+
+	first := httptest.NewRecorder()
+	r.ServeHTTP(first, httptest.NewRequest(http.MethodGet, signed, nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first thumbnail request failed: %d %s", first.Code, first.Body.String())
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatalf("missing ETag")
+	}
+	if cc := first.Header().Get("Cache-Control"); !strings.Contains(cc, "max-age=1800") {
+		t.Fatalf("Cache-Control max-age must not exceed signature TTL, got %q", cc)
+	}
+
+	second := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, signed, nil)
+	req.Header.Set("If-None-Match", etag)
+	r.ServeHTTP(second, req)
+	if second.Code != http.StatusNotModified {
+		t.Fatalf("expected 304, got %d", second.Code)
+	}
+	if second.Body.Len() != 0 {
+		t.Fatalf("304 must not write body, got %d bytes", second.Body.Len())
+	}
+}
+
+// BE-6：先 DecodeConfig，超大源图在整图解码前就被 422 拒绝。
+func TestBE6_ThumbnailRejectsOversizedSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	resetThumbnailTestCaches(t, dir)
+
+	huge := image.NewRGBA(image.Rect(0, 0, thumbnailMaxSourceSide+1, 2))
+	key := "entries/2026/10/23/be6-huge.jpg"
+	writeThumbnailJPEG(t, dir, key, huge)
+
+	r := gin.New()
+	r.GET("/api/v1/files/thumbnail", ThumbnailFile)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, storage.SignLocalThumbnailURL(key, 240), nil))
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for oversized source, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "过大") && !strings.Contains(w.Body.String(), "像素") {
+		t.Fatalf("error message should explain size limit, got %s", w.Body.String())
+	}
+}
+
+// BE-6：同 cacheKey 的并发请求只解码一次，其余等待同一结果。
+func TestBE6_ThumbnailConcurrentSameKeyDecodesOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	resetThumbnailTestCaches(t, dir)
+
+	img := image.NewRGBA(image.Rect(0, 0, 800, 600))
+	for y := 0; y < 600; y++ {
+		for x := 0; x < 800; x++ {
+			img.Set(x, y, color.RGBA{200, uint8(x % 255), uint8(y % 255), 255})
+		}
+	}
+	key := "entries/2026/10/23/be6-concurrent.jpg"
+	writeThumbnailJPEG(t, dir, key, img)
+
+	var decodeCount atomic.Int64
+	thumbnailDecodeHook = func() {
+		decodeCount.Add(1)
+		// 拉长生成窗口，让并发请求真正落在同一个 in-flight 结果上。
+		time.Sleep(150 * time.Millisecond)
+	}
+	defer func() { thumbnailDecodeHook = nil }()
+
+	r := gin.New()
+	r.GET("/api/v1/files/thumbnail", ThumbnailFile)
+	signed := storage.SignLocalThumbnailURL(key, 300)
+
+	const requestCount = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	codes := make([]int, requestCount)
+	wg.Add(requestCount)
+	for i := 0; i < requestCount; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, signed, nil))
+			codes[idx] = w.Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("request %d expected 200, got %d", i, code)
+		}
+	}
+	if got := decodeCount.Load(); got != 1 {
+		t.Fatalf("concurrent same-key requests should decode once, decoded %d times", got)
 	}
 }

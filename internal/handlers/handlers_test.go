@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -230,6 +231,8 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 func TestIncrementalSyncAndETagCaching(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	adminKey := "lldt_sync_etag_key"
+	seedTestAdminDevice(adminKey)
 
 	r := gin.New()
 	r.POST("/api/v1/entries", CreateLifeEntry)
@@ -308,7 +311,9 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 	// 7. Incremental sync with ?since= returns modified/deleted entries with deleted_at set
 	sinceQuery := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?since="+sinceQuery, nil)
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?since="+url.QueryEscape(sinceQuery), nil)
+	// 增量同步会带出软删除墓碑，只允许有效设备授权访问。
+	req.Header.Set("Authorization", "Bearer "+adminKey)
 	r.ServeHTTP(w, req)
 	var syncResp map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &syncResp)
@@ -331,6 +336,8 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	adminKey := "lldt_tx_project_sync_key"
+	seedTestAdminDevice(adminKey)
 
 	r := gin.New()
 	r.POST("/api/v1/transactions", CreateTransaction)
@@ -398,7 +405,8 @@ func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 	// Sync with since returns soft deleted transaction
 	w = httptest.NewRecorder()
 	sinceTime := time.Now().Add(-1 * time.Hour).Format(time.RFC3339)
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions?since="+sinceTime, nil)
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions?since="+url.QueryEscape(sinceTime), nil)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
 	r.ServeHTTP(w, req)
 	_ = json.Unmarshal(w.Body.Bytes(), &txListResp)
 	txs = txListResp["data"].([]interface{})

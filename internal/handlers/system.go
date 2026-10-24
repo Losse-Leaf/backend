@@ -50,7 +50,11 @@ func BootstrapSystem(c *gin.Context) {
 	var cfg models.SiteConfig
 	db.DB.Limit(1).Find(&cfg)
 
-	if cfg.Initialized {
+	// 关键（发现 4a）：判定「禁止二次初始化」必须看 `initialized && 密码非空`。
+	// 恢复脱敏备份后 initialized=true 但 master_passcode 为空 —— 此时若仍一刀切 403，
+	// 而全部管理接口又没有任何「重设密码」端点，实例将**永久锁死**。
+	// 恢复场景因此允许重新走装帧设定密码（窗口由主人掌控：恢复本身就是主人发起的操作）。
+	if cfg.Initialized && strings.TrimSpace(cfg.MasterPasscode) != "" {
 		Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
 		return
 	}
@@ -99,7 +103,11 @@ func BootstrapSystem(c *gin.Context) {
 		return
 	}
 	cfg.MasterPasscode = hashedPasscode
-	cfg.Initialized = false
+	// 关键（发现 4a）：不再无条件把 Initialized 打回 false。
+	// 冷启动路径它本来就是 false（无操作）；而「恢复脱敏备份后重新设密」路径
+	// initialized 已是 true —— 若打回 false，全部已配对设备的凭证会被
+	// AdminAuthRequired 拒之门外（未初始化时只放行 bootstrap/pair 路径），
+	// 主人只能重新走一遍配对才能进门。
 	cfg.UpdatedAt = time.Now()
 	if err := db.DB.Save(&cfg).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "保存站点配置失败: "+err.Error())

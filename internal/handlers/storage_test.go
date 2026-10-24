@@ -124,3 +124,29 @@ func TestStorageEndpoints(t *testing.T) {
 		}
 	})
 }
+
+// BE-7：访客只返回缓存标量，响应里不出现本地磁盘统计字段。
+func TestStorageStatusVisitorSkipsDiskStats(t *testing.T) {
+	r := setupStorageTestRouter(t, "lldt_storage_visitor_test")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/storage/status", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := resp.Data["local_file_count"]; ok {
+		t.Fatalf("visitor response must not include local_file_count")
+	}
+	if _, ok := resp.Data["provider"]; !ok {
+		t.Fatalf("visitor response should keep provider field")
+	}
+	if _, ok := resp.Data["configured"]; !ok {
+		t.Fatalf("visitor response should keep configured field")
+	}
+}

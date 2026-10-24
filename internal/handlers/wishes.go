@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -139,6 +140,9 @@ func GetWishes(c *gin.Context) {
 	status := c.Query("status")
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+	if !validateSyncSince(c, sinceStr) || !allowDeletedScope(c, includeDeleted) {
+		return
+	}
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
@@ -157,7 +161,7 @@ func GetWishes(c *gin.Context) {
 	query := dbScope.Model(&models.Wish{}).Order("created_at DESC, id DESC")
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
-	query = applySyncSince(query, sinceStr)
+	query = applySyncSince(query, &models.Wish{}, sinceStr)
 
 	if kind != "" && kind != "all" {
 		query = query.Where("kind = ?", kind)
@@ -166,8 +170,23 @@ func GetWishes(c *gin.Context) {
 		query = query.Where("status = ?", status)
 	}
 
-	var total int64
-	query.Count(&total)
+	isAdmin := middleware.IsAdmin(c)
+	role := "guest"
+	if isAdmin {
+		role = "admin"
+	}
+	// Vary 必须在任何 304 分支之前写出，避免共享缓存把访客/管理员响应混用。
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+
+	// BE-2：聚合与 304 协商前置；ETag 混入角色，防止跨权限缓存污染 (BE-17)。
+	agg, err := aggregateListQuery(query)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "获取心愿列表失败")
+		return
+	}
+	if negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+		return
+	}
 
 	var wishes []models.Wish
 	offset := (page - 1) * pageSize
@@ -176,7 +195,6 @@ func GetWishes(c *gin.Context) {
 		return
 	}
 
-	isAdmin := middleware.IsAdmin(c)
 	populateWishURLsBatch(wishes)
 	for i := range wishes {
 		// 访客模式财务隐私严格脱敏 (BE-14)
@@ -187,34 +205,20 @@ func GetWishes(c *gin.Context) {
 		}
 	}
 
-	// ETag 与 304 缓存协商 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17)
-	var maxUpdated time.Time
+	// MOB-P1-36：服务端权威增量游标（保持本页语义）
+	var pageMaxUpdated time.Time
 	for _, w := range wishes {
-		if w.UpdatedAt.After(maxUpdated) {
-			maxUpdated = w.UpdatedAt
+		if w.UpdatedAt.After(pageMaxUpdated) {
+			pageMaxUpdated = w.UpdatedAt
 		}
-		if w.DeletedAt.Valid && w.DeletedAt.Time.After(maxUpdated) {
-			maxUpdated = w.DeletedAt.Time
+		if w.DeletedAt.Valid && w.DeletedAt.Time.After(pageMaxUpdated) {
+			pageMaxUpdated = w.DeletedAt.Time
 		}
 	}
-	role := "guest"
-	if isAdmin {
-		role = "admin"
-	}
-	etag := fmt.Sprintf(`W/"%d-%d-%s"`, total, maxUpdated.UnixMilli(), role)
-	c.Header("ETag", etag)
-
-	// MOB-P1-36：服务端权威增量游标
-	setSyncCursor(c, maxUpdated)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
-
-	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
-		c.Status(http.StatusNotModified)
-		return
-	}
+	setSyncCursor(c, pageMaxUpdated)
 
 	Success(c, gin.H{
-		"total":     total,
+		"total":     agg.Total,
 		"page":      page,
 		"page_size": pageSize,
 		"wishes":    wishes,
@@ -223,9 +227,12 @@ func GetWishes(c *gin.Context) {
 
 // GetWishByID 单个心愿详情 (访客模式脱敏 BE-14)
 func GetWishByID(c *gin.Context) {
-	id := c.Param("id")
+	id, ok := parseIDParam(c)
+	if !ok {
+		return
+	}
 	var w models.Wish
-	if err := db.DB.First(&w, id).Error; err != nil {
+	if err := db.DB.First(&w, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -249,17 +256,23 @@ func CreateWish(c *gin.Context) {
 
 	var targetDate *time.Time
 	if req.TargetDate != "" {
-		if t, err := ParseFlexTime(req.TargetDate); err == nil {
-			targetDate = &t
+		t, err := ParseFlexTime(req.TargetDate)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "目标日期格式无法识别")
+			return
 		}
+		targetDate = &t
 	}
 
 	// 补档：许下时刻可指定为过去（省略则取当前）
 	var plantedAt *time.Time
 	if req.PlantedAt != "" {
-		if t, err := ParseFlexTime(req.PlantedAt); err == nil {
-			plantedAt = &t
+		t, err := ParseFlexTime(req.PlantedAt)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "许愿时间格式无法识别")
+			return
 		}
+		plantedAt = &t
 	}
 	plantedMoment := time.Now().In(config.BeijingLocation)
 	if plantedAt != nil {
@@ -320,18 +333,21 @@ func CreateWish(c *gin.Context) {
 		}
 
 		if len(req.AttachmentIDs) > 0 {
-			if err := tx.Model(&models.Attachment{}).
-				Where("id IN ?", req.AttachmentIDs).
-				Updates(map[string]interface{}{
-					"wish_id":  wish.ID,
-					"entry_id": companionEntry.ID,
-				}).Error; err != nil {
+			// 归属校验后绑定：抢占其他实体的附件直接 400（发现 15）
+			if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{
+				"wish_id":  wish.ID,
+				"entry_id": companionEntry.ID,
+			}); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errAttachmentClaimConflict) {
+			Error(c, http.StatusBadRequest, "创建心愿失败: "+err.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "创建心愿失败: "+err.Error())
 		return
 	}
@@ -347,7 +363,7 @@ func CreateWish(c *gin.Context) {
 func UpdateWish(c *gin.Context) {
 	id := c.Param("id")
 	var wish models.Wish
-	if err := db.DB.First(&wish, id).Error; err != nil {
+	if err := db.DB.First(&wish, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -369,23 +385,35 @@ func UpdateWish(c *gin.Context) {
 	oldStatus := wish.Status
 	oldTitle := wish.Title
 
-	if req.Title != "" {
-		wish.Title = strings.TrimSpace(req.Title)
+	if hasKey("title") {
+		title := strings.TrimSpace(req.Title)
+		if title == "" {
+			Error(c, http.StatusBadRequest, "心愿标题不能为空")
+			return
+		}
+		wish.Title = title
 	}
 	if req.Kind != "" {
 		wish.Kind = strings.TrimSpace(req.Kind)
 	}
-	if req.Note != "" {
+	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
+	// 缺省 / null = 保持原值」。原先 `if req.Note != ""` 让「删光备注/规格后保存」静默失败。
+	if req.Note != "" || hasKey("note") {
 		wish.Note = strings.TrimSpace(req.Note)
 	}
-	if req.Spec != "" {
+	if req.Spec != "" || hasKey("spec") {
 		wish.Spec = strings.TrimSpace(req.Spec)
 	}
-	if req.CityCode != "" {
+	// 契约 C：城市同样支持显式清空（空串 = 清空），否则用户删掉目的地后
+	// 保存提示成功、下次拉取又把旧城市“复活”。
+	if hasKey("city_code") || req.CityCode != "" {
 		wish.CityCode = strings.TrimSpace(req.CityCode)
 	}
-	if req.CityName != "" {
+	if hasKey("city_name") || req.CityName != "" {
 		wish.CityName = strings.TrimSpace(req.CityName)
+	}
+	if hasKey("city_code") && req.CityCode == "" {
+		wish.CityName = ""
 	}
 	// 关键：预算要能改成 0。
 	// 原先 `if req.Budget != 0` 把「改成 0」当成「未携带」——
@@ -401,24 +429,39 @@ func UpdateWish(c *gin.Context) {
 	if req.Status != "" {
 		wish.Status = strings.TrimSpace(req.Status)
 	}
-	if req.TargetDate != "" {
-		if t, err := ParseFlexTime(req.TargetDate); err == nil {
+	if hasKey("target_date") {
+		if req.TargetDate == "" {
+			wish.TargetDate = nil
+		} else if t, err := ParseFlexTime(req.TargetDate); err != nil {
+			Error(c, http.StatusBadRequest, "目标日期格式无法识别")
+			return
+		} else {
 			wish.TargetDate = &t
 		}
 	}
-	// 补档：许下时刻可改写为过去的时间
-	if req.PlantedAt != "" {
-		if t, err := ParseFlexTime(req.PlantedAt); err == nil {
+	// 补档：许下时刻可改写为过去的时间；显式空串 = 清空
+	if hasKey("planted_at") {
+		if req.PlantedAt == "" {
+			wish.PlantedAt = nil
+		} else if t, err := ParseFlexTime(req.PlantedAt); err != nil {
+			Error(c, http.StatusBadRequest, "许愿时间格式无法识别")
+			return
+		} else {
 			wish.PlantedAt = &t
 		}
 	}
-	if req.FulfilledAt != "" {
-		if t, err := ParseFlexTime(req.FulfilledAt); err == nil {
+	if hasKey("fulfilled_at") {
+		if req.FulfilledAt == "" {
+			wish.FulfilledAt = nil
+		} else if t, err := ParseFlexTime(req.FulfilledAt); err != nil {
+			Error(c, http.StatusBadRequest, "达成时间格式无法识别")
+			return
+		} else {
 			wish.FulfilledAt = &t
 		}
 	}
 	if wish.Status == "fulfilled" && wish.FulfilledAt == nil {
-		now := time.Now()
+		now := config.NowInBeijing()
 		wish.FulfilledAt = &now
 	}
 
@@ -429,7 +472,7 @@ func UpdateWish(c *gin.Context) {
 			if wish.Kind == "travel" && wish.CityCode != "" {
 				entryType = "travel"
 			}
-			fulfilledTime := time.Now()
+			fulfilledTime := config.NowInBeijing()
 			if wish.FulfilledAt != nil {
 				fulfilledTime = *wish.FulfilledAt
 			}
@@ -475,44 +518,41 @@ func UpdateWish(c *gin.Context) {
 			return err
 		}
 
-		if req.AttachmentIDs != nil {
-			// 空数组语义 = 解除该心愿的全部参考图绑定
-			//
-			// 关键：这是**破坏性**操作，必须由客户端显式请求。
-			// 已发布的老客户端把 attachmentIds 定义成非可选数组（默认 `[]`），
-			// JSONEncoder 必定写出 `"attachment_ids": []` ——
-			// 而 mac 的心愿编辑弹窗**根本没有附件 UI**，
-			// 于是每次在 mac 上改心愿标题/预算，服务端都会把该心愿的照片
-			// `wish_id` 置空，照片变成游离附件。
-			// 跨端更刺眼：用 web 给心愿传了图，再用 mac 改个字，图片就没了。
-			//
-			// 所以与分期一样：**只有显式声明 clear_attachments 时才真的解绑**；
-			// 空数组但没声明 → 视为「本次不携带附件字段」，保持原样。
-			if len(req.AttachmentIDs) == 0 {
-				if req.ClearAttachments {
-					tx.Model(&models.Attachment{}).
-						Where("wish_id = ?", wish.ID).
-						Update("wish_id", nil)
-				}
-			} else {
-				tx.Model(&models.Attachment{}).
-					Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
-					Update("wish_id", nil)
+		// 契约 A：clear_attachments = true 时先解绑该心愿全部参考图；
+		// 若同时携带非空 attachment_ids，则再绑定新列表（先解绑再绑定）。
+		// 空数组但没声明 clear_attachments → 视为「本次不携带附件字段」，保持原样。
+		if req.ClearAttachments {
+			if err := tx.Model(&models.Attachment{}).
+				Where("wish_id = ?", wish.ID).
+				Update("wish_id", nil).Error; err != nil {
+				return err
+			}
+		}
+		if len(req.AttachmentIDs) > 0 {
+			if err := tx.Model(&models.Attachment{}).
+				Where("wish_id = ? AND id NOT IN ?", wish.ID, req.AttachmentIDs).
+				Update("wish_id", nil).Error; err != nil {
+				return err
+			}
 
-				updates := map[string]interface{}{
-					"wish_id": wish.ID,
-				}
-				if wish.LifeEntryID != nil && *wish.LifeEntryID > 0 {
-					updates["entry_id"] = *wish.LifeEntryID
-				}
-				tx.Model(&models.Attachment{}).
-					Where("id IN ?", req.AttachmentIDs).
-					Updates(updates)
+			updates := map[string]any{
+				"wish_id": wish.ID,
+			}
+			if wish.LifeEntryID != nil && *wish.LifeEntryID > 0 {
+				updates["entry_id"] = *wish.LifeEntryID
+			}
+			// 归属校验后绑定：抢占其他实体的附件直接 400（发现 15）
+			if err := claimAttachments(tx, req.AttachmentIDs, updates); err != nil {
+				return err
 			}
 		}
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errAttachmentClaimConflict) {
+			Error(c, http.StatusBadRequest, "更新心愿事务执行失败: "+err.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "更新心愿事务执行失败: "+err.Error())
 		return
 	}
@@ -528,7 +568,7 @@ func UpdateWish(c *gin.Context) {
 func ResolveWish(c *gin.Context) {
 	id := c.Param("id")
 	var wish models.Wish
-	if err := db.DB.First(&wish, id).Error; err != nil {
+	if err := db.DB.First(&wish, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
@@ -540,13 +580,16 @@ func ResolveWish(c *gin.Context) {
 	}
 
 	// 达成时间解析与校验 (必须 <= now，杜绝穿越)
-	fulfilledAt := time.Now()
+	fulfilledAt := config.NowInBeijing()
 	if req.FulfilledAt != "" {
-		if t, err := ParseFlexTime(req.FulfilledAt); err == nil {
-			fulfilledAt = t
+		t, err := ParseFlexTime(req.FulfilledAt)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "达成时间格式无法识别")
+			return
 		}
+		fulfilledAt = t
 	}
-	if fulfilledAt.After(time.Now()) {
+	if fulfilledAt.After(config.NowInBeijing()) {
 		Error(c, http.StatusBadRequest, "达成时间不能晚于当前时间")
 		return
 	}
@@ -591,12 +634,13 @@ func ResolveWish(c *gin.Context) {
 				}
 				wish.LifeEntryID = &entry.ID
 				if len(req.AttachmentIDs) > 0 {
-					tx.Model(&models.Attachment{}).
-						Where("id IN ?", req.AttachmentIDs).
-						Updates(map[string]interface{}{
-							"wish_id":  wish.ID,
-							"entry_id": entry.ID,
-						})
+					// 归属校验后绑定（发现 15）
+					if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{
+						"wish_id":  wish.ID,
+						"entry_id": entry.ID,
+					}); err != nil {
+						return err
+					}
 				}
 			}
 			return tx.Save(&wish).Error
@@ -710,12 +754,13 @@ func ResolveWish(c *gin.Context) {
 			wish.LifeEntryID = &entry.ID
 
 			if len(req.AttachmentIDs) > 0 {
-				tx.Model(&models.Attachment{}).
-					Where("id IN ?", req.AttachmentIDs).
-					Updates(map[string]interface{}{
-						"wish_id":  wish.ID,
-						"entry_id": entry.ID,
-					})
+				// 归属校验后绑定（发现 15）
+				if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{
+					"wish_id":  wish.ID,
+					"entry_id": entry.ID,
+				}); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -743,9 +788,18 @@ func ResolveWish(c *gin.Context) {
 			wish.FootprintID = &footprint.ID
 
 			if len(req.AttachmentIDs) > 0 {
-				tx.Model(&models.Attachment{}).
-					Where("id IN ?", req.AttachmentIDs).
-					Update("footprint_id", footprint.ID)
+				// 归属校验后绑定：联动 3 可能已把附件挂到 wish/entry 上，
+				// 这里补挂 footprint —— 三个目标值都与本实体一致，不会误判为抢占。
+				targets := map[string]any{
+					"footprint_id": footprint.ID,
+					"wish_id":      wish.ID,
+				}
+				if wish.LifeEntryID != nil && *wish.LifeEntryID > 0 {
+					targets["entry_id"] = *wish.LifeEntryID
+				}
+				if err := claimAttachments(tx, req.AttachmentIDs, targets); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -754,6 +808,10 @@ func ResolveWish(c *gin.Context) {
 	})
 
 	if err != nil {
+		if errors.Is(err, errAttachmentClaimConflict) {
+			Error(c, http.StatusBadRequest, "心愿归册事务执行失败: "+err.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "心愿归册事务执行失败: "+err.Error())
 		return
 	}
@@ -771,32 +829,39 @@ func DeleteWish(c *gin.Context) {
 	purge := c.Query("purge") == "true"
 
 	var w models.Wish
-	if err := db.DB.First(&w, id).Error; err != nil {
+	if err := db.DB.First(&w, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "心愿不存在或已被删除")
 		return
 	}
 
-	// 关键：删除心愿时**一并软删除**它在时间流里的伴生散页（两条删除路径都要走）。
-	// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
-	if err := db.DB.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{}).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "清理伴生记录失败: "+err.Error())
-		return
-	}
-
-	if purge {
-		db.DB.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-		db.DB.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-		db.DB.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
-		if err := db.DB.Unscoped().Delete(&w).Error; err != nil {
-			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
-			return
+	// 关键（发现 14）：伴生散页清理、关联解绑与心愿删除原先分散在多次独立写入，
+	// 中途失败会留下「心愿还在、时间流记录已被删」的半套状态 —— 统一包进同一事务。
+	purged := false
+	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 删除心愿时**一并软删除**它在时间流里的伴生散页。
+		// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
+		if err := tx.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{}).Error; err != nil {
+			return err
 		}
-		Success(c, gin.H{"id": id, "purged": true})
+
+		if purge {
+			tx.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+			tx.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+			tx.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil)
+			if err := tx.Unscoped().Delete(&w).Error; err != nil {
+				return err
+			}
+			purged = true
+			return nil
+		}
+		return tx.Delete(&w).Error
+	})
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "删除心愿失败: "+err.Error())
 		return
 	}
-
-	if err := db.DB.Delete(&w).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
+	if purged {
+		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
 	Success(c, gin.H{"id": id, "deleted": true})

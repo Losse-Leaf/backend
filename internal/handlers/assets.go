@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -15,6 +16,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+// errGearAlreadySold 设备已转售（发现 12）：重复转售会在资产库状态不变的情况下
+// 再生成一条等额「二手回血」收入流水，收入与净资产虚增 —— 直接拒绝。
+var errGearAlreadySold = errors.New("该设备已转售，不能重复转售")
 
 // ChannelLiabilitySummary 信贷渠道负债聚合摘要 (RC-53)
 type ChannelLiabilitySummary struct {
@@ -428,7 +433,7 @@ func AddGearAsset(c *gin.Context) {
 	// 使「所有二级对象都能在时间流里查到」这一约定成立。
 	gearOccurredAt, parseErr := ParseFlexTime(purchaseDate)
 	if parseErr != nil {
-		gearOccurredAt = time.Now().In(config.BeijingLocation)
+		gearOccurredAt = config.NowInBeijing()
 	}
 	if _, err := createGearCompanionEntry(db.DB, newGear, gearOccurredAt); err != nil {
 		Error(c, http.StatusInternalServerError, "设备已录入但写入伴生记录失败: "+err.Error())
@@ -439,13 +444,15 @@ func AddGearAsset(c *gin.Context) {
 	if (req.CreateTransaction || req.IsInstallment) && req.PriceCents > 0 {
 		occurred, err := ParseFlexTime(purchaseDate)
 		if err != nil {
-			occurred = time.Now()
+			occurred = config.NowInBeijing()
 		}
 
 		tx := models.Transaction{
-			Amount:        req.PriceCents,
-			Type:          "expense",
-			Category:      req.Category,
+			Amount: req.PriceCents,
+			Type:   "expense",
+			// 发现 21：联动账单用**兜底后**的分类（省略 category 时应为「数码器材」），
+			// 原先用原始 req.Category，省略时会落一条空分类账目，分类统计出现无名项。
+			Category:      gearCategory,
 			Title:         "购置设备: " + newGear.Name,
 			Note:          fmt.Sprintf("录入设备固资库自动同步流水 (%s)", newGear.Spec),
 			PaymentMethod: strings.TrimSpace(req.PaymentMethod),
@@ -516,6 +523,9 @@ func SellGearAsset(c *gin.Context) {
 	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
 		for i := range list {
 			if list[i].ID == gearID {
+				if list[i].Status == "sold" {
+					return nil, errGearAlreadySold
+				}
 				list[i].Status = "sold"
 				list[i].SoldPriceCents = soldCents
 				list[i].SoldDate = soldDate
@@ -533,6 +543,11 @@ func SellGearAsset(c *gin.Context) {
 		}
 		return nil, fmt.Errorf("设备不存在")
 	}); err != nil {
+		if errors.Is(err, errGearAlreadySold) {
+			// 跨端契约：重复转售按 400 拒绝，防双击/重试重复回血（发现 12）
+			Error(c, http.StatusBadRequest, errGearAlreadySold.Error())
+			return
+		}
 		if !found {
 			Error(c, http.StatusNotFound, "设备不存在")
 		} else {

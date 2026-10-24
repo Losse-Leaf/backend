@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"net/http"
 	"time"
 
-	"loose-leaf/internal/config"
+	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -24,7 +26,7 @@ import (
 //     改为含等号后，那条记录会在每一轮增量中被重复带回 —— 但三端都是按服务端 id upsert，
 //     重复写入幂等，不会产生脏数据；而漏拉被彻底消除。
 //
-//  2. 响应头 `X-Sync-Cursor` 携带**服务端权威游标**（本次响应内记录的最大变动时间，RFC3339 北京时间）。
+//  2. 响应头 `X-Sync-Cursor` 携带**服务端权威游标**（本次响应内记录的最大变动时间，RFC3339 UTC，URL 安全）。
 //     客户端可直接把它原样塞回 `?since=`，不必再在本地遍历全部记录求最大值
 //     （Android 端原先要做上万个时间戳解析，是下拉刷新卡顿的主因之一）。
 //     老客户端不认识这个响应头，行为完全不变。
@@ -41,16 +43,54 @@ import (
 // SyncCursorHeader 服务端权威增量游标的响应头名
 const SyncCursorHeader = "X-Sync-Cursor"
 
-// applySyncSince 施加增量游标过滤（含等号，详见文件头说明）
-func applySyncSince(query *gorm.DB, sinceStr string) *gorm.DB {
+// applySyncSince 施加增量游标过滤（含等号，详见文件头说明）。
+//
+// BE-3：不要直接把 `updated_at >= ? OR deleted_at >= ?` 写在外层查询上。
+// 外层还带着 `ORDER BY occurred_at DESC`，SQLite 面对 OR 谓词会放弃索引，
+// 退化成沿 occurred_at 的全表扫描。
+//
+// 改成 `id IN (SELECT id ...)` 后：
+//   - 内层用 MULTI-INDEX OR，分别沿 updated_at / deleted_at 索引取 id；
+//   - 外层只对命中 id 的 k 行排序，不再扫全表。
+//
+// model 必须是调用方对应的模型指针（如 &models.LifeEntry{}），
+// 内层显式 Unscoped：since 增量必须包含软删除墓碑。
+func applySyncSince(query *gorm.DB, model any, sinceStr string) *gorm.DB {
 	if sinceStr == "" {
 		return query
 	}
 	if sinceTime, err := ParseSyncSinceTime(sinceStr); err == nil {
 		// MOB-P1-36：>= 而非 >，避免「恰好等于游标那一秒」的修改被漏拉
-		return query.Where("updated_at >= ? OR deleted_at >= ?", sinceTime, sinceTime)
+		sub := db.DB.Unscoped().Model(model).Select("id").
+			Where("updated_at >= ? OR deleted_at >= ?", sinceTime, sinceTime)
+		return query.Where("id IN (?)", sub)
 	}
 	return query
+}
+
+// allowDeletedScope 增量同步（since / include_deleted）会切到 Unscoped，
+// 连软删除的正文与附件地址都会下发。这些路由是公开 GET，访客不能拿到墓碑，
+// 因此必须要求有效设备/会话授权；未授权时直接 401，而不是静默降级
+// （静默降级会让客户端误以为「删除事件已经同步完」）。
+func allowDeletedScope(c *gin.Context, includeDeleted bool) bool {
+	if !includeDeleted || middleware.IsAdmin(c) {
+		return true
+	}
+	Error(c, http.StatusUnauthorized, "增量同步需要有效的设备授权")
+	return false
+}
+
+// validateSyncSince 校验增量游标格式。格式错误必须显式 400：
+// 静默忽略会退化成「全量列表」，客户端会误以为拿到了增量结果。
+func validateSyncSince(c *gin.Context, since string) bool {
+	if since == "" {
+		return true
+	}
+	if _, err := ParseSyncSinceTime(since); err != nil {
+		Error(c, http.StatusBadRequest, "since 时间格式无法识别")
+		return false
+	}
+	return true
 }
 
 // setSyncCursor 写出服务端权威增量游标
@@ -58,7 +98,8 @@ func setSyncCursor(c *gin.Context, t time.Time) {
 	if t.IsZero() {
 		return
 	}
-	c.Header(SyncCursorHeader, t.In(config.BeijingLocation).Format(time.RFC3339))
+	// 用 UTC/Z 形式：`+08:00` 里的 `+` 若被客户端原样拼进 query 会被解码成空格。
+	c.Header(SyncCursorHeader, t.UTC().Format(time.RFC3339))
 }
 
 // entriesSyncCursor 计算生活档案响应中的「最后变动时间」最大值（含软删除时间）。

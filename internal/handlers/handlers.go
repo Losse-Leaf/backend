@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -230,6 +231,102 @@ func populateEntryURLsBatch(entries []models.LifeEntry) {
 	}
 }
 
+// redactEmbeddedWishFinances 对公开读接口里「嵌在散页上的心愿」做与心愿列表
+// 同口径的访客脱敏 —— 否则访客绕过 /wishes 直接请求 /entries 就能拿到实付金额。
+func redactEmbeddedWishFinances(w *models.Wish) {
+	if w == nil {
+		return
+	}
+	w.ActualCost = 0
+	w.TransactionID = nil
+	w.GearID = nil
+}
+
+func redactEmbeddedWishFinancesBatch(entries []models.LifeEntry) {
+	for i := range entries {
+		redactEmbeddedWishFinances(entries[i].Wish)
+	}
+}
+
+// parseIDParam 校验路由 :id 为正整数并返回（发现 5）。
+// 关键：GORM 的 First(&x, id) 会把**非数字字符串**当作原始 SQL 条件拼进 WHERE
+// （实测 First(&entry, "2 OR 1=1") 可命中任意行）。各处查询虽已参数化堵住注入，
+// 但跨端统一契约要求非法 id 显式返回 400（而非 404），入口统一在此拦截。
+func parseIDParam(c *gin.Context) (uint64, bool) {
+	id, err := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
+	if err != nil || id == 0 {
+		Error(c, http.StatusBadRequest, "资源 ID 必须为正整数")
+		return 0, false
+	}
+	return id, true
+}
+
+// errAttachmentClaimConflict 附件跨实体抢占（发现 15）：
+// 待绑定附件已归属其他实体（entry / wish / footprint），拒绝绑定。
+var errAttachmentClaimConflict = errors.New("附件已绑定到其他实体")
+
+// claimAttachments 校验归属后把一批附件绑定到当前实体（跨端统一契约：防附件抢占）。
+//
+// targets 的键只允许 entry_id / wish_id / footprint_id。
+// 绑定规则：每个附件的三个归属列必须为 NULL，或恰好等于本次要写入的目标值；
+// 已挂到其他实体上的附件一律拒绝（返回 errAttachmentClaimConflict 包装错误），
+// 否则一条误传的 attachment_ids 会把别家照片静默「偷走」——原先的
+// `WHERE id IN ? AND (entry_id IS NULL OR entry_id = ?)` 弱校验只看本实体列，
+// 既不校验另外两个归属列，也把冲突静默跳过（客户端毫无感知）。
+func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
+	if len(ids) == 0 || dbTx == nil {
+		return nil
+	}
+	var atts []models.Attachment
+	if err := dbTx.Where("id IN ?", ids).Find(&atts).Error; err != nil {
+		return err
+	}
+	byID := make(map[uint]models.Attachment, len(atts))
+	for _, att := range atts {
+		byID[att.ID] = att
+	}
+	for _, id := range ids {
+		att, ok := byID[id]
+		if !ok {
+			return fmt.Errorf("附件 #%d 不存在或已被清理", id)
+		}
+		if err := assertAttachmentBindable(att, targets); err != nil {
+			return err
+		}
+	}
+	return dbTx.Model(&models.Attachment{}).Where("id IN ?", ids).Updates(targets).Error
+}
+
+// assertAttachmentBindable 单个附件的归属校验：三个归属列各自为 NULL，
+// 或恰好等于本次要写入的目标值，否则视为抢占冲突。
+func assertAttachmentBindable(att models.Attachment, targets map[string]any) error {
+	ownerNames := map[string]string{
+		"entry_id":     "生活散页",
+		"wish_id":      "心愿",
+		"footprint_id": "旅程",
+	}
+	check := func(col string, cur *uint) error {
+		if want, has := targets[col]; has {
+			wantID, _ := want.(uint)
+			if cur != nil && *cur != wantID {
+				return fmt.Errorf("%w：附件 #%d 已绑定到其他%s", errAttachmentClaimConflict, att.ID, ownerNames[col])
+			}
+			return nil
+		}
+		if cur != nil {
+			return fmt.Errorf("%w：附件 #%d 已绑定到其他%s", errAttachmentClaimConflict, att.ID, ownerNames[col])
+		}
+		return nil
+	}
+	if err := check("entry_id", att.EntryID); err != nil {
+		return err
+	}
+	if err := check("wish_id", att.WishID); err != nil {
+		return err
+	}
+	return check("footprint_id", att.FootprintID)
+}
+
 // ==========================================
 // 1. Life Entry CRUD (生活档案接口)
 // ==========================================
@@ -250,6 +347,9 @@ type CreateEntryRequest struct {
 	WishID        *uint  `json:"wish_id"`
 	FootprintID   *uint  `json:"footprint_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
+	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
+	ClientRequestID string `json:"client_request_id"`
 }
 
 // CreateLifeEntry 创建一条新的生活档案记录（支持主流自然下渗点亮足迹与造物伴生去重）
@@ -260,7 +360,23 @@ func CreateLifeEntry(c *gin.Context) {
 		return
 	}
 
-	occurred, _ := ParseFlexTime(req.OccurredAt)
+	occurred, err := ParseFlexTime(req.OccurredAt)
+	if err != nil && strings.TrimSpace(req.OccurredAt) != "" {
+		// 不能把无法解析的时间静默改成「现在」：那会悄悄改写用户记录的时间。
+		Error(c, http.StatusBadRequest, "发生时间格式无法识别")
+		return
+	}
+	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
+	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
+	clientRequestID := strings.TrimSpace(req.ClientRequestID)
+	if clientRequestID != "" {
+		var existing models.LifeEntry
+		if err := db.DB.Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			populateEntryURLs(&existing)
+			Success(c, existing)
+			return
+		}
+	}
 	title := strings.TrimSpace(req.Title)
 	content := strings.TrimSpace(req.Content)
 	// 朋友圈式发布：客户端可能只填正文不填标题 —— 这里统一从正文首行派生，
@@ -314,9 +430,15 @@ func CreateLifeEntry(c *gin.Context) {
 				}
 				_ = db.DB.Save(&existing).Error
 				if len(req.AttachmentIDs) > 0 {
-					db.DB.Model(&models.Attachment{}).
-						Where("id IN ?", req.AttachmentIDs).
-						Update("entry_id", existing.ID)
+					// 归属校验 + 绑定：已挂到其他实体的附件直接 400，防「偷照片」（发现 15）
+					if err := claimAttachments(db.DB, req.AttachmentIDs, map[string]any{"entry_id": existing.ID}); err != nil {
+						if errors.Is(err, errAttachmentClaimConflict) {
+							Error(c, http.StatusBadRequest, "绑定附件失败: "+err.Error())
+						} else {
+							Error(c, http.StatusInternalServerError, "绑定附件失败: "+err.Error())
+						}
+						return
+					}
 				}
 				syncFootprintFromLifeEntry(&existing, req.AttachmentIDs)
 				db.DB.First(&existing, existing.ID)
@@ -346,16 +468,17 @@ func CreateLifeEntry(c *gin.Context) {
 		WishID:      req.WishID,
 		FootprintID: req.FootprintID,
 	}
+	if clientRequestID != "" {
+		entry.ClientRequestID = &clientRequestID
+	}
 
 	// 事务内原子保存主体、关联附件与下渗足迹
-	err := db.DB.Transaction(func(tx *gorm.DB) error {
+	err = db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&entry).Error; err != nil {
 			return err
 		}
 		if len(req.AttachmentIDs) > 0 {
-			if err := tx.Model(&models.Attachment{}).
-				Where("id IN ?", req.AttachmentIDs).
-				Update("entry_id", entry.ID).Error; err != nil {
+			if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{"entry_id": entry.ID}); err != nil {
 				return err
 			}
 		}
@@ -363,6 +486,20 @@ func CreateLifeEntry(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		// 并发重复提交：client_request_id 唯一索引兜底，回读已有记录按幂等语义返回
+		//（含已被软删除的记录——该请求确实处理过，不该再建一条）。
+		if clientRequestID != "" {
+			var existing models.LifeEntry
+			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				populateEntryURLs(&existing)
+				Success(c, existing)
+				return
+			}
+		}
+		if errors.Is(err, errAttachmentClaimConflict) {
+			Error(c, http.StatusBadRequest, "保存记录失败: "+err.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "保存记录失败: "+err.Error())
 		return
 	}
@@ -392,17 +529,29 @@ func GetLifeEntriesV1(c *gin.Context) {
 
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+	if !validateSyncSince(c, sinceStr) || !allowDeletedScope(c, includeDeleted) {
+		return
+	}
 
 	dbScope := db.DB
 	if includeDeleted {
 		dbScope = db.DB.Unscoped()
 	}
 
+	// 散页内嵌心愿的实付金额按角色脱敏，ETag 必须带角色盐；
+	// Vary 在协商之前写出，避免共享缓存/浏览器角色切换后互相命中 304。
+	isAdmin := middleware.IsAdmin(c)
+	role := "guest"
+	if isAdmin {
+		role = "admin"
+	}
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+
 	query := dbScope.Model(&models.LifeEntry{}).
 		Order("occurred_at DESC, id DESC")
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
-	query = applySyncSince(query, sinceStr)
+	query = applySyncSince(query, &models.LifeEntry{}, sinceStr)
 
 	if entryType != "" && entryType != "all" {
 		query = query.Where("type = ?", entryType)
@@ -441,8 +590,17 @@ func GetLifeEntriesV1(c *gin.Context) {
 		}
 	}
 
-	var total int64
-	query.Count(&total)
+	// BE-2：先用一条聚合 SQL 拿到 total / max(updated_at) / max(deleted_at)，
+	// 再在 Find 与签名之前完成 ETag/304 协商。304 请求最多只花这一条 SQL。
+	agg, err := aggregateListQuery(query)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "获取生活档案失败")
+		return
+	}
+	// 按角色脱敏 + 软删除会改变 total：禁用 If-Modified-Since，只走 ETag。
+	if negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+		return
+	}
 
 	var entries []models.LifeEntry
 	offset := (page - 1) * pageSize
@@ -452,34 +610,15 @@ func GetLifeEntriesV1(c *gin.Context) {
 	}
 
 	populateEntryURLsBatch(entries)
-
-	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
-	var maxUpdated time.Time
-	for _, e := range entries {
-		if e.UpdatedAt.After(maxUpdated) {
-			maxUpdated = e.UpdatedAt
-		}
+	if !isAdmin {
+		redactEmbeddedWishFinancesBatch(entries)
 	}
-	etag := fmt.Sprintf(`W/"%d-%d"`, total, maxUpdated.UnixMilli())
-	c.Header("ETag", etag)
 
 	// MOB-P1-36：服务端权威增量游标（客户端可直接回传为 ?since=）
 	setSyncCursor(c, entriesSyncCursor(entries))
 
-	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
-		c.Status(http.StatusNotModified)
-		return
-	}
-
-	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
-		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
-			c.Status(http.StatusNotModified)
-			return
-		}
-	}
-
 	Success(c, gin.H{
-		"total":     total,
+		"total":     agg.Total,
 		"page":      page,
 		"page_size": pageSize,
 		"entries":   entries,
@@ -522,10 +661,14 @@ func GetOnThisDayEntries(c *gin.Context) {
 		}
 	}
 
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	matched := make([]models.LifeEntry, 0, len(matchedIDs))
 	if len(matchedIDs) > 0 {
 		db.DB.Where("id IN ?", matchedIDs).Order("occurred_at DESC, id DESC").Find(&matched)
 		populateEntryURLsBatch(matched)
+		if !middleware.IsAdmin(c) {
+			redactEmbeddedWishFinancesBatch(matched)
+		}
 	}
 
 	Success(c, gin.H{
@@ -537,14 +680,21 @@ func GetOnThisDayEntries(c *gin.Context) {
 
 // GetLifeEntryByID 获取单条生活档案详情
 func GetLifeEntryByID(c *gin.Context) {
-	id := c.Param("id")
+	id, ok := parseIDParam(c)
+	if !ok {
+		return
+	}
 	var entry models.LifeEntry
-	if err := db.DB.First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "未找到该条生活记录")
 		return
 	}
 
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	populateEntryURLs(&entry)
+	if !middleware.IsAdmin(c) {
+		redactEmbeddedWishFinances(entry.Wish)
+	}
 
 	Success(c, entry)
 }
@@ -562,13 +712,19 @@ type UpdateEntryRequest struct {
 	WishID        *uint  `json:"wish_id"`
 	FootprintID   *uint  `json:"footprint_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
+	// ClearAttachments 显式解绑该散页全部附件（跨端统一契约 A）：
+	// true 时先解绑全部；若同时携带 attachment_ids，则再绑定新列表。
+	ClearAttachments bool `json:"clear_attachments"`
+	// ClearCity 显式清空城市归属（跨端统一契约 A）：优先级高于
+	// city_code / city_name / location 字段本身（携带也忽略）。
+	ClearCity bool `json:"clear_city"`
 }
 
 // UpdateLifeEntry 更新生活记录
 func UpdateLifeEntry(c *gin.Context) {
 	id := c.Param("id")
 	var entry models.LifeEntry
-	if err := db.DB.First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "未找到该条生活记录")
 		return
 	}
@@ -604,42 +760,53 @@ func UpdateLifeEntry(c *gin.Context) {
 	if req.Title != "" || titleKeyPresent {
 		entry.Title = strings.TrimSpace(req.Title)
 	}
-	if req.Content != "" {
+	// content 同样采用「携带 key 即写入」：空串 = 清空正文。
+	// 原先 `if req.Content != ""` 让「删光正文后保存」静默失败。
+	if hasKey("content") || req.Content != "" {
 		entry.Content = strings.TrimSpace(req.Content)
 		// 标题原本就是从正文首行派生的（朋友圈式发布）→ 正文改了，标题跟着改。
-		//
 		// 关键：**只有请求未携带 title 时**才允许回填派生标题。
-		// 否则用户显式清空标题后，这里会立刻把它填回正文首行 ——
-		// 「清空标题」这条契约等于从未生效（三端都在同时提交 title 与 content）。
-		if !titleKeyPresent &&
+		if entry.Content != "" && !titleKeyPresent &&
 			(entry.Title == "" || entry.Title == DeriveTitleFromContent(entry.Content, 40)) {
 			entry.Title = DeriveTitleFromContent(entry.Content, 40)
 		}
 	}
-	if req.Location != "" {
-		entry.Location = strings.TrimSpace(req.Location)
-	}
-	if req.CityCode != "" || req.CityName != "" || req.Location != "" {
+	// 契约 A：clear_city 显式清空城市归属，优先级高于 city_code / city_name /
+	// location 字段本身（携带也被忽略）；不清空时才走字段驱动的属地解析。
+	if req.ClearCity {
+		entry.CityCode = ""
+		entry.CityName = ""
+		entry.Location = ""
+	} else if hasKey("location") || hasKey("city_code") || hasKey("city_name") ||
+		req.Location != "" || req.CityCode != "" || req.CityName != "" {
 		curCode := entry.CityCode
-		if req.CityCode != "" {
+		if hasKey("city_code") || req.CityCode != "" {
 			curCode = req.CityCode
 		}
 		curName := entry.CityName
-		if req.CityName != "" {
+		if hasKey("city_name") || req.CityName != "" {
 			curName = req.CityName
 		}
 		curLoc := entry.Location
-		if req.Location != "" {
+		if hasKey("location") || req.Location != "" {
 			curLoc = req.Location
 		}
-		cCode, cName, cLoc := ResolveCityCodeAndName(curCode, curName, curLoc)
-		entry.CityCode = cCode
-		entry.CityName = cName
-		entry.Location = cLoc
+		if strings.TrimSpace(curCode) == "" && strings.TrimSpace(curName) == "" && strings.TrimSpace(curLoc) == "" {
+			// 显式清空属地：不再走城市解析（解析器会从标题里“猜”回一个城市）
+			entry.CityCode = ""
+			entry.CityName = ""
+			entry.Location = ""
+		} else {
+			cCode, cName, cLoc := ResolveCityCodeAndName(curCode, curName, curLoc)
+			entry.CityCode = cCode
+			entry.CityName = cName
+			entry.Location = cLoc
+		}
 	}
 	if req.FootprintID != nil {
 		entry.FootprintID = req.FootprintID
-		if *req.FootprintID > 0 && entry.CityCode == "" {
+		// clear_city 优先级最高：显式清空属地时不允许再从旅程回填城市（契约 A）
+		if *req.FootprintID > 0 && entry.CityCode == "" && !req.ClearCity {
 			var fp models.Footprint
 			if err := db.DB.First(&fp, *req.FootprintID).Error; err == nil && fp.ID > 0 {
 				entry.CityCode = fp.CityCode
@@ -652,17 +819,21 @@ func UpdateLifeEntry(c *gin.Context) {
 	if entry.CityCode != "" && entry.Location == "" {
 		entry.Location = entry.CityName
 	}
-	if req.ProjectID != nil {
+	// 指针字段：携带 key 才写（null = 解绑）
+	if hasKey("project_id") {
 		entry.ProjectID = req.ProjectID
 	}
-	if req.WishID != nil {
+	if hasKey("wish_id") {
 		entry.WishID = req.WishID
 	}
 
 	if req.OccurredAt != "" {
-		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
-			entry.OccurredAt = t
+		t, err := ParseFlexTime(req.OccurredAt)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "发生时间格式无法识别")
+			return
 		}
+		entry.OccurredAt = t
 	}
 
 	// 事务内原子保存记录、更新附件关联与下渗足迹
@@ -670,7 +841,14 @@ func UpdateLifeEntry(c *gin.Context) {
 		if err := tx.Save(&entry).Error; err != nil {
 			return err
 		}
-		if req.AttachmentIDs != nil {
+		if req.ClearAttachments {
+			// 契约 A：显式解绑全部附件；若同时携带 attachment_ids，则下面再绑定新列表
+			if err := tx.Model(&models.Attachment{}).
+				Where("entry_id = ?", entry.ID).
+				Update("entry_id", nil).Error; err != nil {
+				return err
+			}
+		} else if req.AttachmentIDs != nil {
 			// 空数组语义 = 解除该条目的全部附件绑定（不可退化为 NOT IN 空集，那样解绑一条都不发生）
 			if len(req.AttachmentIDs) == 0 {
 				if err := tx.Model(&models.Attachment{}).
@@ -685,18 +863,22 @@ func UpdateLifeEntry(c *gin.Context) {
 					Update("entry_id", nil).Error; err != nil {
 					return err
 				}
-				// 绑定新选中的附件
-				if err := tx.Model(&models.Attachment{}).
-					Where("id IN ?", req.AttachmentIDs).
-					Update("entry_id", entry.ID).Error; err != nil {
-					return err
-				}
+			}
+		}
+		if len(req.AttachmentIDs) > 0 {
+			// 绑定新选中的附件：归属校验失败（抢占其他实体的附件）直接 400（发现 15）
+			if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{"entry_id": entry.ID}); err != nil {
+				return err
 			}
 		}
 		syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx)
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errAttachmentClaimConflict) {
+			Error(c, http.StatusBadRequest, "更新记录失败: "+err.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "更新记录失败: "+err.Error())
 		return
 	}
@@ -714,12 +896,16 @@ func DeleteLifeEntry(c *gin.Context) {
 	purge := c.Query("purge") == "true"
 
 	var entry models.LifeEntry
-	if err := db.DB.First(&entry, id).Error; err != nil {
+	if err := db.DB.First(&entry, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "记录不存在或已被删除")
 		return
 	}
 
 	if purge {
+		// 媒体删除（本地磁盘 / R2 网络）放到事务提交之后：
+		// 1) 不在持有 SQLite 写锁时做网络 I/O；
+		// 2) 不会出现「对象已删、数据库事务回滚」留下坏链接。
+		var keysToDelete []string
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
 			// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）
 			var atts []models.Attachment
@@ -727,7 +913,7 @@ func DeleteLifeEntry(c *gin.Context) {
 			for _, att := range atts {
 				if att.WishID == nil && att.FootprintID == nil {
 					if att.ObjectKey != "" {
-						_ = storage.DeleteObject(att.ObjectKey)
+						keysToDelete = append(keysToDelete, att.ObjectKey)
 					}
 					tx.Unscoped().Delete(&att)
 				} else {
@@ -754,6 +940,9 @@ func DeleteLifeEntry(c *gin.Context) {
 		if err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
+		}
+		for _, key := range keysToDelete {
+			_ = storage.DeleteObject(key)
 		}
 		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
@@ -923,8 +1112,11 @@ func CleanupUpload(c *gin.Context) {
 	for _, key := range req.ObjectKeys {
 		if key != "" {
 			var att models.Attachment
-			// 仅允许清理在数据库中且未关联生活条目的孤立附件，防止越权传入他人 ObjectKey 随意删除
-			if err := db.DB.Where("object_key = ? AND entry_id IS NULL", key).First(&att).Error; err == nil {
+			// 仅清理三类归属都为空的真正孤立附件。
+			// 只判 entry_id 会误删「心愿 / 足迹仍在引用、但散页已 purge」的共享照片。
+			if err := db.DB.Where(
+				"object_key = ? AND entry_id IS NULL AND wish_id IS NULL AND footprint_id IS NULL", key,
+			).First(&att).Error; err == nil {
 				_ = storage.DeleteObject(key)
 				db.DB.Delete(&att)
 				cleaned++
@@ -937,15 +1129,15 @@ func CleanupUpload(c *gin.Context) {
 
 // GetStorageStatus 获取 R2 配置状态 (非管理员脱敏敏感桶名与节点)
 func GetStorageStatus(c *gin.Context) {
-	status := storage.GetStorageStatus()
+	// 同一 URL 对访客/管理员返回不同字段，禁止任何共享缓存混用。
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Cache-Control", "private, no-store")
+	// BE-7：访客只需要两个标量。直接读缓存状态，绝不为了丢弃结果而遍历磁盘。
 	if !middleware.IsAdmin(c) {
-		Success(c, gin.H{
-			"provider":   status["provider"],
-			"configured": status["configured"],
-		})
+		Success(c, storage.GetStorageStatusBasic())
 		return
 	}
-	Success(c, status)
+	Success(c, storage.GetStorageStatus())
 }
 
 // ==========================================
@@ -971,7 +1163,7 @@ type TransactionRequest struct {
 	// 关键：原先是普通 bool，JSONEncoder 一定会把它写进请求体，
 	// 于是客户端**不传**时也被解读成「显式取消分期」——
 	// 而 Swift 的 `Bool` 不可选，任何一次「只改标题」的编辑都会把分期账目降级。
-	IsInstallment           *bool  `json:"is_installment"`
+	IsInstallment *bool `json:"is_installment"`
 	// ClearInstallment 显式声明「本次要取消分期」
 	//
 	// 关键：`is_installment: false` **不足以**表达「取消分期」。
@@ -984,7 +1176,7 @@ type TransactionRequest struct {
 	//
 	// 所以：**只有携带 clear_installment=true 时才真的降级**；
 	// 单传 false 一律保持原值。
-	ClearInstallment         bool   `json:"clear_installment"`
+	ClearInstallment        bool   `json:"clear_installment"`
 	InstallmentChannelCode  string `json:"installment_channel_code"`
 	InstallmentTotalAmount  int64  `json:"installment_total_amount"`
 	InstallmentMonths       int    `json:"installment_months"`
@@ -995,6 +1187,10 @@ type TransactionRequest struct {
 	LinkGearAsset bool   `json:"link_gear_asset"`
 	GearCategory  string `json:"gear_category"`
 	GearSpec      string `json:"gear_spec"`
+	// ClearCity 显式清空城市归属（跨端统一契约 A）：优先级高于 city_code 字段本身。
+	ClearCity bool `json:"clear_city"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：同一 id 重复提交直接返回已有记录。
+	ClientRequestID string `json:"client_request_id"`
 }
 
 // CreateTransaction 记一笔 (支持分期付款与随身设备库双向绑定 RC-53)
@@ -1013,8 +1209,25 @@ func CreateTransaction(c *gin.Context) {
 		return
 	}
 
-	occurred, _ := ParseFlexTime(req.OccurredAt)
-	cleanCityCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", req.Title+" "+req.Note)
+	occurred, err := ParseFlexTime(req.OccurredAt)
+	if err != nil && strings.TrimSpace(req.OccurredAt) != "" {
+		Error(c, http.StatusBadRequest, "发生时间格式无法识别")
+		return
+	}
+	// 发现 18：城市只认显式 city_code（6 位国标或可反查字典），
+	// 不再用标题/备注文本做模糊反查 ——「海南鸡饭」会命中青海海南州之类的误报。
+	cleanCityCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", "")
+
+	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录；
+	// 并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
+	clientRequestID := strings.TrimSpace(req.ClientRequestID)
+	if clientRequestID != "" {
+		var existing models.Transaction
+		if err := db.DB.Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			Success(c, existing)
+			return
+		}
+	}
 
 	// MOB-P1-35：省略 type 时回落到默认 expense
 	txType := strings.TrimSpace(req.Type)
@@ -1033,6 +1246,9 @@ func CreateTransaction(c *gin.Context) {
 		FootprintID:   req.FootprintID,
 		CityCode:      cleanCityCode,
 		OccurredAt:    occurred,
+	}
+	if clientRequestID != "" {
+		tx.ClientRequestID = &clientRequestID
 	}
 
 	// 若选择了关联旅程 (FootprintID) 或带有城市代码，自动对齐城市并尝试归并到对应旅程
@@ -1054,8 +1270,22 @@ func CreateTransaction(c *gin.Context) {
 	}
 
 	if err := db.DB.Create(&tx).Error; err != nil {
+		// 并发重复提交：client_request_id 唯一索引兜底，回读已有记录按幂等语义返回
+		//（含已被软删除的记录——该请求确实处理过，不该再记一笔）。
+		if clientRequestID != "" {
+			var existing models.Transaction
+			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				Success(c, existing)
+				return
+			}
+		}
 		Error(c, http.StatusInternalServerError, "记账失败: "+err.Error())
 		return
+	}
+	// 新账目可能挂在某趟旅程上：旅程花销统计随之变化，必须推进 footprints.updated_at，
+	// 否则足迹列表的 ETag 不变，客户端会一直拿到 304 的旧花销。
+	if tx.FootprintID != nil {
+		touchFootprintTimestamps(db.DB, *tx.FootprintID)
 	}
 	// 关键：让 /stats 的 30 秒缓存失效。
 	// 否则记完账立刻打开统计弹窗，弹窗显示的是**缓存里的旧数字**，
@@ -1116,6 +1346,9 @@ func GetTransactions(c *gin.Context) {
 	monthStr := c.Query("month")
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+	if !validateSyncSince(c, sinceStr) || !allowDeletedScope(c, includeDeleted) {
+		return
+	}
 
 	dbScope := db.DB
 	if includeDeleted {
@@ -1125,7 +1358,7 @@ func GetTransactions(c *gin.Context) {
 	query := dbScope.Model(&models.Transaction{}).Order("occurred_at DESC, id DESC")
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
-	query = applySyncSince(query, sinceStr)
+	query = applySyncSince(query, &models.Transaction{}, sinceStr)
 
 	if yearStr != "" {
 		y, err := strconv.Atoi(yearStr)
@@ -1156,6 +1389,16 @@ func GetTransactions(c *gin.Context) {
 		query = query.Offset(offset)
 	}
 
+	// BE-2：聚合与 304 协商前置，命中时不再加载账目。
+	agg, err := aggregateListQuery(query)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "获取记账列表失败")
+		return
+	}
+	if negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+		return
+	}
+
 	var txs []models.Transaction
 	if err := query.Find(&txs).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取记账列表失败")
@@ -1173,44 +1416,34 @@ func GetTransactions(c *gin.Context) {
 		}
 	}
 
-	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
-	var maxUpdated time.Time
-	for _, tx := range txs {
-		if tx.UpdatedAt.After(maxUpdated) {
-			maxUpdated = tx.UpdatedAt
-		}
-		if tx.DeletedAt.Valid && tx.DeletedAt.Time.After(maxUpdated) {
-			maxUpdated = tx.DeletedAt.Time
-		}
-	}
-	etag := fmt.Sprintf(`W/"%d-%d"`, len(txs), maxUpdated.UnixMilli())
-	c.Header("ETag", etag)
-
 	// MOB-P1-36：服务端权威增量游标（客户端可直接回传为 ?since=）
-	setSyncCursor(c, maxUpdated)
-
-	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
-		c.Status(http.StatusNotModified)
-		return
-	}
-
-	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
-		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
-			c.Status(http.StatusNotModified)
-			return
+	// 保持原有语义：取本页记录的最大变动时间（含软删除）。
+	var pageMaxUpdated time.Time
+	for _, tx := range txs {
+		if tx.UpdatedAt.After(pageMaxUpdated) {
+			pageMaxUpdated = tx.UpdatedAt
+		}
+		if tx.DeletedAt.Valid && tx.DeletedAt.Time.After(pageMaxUpdated) {
+			pageMaxUpdated = tx.DeletedAt.Time
 		}
 	}
+	setSyncCursor(c, pageMaxUpdated)
 
 	Success(c, txs)
 }
 
 // GetTransactionSummary 月度记账统计
 func GetTransactionSummary(c *gin.Context) {
-	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", time.Now().Year()))
-	monthStr := c.DefaultQuery("month", fmt.Sprintf("%02d", time.Now().Month()))
+	nowBJ := config.NowInBeijing()
+	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", nowBJ.Year()))
+	monthStr := c.DefaultQuery("month", fmt.Sprintf("%02d", int(nowBJ.Month())))
 
-	y, _ := strconv.Atoi(yearStr)
-	m, _ := strconv.Atoi(monthStr)
+	y, errY := strconv.Atoi(yearStr)
+	m, errM := strconv.Atoi(monthStr)
+	if errY != nil || errM != nil || y < 1900 || y > 2999 || m < 1 || m > 12 {
+		Error(c, http.StatusBadRequest, "年月参数无效")
+		return
+	}
 
 	start := time.Date(y, time.Month(m), 1, 0, 0, 0, 0, config.BeijingLocation)
 	end := start.AddDate(0, 1, 0)
@@ -1246,24 +1479,39 @@ func GetTransactionSummary(c *gin.Context) {
 func UpdateTransaction(c *gin.Context) {
 	id := c.Param("id")
 	var tx models.Transaction
-	if err := db.DB.First(&tx, id).Error; err != nil {
+	if err := db.DB.First(&tx, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "账目记录不存在")
 		return
 	}
 
 	var req TransactionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	rawBytes, _ := io.ReadAll(c.Request.Body)
+	if err := json.Unmarshal(rawBytes, &req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
-	// 金额：**负数**必须被拒绝（会反向冲减所有汇总）。
-	// 0 表示「本次未携带金额」（部分更新语义），保留原值。
+	// 与原 binding:"required" 校验保持一致：amount 必填非 0，category 必填非空。
+	// 改用手动校验是为了同时拿到原始请求体，支持「携带即写入」的部分更新判断（契约 C）。
+	if req.Amount == 0 || strings.TrimSpace(req.Category) == "" {
+		Error(c, http.StatusBadRequest, "请填写金额、类型(支出/收入)与分类")
+		return
+	}
+	var rawKeys map[string]json.RawMessage
+	_ = json.Unmarshal(rawBytes, &rawKeys)
+	hasKey := func(k string) bool {
+		_, ok := rawKeys[k]
+		return ok
+	}
+	oldFootprintID := uint(0)
+	if tx.FootprintID != nil {
+		oldFootprintID = *tx.FootprintID
+	}
+	// 金额：**负数**必须被拒绝（会反向冲减所有汇总）；amount 必填非 0（上方已校验）。
 	if req.Amount < 0 {
 		Error(c, http.StatusBadRequest, "金额必须大于 0")
 		return
 	}
 
-	// `amount` 带 binding:"required"，所以这里一定拿得到一个非 0 的值
 	tx.Amount = req.Amount
 	// MOB-P1-xx：type 为空时**保持原值**，不能写成空串。
 	//
@@ -1279,9 +1527,17 @@ func UpdateTransaction(c *gin.Context) {
 		tx.Type = txType
 	}
 	tx.Category = strings.TrimSpace(req.Category)
-	tx.Title = strings.TrimSpace(req.Title)
-	tx.Note = strings.TrimSpace(req.Note)
-	tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
+	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
+	// 缺省 / null = 保持原值」。原先无条件覆盖，客户端省略 note 时会把备注清掉。
+	if req.Title != "" || hasKey("title") {
+		tx.Title = strings.TrimSpace(req.Title)
+	}
+	if req.Note != "" || hasKey("note") {
+		tx.Note = strings.TrimSpace(req.Note)
+	}
+	if req.PaymentMethod != "" || hasKey("payment_method") {
+		tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
+	}
 	if req.WishID != nil {
 		tx.WishID = req.WishID
 	}
@@ -1292,18 +1548,28 @@ func UpdateTransaction(c *gin.Context) {
 			tx.FootprintID = req.FootprintID
 		}
 	}
-	if req.CityCode != "" {
-		cCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", tx.Title+" "+tx.Note)
+	// 契约 A：clear_city 显式清空城市归属，优先级高于 city_code 字段本身。
+	clearCity := req.ClearCity
+	if !clearCity && req.CityCode != "" {
+		// 发现 18：只认显式 city_code，不再用标题/备注文本模糊反查
+		cCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", "")
 		tx.CityCode = cCode
 	}
 
 	if req.OccurredAt != "" {
-		if t, err := ParseFlexTime(req.OccurredAt); err == nil {
-			tx.OccurredAt = t
+		t, err := ParseFlexTime(req.OccurredAt)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "发生时间格式无法识别")
+			return
 		}
+		tx.OccurredAt = t
 	}
 
 	autoLinkTransactionFootprint(&tx)
+	if clearCity {
+		// autoLink 会为已挂足迹的账目回填城市；clear_city 语义优先级最高，再次清空（契约 A）
+		tx.CityCode = ""
+	}
 
 	if req.IsInstallment != nil && *req.IsInstallment {
 		tx.IsInstallment = true
@@ -1351,6 +1617,12 @@ func UpdateTransaction(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "更新账目失败")
 		return
 	}
+	// 金额/挂载旅程任一变化都会影响旅程花销；旧旅程与新旅程都要推进时间戳。
+	if tx.FootprintID != nil {
+		touchFootprintTimestamps(db.DB, oldFootprintID, *tx.FootprintID)
+	} else {
+		touchFootprintTimestamps(db.DB, oldFootprintID)
+	}
 	// 同上：更新账目后统计缓存必须失效
 	InvalidateStatsCache()
 
@@ -1363,7 +1635,7 @@ func DeleteTransaction(c *gin.Context) {
 	purge := c.Query("purge") == "true"
 
 	var tx models.Transaction
-	if err := db.DB.First(&tx, id).Error; err != nil {
+	if err := db.DB.First(&tx, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "账目不存在或已被删除")
 		return
 	}
@@ -1372,6 +1644,9 @@ func DeleteTransaction(c *gin.Context) {
 		if err := db.DB.Unscoped().Delete(&tx).Error; err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
+		}
+		if tx.FootprintID != nil {
+			touchFootprintTimestamps(db.DB, *tx.FootprintID)
 		}
 		Success(c, gin.H{"id": id, "purged": true})
 		return
@@ -1383,6 +1658,9 @@ func DeleteTransaction(c *gin.Context) {
 	if err := db.DB.Delete(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
+	}
+	if tx.FootprintID != nil {
+		touchFootprintTimestamps(db.DB, *tx.FootprintID)
 	}
 	Success(c, gin.H{"id": id, "deleted": true})
 }
@@ -1457,6 +1735,9 @@ func CreateProject(c *gin.Context) {
 func GetProjectsV1(c *gin.Context) {
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
+	if !validateSyncSince(c, sinceStr) || !allowDeletedScope(c, includeDeleted) {
+		return
+	}
 
 	dbScope := db.DB
 	if includeDeleted {
@@ -1466,7 +1747,7 @@ func GetProjectsV1(c *gin.Context) {
 	query := dbScope.Model(&models.Project{}).Order("`order` ASC, id DESC")
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
-	query = applySyncSince(query, sinceStr)
+	query = applySyncSince(query, &models.Project{}, sinceStr)
 
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
 	if limit > 1000 {
@@ -1476,47 +1757,44 @@ func GetProjectsV1(c *gin.Context) {
 		query = query.Limit(limit)
 	}
 
+	// BE-2：聚合与 304 协商前置，命中时不再加载项目列表。
+	agg, err := aggregateListQuery(query)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "获取项目列表失败")
+		return
+	}
+	if negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+		return
+	}
+
 	var projects []models.Project
 	if err := query.Find(&projects).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取项目列表失败")
 		return
 	}
 
-	// 计算 ETag 与 HTTP 304 缓存协商 (BE-05)
-	var maxUpdated time.Time
+	// MOB-P1-36：服务端权威增量游标（保持本页语义）
+	var pageMaxUpdated time.Time
 	for _, p := range projects {
-		if p.UpdatedAt.After(maxUpdated) {
-			maxUpdated = p.UpdatedAt
+		if p.UpdatedAt.After(pageMaxUpdated) {
+			pageMaxUpdated = p.UpdatedAt
 		}
-		if p.DeletedAt.Valid && p.DeletedAt.Time.After(maxUpdated) {
-			maxUpdated = p.DeletedAt.Time
-		}
-	}
-	etag := fmt.Sprintf(`W/"%d-%d"`, len(projects), maxUpdated.UnixMilli())
-	c.Header("ETag", etag)
-
-	// MOB-P1-36：服务端权威增量游标
-	setSyncCursor(c, maxUpdated)
-
-	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
-		c.Status(http.StatusNotModified)
-		return
-	}
-
-	if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
-		if t, err := http.ParseTime(ifModSince); err == nil && !maxUpdated.After(t) {
-			c.Status(http.StatusNotModified)
-			return
+		if p.DeletedAt.Valid && p.DeletedAt.Time.After(pageMaxUpdated) {
+			pageMaxUpdated = p.DeletedAt.Time
 		}
 	}
+	setSyncCursor(c, pageMaxUpdated)
 
 	Success(c, projects)
 }
 
 func GetProjectByID(c *gin.Context) {
-	id := c.Param("id")
+	id, ok := parseIDParam(c)
+	if !ok {
+		return
+	}
 	var p models.Project
-	if err := db.DB.First(&p, id).Error; err != nil {
+	if err := db.DB.First(&p, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "项目不存在")
 		return
 	}
@@ -1524,7 +1802,11 @@ func GetProjectByID(c *gin.Context) {
 	// 同时拉取关联该项目的 Life Entries
 	var entries []models.LifeEntry
 	db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC").Find(&entries)
+	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 	populateEntryURLsBatch(entries)
+	if !middleware.IsAdmin(c) {
+		redactEmbeddedWishFinancesBatch(entries)
+	}
 
 	Success(c, gin.H{
 		"project": p,
@@ -1546,7 +1828,7 @@ type ProjectUpdateRequest struct {
 func UpdateProject(c *gin.Context) {
 	id := c.Param("id")
 	var p models.Project
-	if err := db.DB.First(&p, id).Error; err != nil {
+	if err := db.DB.First(&p, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "项目不存在")
 		return
 	}
@@ -1649,7 +1931,7 @@ func DeleteProject(c *gin.Context) {
 	purge := c.Query("purge") == "true"
 
 	var p models.Project
-	if err := db.DB.First(&p, id).Error; err != nil {
+	if err := db.DB.First(&p, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "项目不存在或已被删除")
 		return
 	}
@@ -1891,6 +2173,9 @@ func GlobalSearch(c *gin.Context) {
 		entries = []models.LifeEntry{}
 	}
 	populateEntryURLsBatch(entries)
+	if !middleware.IsAdmin(c) {
+		redactEmbeddedWishFinancesBatch(entries)
+	}
 
 	var footprints []models.Footprint
 	db.DB.Where("city_name LIKE ? OR title LIKE ? OR note LIKE ?", likePat, likePat, likePat).

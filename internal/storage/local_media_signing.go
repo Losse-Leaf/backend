@@ -130,9 +130,13 @@ func signLocalMediaURLAt(objectKey string, ttl time.Duration, now time.Time) str
 		return ""
 	}
 	expiresAt := mediaSignatureExpiry(now, ttl)
+	// 关键（发现 19）：签名按**原始 objectKey** 计算，URL 里则逐段转义。
+	// 历史对象键可能含空格 / `#` / `%` / 非 ASCII —— 不转义时浏览器会把 `#` 后截断、
+	// `%` 开头段误当编码，服务端解析出的 key 与签名所用 key 不一致 → 401。
+	// gin/net/http 对路径参数做对称解码，转义后可无损还原。
 	sig := computeMediaSignature(mediaResource(objectKey), expiresAt)
 	return fmt.Sprintf("/media/%s?%s=%d&%s=%s",
-		objectKey,
+		escapeObjectKeyPath(objectKey),
 		mediaSignatureParamExpires, expiresAt,
 		mediaSignatureParamSig, sig)
 }

@@ -544,6 +544,5 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 	})
 }
 
-
 // boolPtr 便于在结构体字面量里构造 *bool
 func boolPtr(v bool) *bool { return &v }

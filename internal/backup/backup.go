@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"loose-leaf/internal/config"
@@ -94,13 +95,13 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	defer os.Remove(tempDBPath)
 
 	if err := db.DB.Exec("VACUUM INTO ?", tempDBPath).Error; err != nil {
-		// 若 VACUUM INTO 偶发失败，降级为直接读取当前 db 文件复制
-		log.Printf("[Backup] VACUUM INTO 失败 (%v)，尝试文件级复制作为保底", err)
-		if cpErr := copyFile(config.AppConfig.DBPath, tempDBPath); cpErr != nil {
-			zipWriter.Close()
-			tempZipFile.Close()
-			return nil, fmt.Errorf("生成数据库快照失败: %w", cpErr)
-		}
+		// 关键（发现 9）：VACUUM INTO 失败时**不再降级为「直接复制活库文件」**。
+		// 主库运行在 WAL 模式下，直接复制主文件可能缺少尚未 checkpoint 的事务，
+		// 产出**不一致**的副本 —— 一份看似成功、实则损坏的备份比没有备份更危险
+		// （恢复时会用它覆盖掉唯一的好库）。宁可本轮失败，等待下一轮（≤6 小时）重试。
+		zipWriter.Close()
+		tempZipFile.Close()
+		return nil, fmt.Errorf("生成数据库快照失败 (VACUUM INTO): %w", err)
 	}
 
 	// 关键：**打包前先对快照副本脱敏**。
@@ -255,32 +256,36 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 		CreatedAt: manifest.ExportedAt,
 	}
 
-	// 6. 分流存储：优先上传已配置的 Cloudflare R2，否则落盘本地
+	// 6. 本地始终留一份，R2 只做异地副本。
+	// 原先是「配了 R2 就只写 R2」：那一次上传失败（或 R2 临时不可用）就
+	// 连本地副本都没有，灾备形同虚设。
+	localDir := GetLocalBackupDir()
+	if err := os.MkdirAll(localDir, 0700); err != nil {
+		tempZipFile.Close()
+		return nil, fmt.Errorf("创建本地备份目录失败: %w", err)
+	}
+	targetPath := filepath.Join(localDir, filename)
+	if err := copyFile(tempZipPath, targetPath); err != nil {
+		tempZipFile.Close()
+		return nil, fmt.Errorf("落盘本地备份失败: %w", err)
+	}
+	item.StorageType = "local"
+
 	if storage.IsConfigured() {
 		r2Key := "backups/" + filename
-		// 备份包的**存放位置**由这里显式指定为 R2，因此必须只写 R2
 		if err := storage.BackupObjectToR2(ctx, r2Key, tempZipFile, zipSize, "application/zip"); err != nil {
-			tempZipFile.Close()
-			return nil, fmt.Errorf("上传备份到 R2 失败: %w", err)
+			// R2 失败不影响本地灾备，但必须显式记下：本次只有本地副本。
+			log.Printf("[Backup] 本地快照已生成，但推送 R2 失败（本轮仅本地副本）: %v", err)
+		} else {
+			item.StorageType = "r2"
+			log.Printf("[Backup] 全量快照已同时保存至本地与 R2: %s (大小: %d 字节)", targetPath, zipSize)
 		}
-		tempZipFile.Close()
-		item.StorageType = "r2"
-		log.Printf("[Backup] 成功生成全量快照并推送至 R2: %s (大小: %d 字节)", r2Key, zipSize)
 	} else {
-		tempZipFile.Close()
-		localDir := GetLocalBackupDir()
-		if err := os.MkdirAll(localDir, 0700); err != nil {
-			return nil, fmt.Errorf("创建本地备份目录失败: %w", err)
-		}
-		targetPath := filepath.Join(localDir, filename)
-		if err := copyFile(tempZipPath, targetPath); err != nil {
-			return nil, fmt.Errorf("落盘本地备份失败: %w", err)
-		}
-		item.StorageType = "local"
 		log.Printf("[Backup] 成功生成全量快照并保存至本地: %s (大小: %d 字节)", targetPath, zipSize)
 	}
+	tempZipFile.Close()
 
-	// 7. 执行滑动窗口清理：仅保留最近 MaxBackupRetention (7) 份备份
+	// 7. 执行滑动窗口清理：仅保留最近 MaxBackupRetention (12) 份备份
 	_ = PruneOldBackups(ctx, MaxBackupRetention)
 
 	return item, nil
@@ -461,10 +466,23 @@ func GetBackupStream(ctx context.Context, filename string) (io.ReadCloser, int64
 	return f, fi.Size(), nil
 }
 
+// restoring 恢复进行中标志（发现 10）。
+// 恢复期间数据库连接池会被关闭重建、主库文件被整体覆写 ——
+// 并发写入要么报错、要么写到被替换前的旧文件上而**静默丢失**。
+// main.go 路由层据此对全部非 GET 写请求返回 503。
+var restoring atomic.Bool
+
+// IsRestoring 当前是否正在执行整库恢复（写请求应被 503 拒绝）
+func IsRestoring() bool { return restoring.Load() }
+
 // RestoreFromZipStream 从 ZIP 输入流执行整库还原与灾备回退
 func RestoreFromZipStream(zipReader *zip.Reader) error {
 	backupMutex.Lock()
 	defer backupMutex.Unlock()
+
+	// 恢复窗口内静默写操作（发现 10）；defer 保证任何失败路径都会放开
+	restoring.Store(true)
+	defer restoring.Store(false)
 
 	// 1. 扫描 ZIP 校验核心文件
 	var dbZipFile *zip.File
@@ -593,8 +611,49 @@ func RestoreFromZipStream(zipReader *zip.Reader) error {
 		return fmt.Errorf("重载数据库连接失败: %w", err)
 	}
 
+	// 7. 恢复后的存储配置保全（发现 4b）：
+	// 脱敏备份里的 R2 配置必然为空；若照单全收，进程一重启
+	// LoadStorageConfigFromDB 读到空配置 → 对象存储**静默失效**（回落纯本地）。
+	// 若当前运行时已有可用 R2 配置且还原库未显式禁用（R2Disabled），把它回写进还原库。
+	preserveRuntimeStorageConfig()
+
 	log.Printf("[Backup] 恭喜！已成功从备份完整恢复数据库与 %d 项媒体资源", len(uploadFiles))
 	return nil
+}
+
+// preserveRuntimeStorageConfig 恢复后把运行时的对象存储配置回写进还原库。
+// 仅当：还原库未显式禁用对象存储（R2Disabled=false）、其 R2 配置为空、
+// 且运行时确实持有完整配置时执行 —— 用户主动 Reset 的（R2Disabled=true）不动。
+func preserveRuntimeStorageConfig() {
+	if !storage.IsConfigured() {
+		return
+	}
+	var siteCfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&siteCfg).Error; err != nil || siteCfg.ID == 0 {
+		return
+	}
+	if siteCfg.R2Disabled {
+		return
+	}
+	if strings.TrimSpace(siteCfg.R2BucketName) != "" && strings.TrimSpace(siteCfg.R2AccessKeyID) != "" {
+		return
+	}
+	cfg := storage.R2ConfigSnapshot()
+	if strings.TrimSpace(cfg.BucketName) == "" || strings.TrimSpace(cfg.AccessKeyID) == "" {
+		return
+	}
+	siteCfg.R2AccountID = cfg.AccountID
+	siteCfg.R2AccessKeyID = cfg.AccessKeyID
+	siteCfg.R2SecretAccessKey = cfg.SecretAccessKey
+	siteCfg.R2BucketName = cfg.BucketName
+	siteCfg.R2Endpoint = cfg.Endpoint
+	siteCfg.R2PublicDomain = cfg.PublicDomain
+	siteCfg.R2PresignExpireSeconds = cfg.PresignExpireSeconds
+	if err := db.DB.Save(&siteCfg).Error; err != nil {
+		log.Printf("[Backup] 回写运行时存储配置失败（重启后对象存储可能失效）: %v", err)
+	} else {
+		log.Println("[Backup] 已把运行时对象存储配置回写至还原库（防重启后静默失效）")
+	}
 }
 
 // BackupInterval 自动全量备份的间隔
@@ -609,36 +668,40 @@ const BackupInterval = 6 * time.Hour
 // 保留旧函数名以免影响调用方，但内部已是**每 6 小时**一轮（见 BackupInterval）。
 func StartDailyBackupScheduler() {
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[Backup Scheduler] 定时任务异常崩溃捕获: %v", r)
-			}
-		}()
-
 		for {
-			now := time.Now().In(config.BeijingLocation)
-			// 计算下一个整点后 6 小时刻度
-			nextRun := now.Truncate(time.Hour).Add(BackupInterval)
-			if !nextRun.After(now) {
-				nextRun = nextRun.Add(BackupInterval)
-			}
+			// 每一轮单独 recover：原先 defer 挂在 goroutine 外层，
+			// 任意一次 CreateBackup panic 都会让整个自动备份永久停摆。
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[Backup Scheduler] 本轮定时任务异常崩溃捕获: %v", r)
+					}
+				}()
 
-			waitDuration := nextRun.Sub(now)
-			log.Printf("[Backup Scheduler] 下次全量自动备份定于: %s (等待 %s)",
-				nextRun.Format("2006-01-02 15:04:05"), waitDuration.Round(time.Minute))
+				now := time.Now().In(config.BeijingLocation)
+				// 计算下一个整点后 6 小时刻度
+				nextRun := now.Truncate(time.Hour).Add(BackupInterval)
+				if !nextRun.After(now) {
+					nextRun = nextRun.Add(BackupInterval)
+				}
 
-			timer := time.NewTimer(waitDuration)
-			<-timer.C
+				waitDuration := nextRun.Sub(now)
+				log.Printf("[Backup Scheduler] 下次全量自动备份定于: %s (等待 %s)",
+					nextRun.Format("2006-01-02 15:04:05"), waitDuration.Round(time.Minute))
 
-			log.Println("[Backup Scheduler] 每日夜间定时备份任务已唤醒，开始生成全量归档...")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if item, err := CreateBackup(ctx); err != nil {
-				log.Printf("[Backup Scheduler] 自动备份执行失败: %v", err)
-			} else {
-				log.Printf("[Backup Scheduler] 自动备份成功完成: %s (%s, %d 字节)",
-					item.Filename, item.StorageType, item.Size)
-			}
-			cancel()
+				timer := time.NewTimer(waitDuration)
+				<-timer.C
+
+				log.Println("[Backup Scheduler] 定时备份任务已唤醒，开始生成全量归档...")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cancel()
+				if item, err := CreateBackup(ctx); err != nil {
+					log.Printf("[Backup Scheduler] 自动备份执行失败: %v", err)
+				} else {
+					log.Printf("[Backup Scheduler] 自动备份成功完成: %s (%s, %d 字节)",
+						item.Filename, item.StorageType, item.Size)
+				}
+			}()
 		}
 	}()
 }

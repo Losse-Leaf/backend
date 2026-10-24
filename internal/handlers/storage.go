@@ -39,8 +39,7 @@ func LoadStorageConfigFromDB() {
 	// 若主理人明确选择禁用对象存储（恢复本地模式）
 	if siteCfg.R2Disabled {
 		log.Println("Notice: Object storage is explicitly disabled in site configuration. Using local storage mode.")
-		config.AppConfig.R2 = config.R2Config{}
-		_ = storage.InitR2(config.AppConfig.R2)
+		_ = storage.ReplaceR2Config(config.R2Config{})
 		return
 	}
 
@@ -54,7 +53,7 @@ func LoadStorageConfigFromDB() {
 
 		expireSec := siteCfg.R2PresignExpireSeconds
 		if expireSec <= 0 {
-			expireSec = config.AppConfig.R2.PresignExpireSeconds
+			expireSec = storage.R2ConfigSnapshot().PresignExpireSeconds
 		}
 		if expireSec <= 0 {
 			expireSec = 1800
@@ -70,8 +69,7 @@ func LoadStorageConfigFromDB() {
 			PresignExpireSeconds: expireSec,
 		}
 
-		config.AppConfig.R2 = cfg
-		if err := storage.InitR2(cfg); err != nil {
+		if err := storage.ReplaceR2Config(cfg); err != nil {
 			log.Printf("Notice: DB R2 storage initialization: %v", err)
 		} else if storage.IsConfigured() {
 			log.Println("Cloudflare R2 storage initialized from database configuration.")
@@ -124,7 +122,7 @@ func TestStorageConfig(c *gin.Context) {
 
 	// 若未填写密钥但系统已有保存的密钥，则沿用已有密钥进行握手测试
 	if secretAccessKey == "" {
-		secretAccessKey = config.AppConfig.R2.SecretAccessKey
+		secretAccessKey = storage.R2ConfigSnapshot().SecretAccessKey
 	}
 
 	if bucketName == "" || accessKeyID == "" || secretAccessKey == "" || endpoint == "" {
@@ -169,7 +167,7 @@ func UpdateStorageConfig(c *gin.Context) {
 
 	// 沿用旧密钥逻辑：若留空且已有密钥，保留原密钥
 	if secretAccessKey == "" {
-		secretAccessKey = config.AppConfig.R2.SecretAccessKey
+		secretAccessKey = storage.R2ConfigSnapshot().SecretAccessKey
 	}
 
 	if bucketName == "" || accessKeyID == "" || secretAccessKey == "" || endpoint == "" {
@@ -179,7 +177,7 @@ func UpdateStorageConfig(c *gin.Context) {
 
 	expireSec := req.PresignExpireSeconds
 	if expireSec <= 0 {
-		expireSec = config.AppConfig.R2.PresignExpireSeconds
+		expireSec = storage.R2ConfigSnapshot().PresignExpireSeconds
 	}
 	if expireSec <= 0 {
 		expireSec = 1800
@@ -228,8 +226,7 @@ func UpdateStorageConfig(c *gin.Context) {
 	}
 
 	// 热更新全局运行时配置与 S3 客户端
-	config.AppConfig.R2 = newCfg
-	if err := storage.InitR2(newCfg); err != nil {
+	if err := storage.ReplaceR2Config(newCfg); err != nil {
 		Error(c, http.StatusInternalServerError, "重载存储客户端失败: "+err.Error())
 		return
 	}
@@ -252,8 +249,7 @@ func ResetStorageConfig(c *gin.Context) {
 		_ = db.DB.Save(&siteCfg)
 	}
 
-	config.AppConfig.R2 = config.R2Config{}
-	_ = storage.InitR2(config.AppConfig.R2)
+	_ = storage.ReplaceR2Config(config.R2Config{})
 
 	Success(c, storage.GetStorageStatus())
 }

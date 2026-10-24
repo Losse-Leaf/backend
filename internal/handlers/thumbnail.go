@@ -52,6 +52,28 @@ const (
 	thumbnailQuality = 72
 	// 内存缓存条目上限
 	thumbnailMemoryEntries = 256
+	// 源图安全上限：单边 12000px、总像素 50MP（BE-6）
+	thumbnailMaxSourceSide   = 12000
+	thumbnailMaxSourcePixels = 50_000_000
+	// Cache-Control 不得超过缩略图签名 TTL（30 分钟）
+	thumbnailCacheMaxAge = 1800
+)
+
+// thumbnailDecodeHook 仅供测试统计实际解码次数（并发去重验收）。
+var thumbnailDecodeHook func()
+
+// thumbnailInflightCall 合并同一 cacheKey 的并发生成：
+// 第一个请求计算，其余请求等待同一结果；失败同样广播。
+type thumbnailInflightCall struct {
+	done   chan struct{}
+	data   []byte
+	status int
+	err    error
+}
+
+var (
+	thumbnailInflightMu sync.Mutex
+	thumbnailInflight   = map[string]*thumbnailInflightCall{}
 )
 
 // 缩略图内存缓存
@@ -70,7 +92,16 @@ var (
 
 // thumbnailCacheKey 缓存键：对象键 + 目标宽度
 func thumbnailCacheKey(objectKey string, width int) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s@%d", objectKey, width)))
+	// 本地主存储的同一 objectKey 可能被自定义 key 覆盖写（如 avatar/user.png）。
+	// 把源文件的 size + mtime 混入缓存键与 ETag，覆盖后自动换新；
+	// R2 模式取不到本地文件时为空版本，行为与之前一致。
+	version := ""
+	if p := storage.LocalObjectPath(objectKey); p != "" {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			version = fmt.Sprintf("%d-%d", fi.Size(), fi.ModTime().UnixNano())
+		}
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s@%d@%s", objectKey, width, version)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -111,7 +142,31 @@ func readObjectBytes(ctx context.Context, objectKey string) ([]byte, error) {
 }
 
 // makeThumbnail 生成缩略图字节
+//
+// BE-6：先 DecodeConfig 做尺寸/像素上限校验，再完整 Decode。
+// 否则一张 30000×30000 的源图会先被解码成数 GB 的 RGBA，进程直接 OOM。
 func makeThumbnail(raw []byte, targetWidth int) ([]byte, error) {
+	if thumbnailDecodeHook != nil {
+		thumbnailDecodeHook()
+	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("图片解码失败: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, fmt.Errorf("图片尺寸非法")
+	}
+	if cfg.Width > thumbnailMaxSourceSide || cfg.Height > thumbnailMaxSourceSide {
+		return nil, fmt.Errorf("源图尺寸过大: %dx%d（单边上限 %dpx）", cfg.Width, cfg.Height, thumbnailMaxSourceSide)
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > thumbnailMaxSourcePixels {
+		return nil, fmt.Errorf("源图像素过多: %dx%d = %.1fMP（上限 %dMP）",
+			cfg.Width, cfg.Height,
+			float64(cfg.Width)*float64(cfg.Height)/1_000_000,
+			thumbnailMaxSourcePixels/1_000_000)
+	}
+
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("图片解码失败: %w", err)
@@ -184,37 +239,39 @@ func ThumbnailFile(c *gin.Context) {
 	cacheKey := thumbnailCacheKey(objectKey, width)
 
 	// 1) 内存缓存
-	thumbnailMemoryMu.RLock()
-	entry, ok := thumbnailMemory[cacheKey]
-	thumbnailMemoryMu.RUnlock()
-	if ok && entry.expiresAt.After(time.Now()) {
-		serveThumbnail(c, entry.data, cacheKey)
+	if data, ok := thumbnailFromMemory(cacheKey); ok {
+		serveThumbnail(c, data, cacheKey)
 		return
 	}
 
 	// 2) 磁盘缓存
 	diskPath := thumbnailDiskPath(objectKey, width)
 	if data, err := os.ReadFile(diskPath); err == nil && len(data) > 0 {
-		thumbnailMemoryMu.Lock()
-		thumbnailMemory[cacheKey] = thumbnailEntry{data: data, expiresAt: time.Now().Add(30 * time.Minute)}
-		thumbnailMemoryMu.Unlock()
+		storeThumbnail(cacheKey, diskPath, data)
 		serveThumbnail(c, data, cacheKey)
 		return
 	}
 
-	// 3) 现算
-	raw, err := readObjectBytes(c.Request.Context(), objectKey)
+	// 3) 现算（同 key 并发合并，只解码一次）
+	data, status, err := buildThumbnailOnce(c.Request.Context(), objectKey, width, cacheKey, diskPath)
 	if err != nil {
-		Error(c, http.StatusNotFound, "缩略图源不可用: "+err.Error())
+		Error(c, status, err.Error())
 		return
 	}
-	data, err := makeThumbnail(raw, width)
-	if err != nil {
-		Error(c, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
+	serveThumbnail(c, data, cacheKey)
+}
 
-	// 4) 落缓存
+func thumbnailFromMemory(cacheKey string) ([]byte, bool) {
+	thumbnailMemoryMu.RLock()
+	entry, ok := thumbnailMemory[cacheKey]
+	thumbnailMemoryMu.RUnlock()
+	if ok && entry.expiresAt.After(time.Now()) {
+		return entry.data, true
+	}
+	return nil, false
+}
+
+func storeThumbnail(cacheKey, diskPath string, data []byte) {
 	thumbnailMemoryMu.Lock()
 	if len(thumbnailMemory) >= thumbnailMemoryEntries {
 		// 简单淘汰：清掉最早到期的若干条
@@ -234,17 +291,77 @@ func ThumbnailFile(c *gin.Context) {
 	if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err == nil {
 		_ = os.WriteFile(diskPath, data, 0o600)
 	}
-
-	serveThumbnail(c, data, cacheKey)
 }
 
-// serveThumbnail 输出缩略图
+// buildThumbnailOnce 合并同 cacheKey 的并发生成。
+// leader 负责读源图/解码/落缓存；follower 等待同一个结果，失败也一并广播。
+func buildThumbnailOnce(ctx context.Context, objectKey string, width int, cacheKey, diskPath string) ([]byte, int, error) {
+	thumbnailInflightMu.Lock()
+	if call, ok := thumbnailInflight[cacheKey]; ok {
+		thumbnailInflightMu.Unlock()
+		select {
+		case <-call.done:
+			return call.data, call.status, call.err
+		case <-ctx.Done():
+			return nil, http.StatusRequestTimeout, ctx.Err()
+		}
+	}
+	call := &thumbnailInflightCall{done: make(chan struct{})}
+	thumbnailInflight[cacheKey] = call
+	thumbnailInflightMu.Unlock()
+
+	defer func() {
+		thumbnailInflightMu.Lock()
+		delete(thumbnailInflight, cacheKey)
+		thumbnailInflightMu.Unlock()
+		close(call.done)
+	}()
+
+	// 抢到 leader 后重新看一眼缓存：上一个 leader 可能刚写完并退出 map。
+	if data, ok := thumbnailFromMemory(cacheKey); ok {
+		call.data, call.status = data, http.StatusOK
+		return data, http.StatusOK, nil
+	}
+	if data, err := os.ReadFile(diskPath); err == nil && len(data) > 0 {
+		storeThumbnail(cacheKey, diskPath, data)
+		call.data, call.status = data, http.StatusOK
+		return data, http.StatusOK, nil
+	}
+
+	// 共享计算不能绑定 leader 的请求生命周期：第一个请求方断开时，
+	// 其他仍在等待的 follower 不应一起收到 404。给共享任务独立的超时。
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer cancel()
+	raw, err := readObjectBytes(workCtx, objectKey)
+	if err != nil {
+		call.status, call.err = http.StatusNotFound, fmt.Errorf("缩略图源不可用: %w", err)
+		return nil, call.status, call.err
+	}
+	data, err := makeThumbnail(raw, width)
+	if err != nil {
+		call.status, call.err = http.StatusUnprocessableEntity, err
+		return nil, call.status, call.err
+	}
+	storeThumbnail(cacheKey, diskPath, data)
+	call.data, call.status = data, http.StatusOK
+	return data, http.StatusOK, nil
+}
+
+// serveThumbnail 输出缩略图；命中 If-None-Match 时返回 304 且不写 body。
 func serveThumbnail(c *gin.Context, data []byte, cacheKey string) {
+	etag := `"` + cacheKey[:32] + `"`
+	c.Header("ETag", etag)
+	// 关键：max-age 不得超过缩略图签名 TTL（30 分钟），
+	// 否则签名过期后客户端仍拿着旧 URL 反复命中本地缓存，行为难以解释。
+	c.Header("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", thumbnailCacheMaxAge))
+
+	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
 	c.Header("Content-Type", "image/jpeg")
 	c.Header("Content-Length", strconv.Itoa(len(data)))
-	// 缩略图内容稳定（键 = 对象键 + 宽度），可以长期缓存
-	c.Header("Cache-Control", "public, max-age=86400, immutable")
-	c.Header("ETag", `"`+cacheKey[:32]+`"`)
 	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write(data)
 }

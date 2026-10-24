@@ -38,9 +38,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		dsn += "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
 	}
 
-	// 数据库文件本身也收紧到 0600（SQLite 驱动按 umask 落地，可能是 0644）
-	_ = os.Chmod(dbPath, 0600)
-
 	database, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger:                                   logger.Default.LogMode(logger.Warn),
 		DisableForeignKeyConstraintWhenMigrating: true,
@@ -48,6 +45,12 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 数据库文件本身也收紧到 0600（SQLite 驱动按 umask 落地，可能是 0644）。
+	// 关键（发现 21）：必须在 gorm.Open（真正创建数据库文件）**之后**执行 ——
+	// 早先放在 Open 之前，首次建库时文件尚不存在，chmod 空打，
+	// 新库仍按 umask 落地，收紧从未对「首次创建」生效过。
+	_ = os.Chmod(dbPath, 0600)
 
 	// 调优连接池：SQLite 启用 WAL 模式后支持并发读取。配合 _busy_timeout=5000 适当放宽连接池并发度 (BE-07)
 	if sqlDB, err := database.DB(); err == nil {
@@ -81,6 +84,9 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_tx_type_occurred ON transactions(type, occurred_at DESC);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_wish_status_kind_created ON wishes(status, kind, created_at DESC);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_fp_city_visited ON footprints(city_code, visited_at DESC);").Error
+	// 器物伴生散页曾使用契约外的 type="gear"，任何分类视角都看不到它。
+	// 统一归入 life（gear_id 仍保留器物关联）。
+	_ = database.Exec("UPDATE life_entries SET type = 'life' WHERE type = 'gear'").Error
 	seedData(database)
 	return database, nil
 }

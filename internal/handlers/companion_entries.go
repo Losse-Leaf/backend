@@ -125,7 +125,7 @@ func buildGearCompanionContent(gear models.GearItem) string {
 func createGearCompanionEntry(tx *gorm.DB, gear models.GearItem, occurredAt time.Time) (models.LifeEntry, error) {
 	gearID := gear.ID
 	companionEntry := models.LifeEntry{
-		Type:       "gear",
+		Type:       "life",
 		Title:      companionGearTitlePrefix + gear.Name,
 		Content:    buildGearCompanionContent(gear),
 		OccurredAt: occurredAt,

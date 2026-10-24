@@ -51,6 +51,8 @@ func containsID(ids []int, target int) bool {
 func TestSyncCursorHeaderIsAuthoritativeAndInclusive(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	adminKey := "lldt_cursor_authoritative"
+	seedTestAdminDevice(adminKey)
 
 	r := gin.New()
 	r.POST("/api/v1/entries", CreateLifeEntry)
@@ -91,6 +93,7 @@ func TestSyncCursorHeaderIsAuthoritativeAndInclusive(t *testing.T) {
 	// 用游标原样回传：记录必须**仍然被带回**（含等号边界 ⇒ 不漏拉）
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?since="+cursor, nil)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("incremental fetch failed: %d", w.Code)
@@ -104,6 +107,8 @@ func TestSyncCursorHeaderIsAuthoritativeAndInclusive(t *testing.T) {
 func TestSyncCursorCoversSoftDeletedRecords(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	adminKey := "lldt_cursor_tombstone"
+	seedTestAdminDevice(adminKey)
 
 	r := gin.New()
 	r.POST("/api/v1/entries", CreateLifeEntry)
@@ -132,6 +137,7 @@ func TestSyncCursorCoversSoftDeletedRecords(t *testing.T) {
 	// 增量拉取：墓碑必须带 deleted_at 回来，游标也必须覆盖到删除时刻
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodGet, "/api/v1/entries?since=2000-01-01T00:00:00%2B08:00", nil)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
 	r.ServeHTTP(w, req)
 	var resp map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)

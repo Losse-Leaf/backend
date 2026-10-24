@@ -9,19 +9,23 @@ import (
 // LifeEntry 统一生活时间线档案条目 (Life Stream)
 // 支持 4 种纯化生活形态：life(日常), travel(游历), project(造物), wish(心愿)
 type LifeEntry struct {
-	ID          uint         `gorm:"primaryKey;index:idx_entry_occurred_id,priority:2" json:"id"`
-	Type        string       `gorm:"index;index:idx_entry_type_occurred,priority:1" json:"type"` // life, travel, project, wish
-	Title       string       `json:"title"`
-	Content     string       `gorm:"type:text" json:"content"`
-	OccurredAt  time.Time    `gorm:"index:idx_entry_occurred_id,priority:1;index:idx_entry_type_occurred,priority:2;index" json:"occurred_at"`
-	Location    string       `json:"location"`
-	ProjectID   *uint        `gorm:"index" json:"project_id,omitempty"`
-	Project     *Project     `gorm:"-" json:"project,omitempty"` // 纯逻辑外键关联 ProjectID，不建物理外键约束
-	WishID      *uint        `gorm:"index" json:"wish_id,omitempty"`
-	Wish        *Wish        `gorm:"-" json:"wish,omitempty"`        // 纯逻辑外键关联 WishID，不建物理外键约束
-	GearID      *string      `gorm:"index" json:"gear_id,omitempty"` // 器物伴生散页（器物 id 为字符串）
-	FootprintID *uint        `gorm:"index" json:"footprint_id,omitempty"`
-	Attachments []Attachment `gorm:"-" json:"attachments"` // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
+	ID          uint      `gorm:"primaryKey;index:idx_entry_occurred_id,priority:2" json:"id"`
+	Type        string    `gorm:"index;index:idx_entry_type_occurred,priority:1" json:"type"` // life, travel, project, wish
+	Title       string    `json:"title"`
+	Content     string    `gorm:"type:text" json:"content"`
+	OccurredAt  time.Time `gorm:"index:idx_entry_occurred_id,priority:1;index:idx_entry_type_occurred,priority:2;index" json:"occurred_at"`
+	Location    string    `json:"location"`
+	ProjectID   *uint     `gorm:"index" json:"project_id,omitempty"`
+	Project     *Project  `gorm:"-" json:"project,omitempty"` // 纯逻辑外键关联 ProjectID，不建物理外键约束
+	WishID      *uint     `gorm:"index" json:"wish_id,omitempty"`
+	Wish        *Wish     `gorm:"-" json:"wish,omitempty"`        // 纯逻辑外键关联 WishID，不建物理外键约束
+	GearID      *string   `gorm:"index" json:"gear_id,omitempty"` // 器物伴生散页（器物 id 为字符串）
+	FootprintID *uint     `gorm:"index" json:"footprint_id,omitempty"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
+	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录，不重复落库。
+	// 指针 + NULL 语义让历史行不参与唯一约束（SQLite 唯一索引中 NULL 互不冲突）。
+	ClientRequestID *string      `gorm:"size:64;uniqueIndex" json:"client_request_id,omitempty"`
+	Attachments     []Attachment `gorm:"-" json:"attachments"` // 纯逻辑外键关联 EntryID，不建物理外键与级联删除约束
 
 	CityCode string `gorm:"size:12;index" json:"city_code,omitempty"`
 	CityName string `gorm:"size:64" json:"city_name,omitempty"`
@@ -33,22 +37,22 @@ type LifeEntry struct {
 
 // Attachment 附件与多媒体对象关联表
 type Attachment struct {
-	ID               uint      `gorm:"primaryKey" json:"id"`
-	EntryID          *uint     `gorm:"index;index:idx_att_refs,priority:1" json:"entry_id,omitempty"`
-	WishID           *uint     `gorm:"index;index:idx_att_refs,priority:2" json:"wish_id,omitempty"`
-	FootprintID      *uint     `gorm:"index;index:idx_att_refs,priority:3" json:"footprint_id,omitempty"`
-	ObjectKey        string    `gorm:"uniqueIndex" json:"object_key"`
-	OriginalFilename string    `json:"original_filename"`
-	MimeType         string    `gorm:"index" json:"mime_type"`
-	Size             int64     `json:"size"`
-	Width            int       `json:"width,omitempty"`
-	Height           int       `json:"height,omitempty"`
-	URL              string    `gorm:"-" json:"url"` // 动态计算得出的公开或代理可访问 URL
+	ID               uint   `gorm:"primaryKey" json:"id"`
+	EntryID          *uint  `gorm:"index;index:idx_att_refs,priority:1" json:"entry_id,omitempty"`
+	WishID           *uint  `gorm:"index;index:idx_att_refs,priority:2" json:"wish_id,omitempty"`
+	FootprintID      *uint  `gorm:"index;index:idx_att_refs,priority:3" json:"footprint_id,omitempty"`
+	ObjectKey        string `gorm:"uniqueIndex" json:"object_key"`
+	OriginalFilename string `json:"original_filename"`
+	MimeType         string `gorm:"index" json:"mime_type"`
+	Size             int64  `json:"size"`
+	Width            int    `json:"width,omitempty"`
+	Height           int    `json:"height,omitempty"`
+	URL              string `gorm:"-" json:"url"` // 动态计算得出的公开或代理可访问 URL
 	// ThumbnailURL 缩略图地址（中枢自己的路由，稳定可缓存）。
 	// 关键：列表与详情用缩略图，只有灯箱才用原图 ——
 	// 原图动辄 1.5MB，从对象存储拉一次要 4 秒，时间流滚动时会把网络打满。
-	ThumbnailURL     string    `gorm:"-" json:"thumbnail_url,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	ThumbnailURL string    `gorm:"-" json:"thumbnail_url,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Project 长期进行的事情、创造与造物
@@ -81,16 +85,18 @@ type Transaction struct {
 	CityCode      string    `gorm:"size:12;index" json:"city_code,omitempty"`
 	OccurredAt    time.Time `gorm:"index:idx_tx_occurred_id,priority:1;index:idx_tx_type_occurred,priority:2;index;not null" json:"occurred_at"`
 	// 分期付款核心字段 (RC-53)
-	IsInstallment           bool           `gorm:"default:false;index" json:"is_installment"`
-	InstallmentChannelCode  string         `gorm:"size:32;index" json:"installment_channel_code,omitempty"` // huabei, baitiao, etc.
-	InstallmentTotalAmount  int64          `gorm:"default:0" json:"installment_total_amount"`               // 分期总额（分）
-	InstallmentMonths       int            `gorm:"default:0" json:"installment_months"`                     // 总期数 (3/6/12/12)
-	InstallmentMonthlyPay   int64          `gorm:"default:0" json:"installment_monthly_pay"`                // 每期还款额（分）
-	InstallmentRemainMonths int            `gorm:"default:0" json:"installment_remain_months"`              // 剩余期数
-	RepaymentDay            int            `gorm:"default:10" json:"repayment_day"`                         // 绑定渠道的每月独立还款日 (1~31)
-	CreatedAt               time.Time      `json:"created_at"`
-	UpdatedAt               time.Time      `gorm:"index" json:"updated_at"`
-	DeletedAt               gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+	IsInstallment           bool   `gorm:"default:false;index" json:"is_installment"`
+	InstallmentChannelCode  string `gorm:"size:32;index" json:"installment_channel_code,omitempty"` // huabei, baitiao, etc.
+	InstallmentTotalAmount  int64  `gorm:"default:0" json:"installment_total_amount"`               // 分期总额（分）
+	InstallmentMonths       int    `gorm:"default:0" json:"installment_months"`                     // 总期数 (3/6/12/12)
+	InstallmentMonthlyPay   int64  `gorm:"default:0" json:"installment_monthly_pay"`                // 每期还款额（分）
+	InstallmentRemainMonths int    `gorm:"default:0" json:"installment_remain_months"`              // 剩余期数
+	RepaymentDay            int    `gorm:"default:10" json:"repayment_day"`                         // 绑定渠道的每月独立还款日 (1~31)
+	// ClientRequestID 幂等创建标识（跨端统一契约 B，语义同 LifeEntry）
+	ClientRequestID *string        `gorm:"size:64;uniqueIndex" json:"client_request_id,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"index" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
 // CreditChannel 信贷与分期方式配置表 (RC-53)

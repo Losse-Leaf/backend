@@ -31,6 +31,13 @@ type presignedCacheItem struct {
 }
 
 var (
+	// runtimeR2 是当前生效的 R2 配置快照。配置热更新与并发读（签名/状态）
+	// 必须走这把锁，不能直接读写 config.AppConfig.R2（普通结构体赋值会撕裂）。
+	runtimeR2Mu sync.RWMutex
+	runtimeR2   config.R2Config
+)
+
+var (
 	s3Mu           sync.RWMutex
 	s3Client       *s3.Client
 	presignClient  *s3.PresignClient
@@ -49,6 +56,32 @@ func ClearPresignCache() {
 	presignCacheMu.Lock()
 	presignCache = make(map[string]presignedCacheItem)
 	presignCacheMu.Unlock()
+}
+
+// r2Clients 当前 S3 客户端与桶信息的一致快照。
+//
+// 关键（发现 11）：isConfigured / s3Client / presignClient / r2Bucket / r2PublicDomain
+// 是会被 InitR2 热更新（UpdateStorageConfig / ResetStorageConfig）并发改写的全局，
+// 任何读用都必须先经 r2ClientsSnapshot() 在 s3Mu 读锁内取快照，再**只使用局部副本**。
+// 直接裸读既是数据竞争（-race 必报），也可能拼出「新客户端 + 旧桶名」的撕裂组合。
+type r2Clients struct {
+	client       *s3.Client
+	presign      *s3.PresignClient
+	bucket       string
+	publicDomain string
+	configured   bool
+}
+
+func r2ClientsSnapshot() r2Clients {
+	s3Mu.RLock()
+	defer s3Mu.RUnlock()
+	return r2Clients{
+		client:       s3Client,
+		presign:      presignClient,
+		bucket:       r2Bucket,
+		publicDomain: r2PublicDomain,
+		configured:   isConfigured,
+	}
 }
 
 // TestR2Connection 测试指定的 R2 / S3 配置是否能够正常通信，成功时返回握手往返延迟毫秒数
@@ -97,6 +130,26 @@ func TestR2Connection(ctx context.Context, cfg config.R2Config) (int64, error) {
 	return time.Since(start).Milliseconds(), nil
 }
 
+// R2ConfigSnapshot 返回当前生效的 R2 配置（并发安全）。
+func R2ConfigSnapshot() config.R2Config {
+	runtimeR2Mu.RLock()
+	defer runtimeR2Mu.RUnlock()
+	return runtimeR2
+}
+
+// ReplaceR2Config 原子替换运行时配置并重建客户端。
+// 必须先完成客户端重建再发布配置？不需要：读方拿到新配置时，
+// InitR2 已持 s3Mu 完成切换；短暂窗口内签名使用旧客户端也仍可工作。
+func ReplaceR2Config(cfg config.R2Config) error {
+	if err := InitR2(cfg); err != nil {
+		return err
+	}
+	runtimeR2Mu.Lock()
+	config.AppConfig.R2 = cfg
+	runtimeR2Mu.Unlock()
+	return nil
+}
+
 // InitR2 初始化 Cloudflare R2 / S3 客户端
 func InitR2(cfg config.R2Config) error {
 	s3Mu.Lock()
@@ -109,6 +162,9 @@ func InitR2(cfg config.R2Config) error {
 		r2Bucket = ""
 		r2PublicDomain = ""
 		ClearPresignCache()
+		runtimeR2Mu.Lock()
+		runtimeR2 = cfg
+		runtimeR2Mu.Unlock()
 		return nil
 	}
 
@@ -137,6 +193,9 @@ func InitR2(cfg config.R2Config) error {
 	r2PublicDomain = cfg.PublicDomain
 	isConfigured = true
 	ClearPresignCache()
+	runtimeR2Mu.Lock()
+	runtimeR2 = cfg
+	runtimeR2Mu.Unlock()
 
 	return nil
 }
@@ -148,34 +207,89 @@ func IsConfigured() bool {
 	return isConfigured
 }
 
-// GetStorageStatus 获取存储服务当前公开状态 (不暴露密钥)
-func GetStorageStatus() map[string]interface{} {
-	s3Mu.RLock()
-	defer s3Mu.RUnlock()
+// 存储状态中的本地文件统计缓存（BE-7）。
+//
+// 公开的 /storage/status 原先每个请求都在 s3Mu.RLock 内 filepath.Walk 整个上传目录，
+// 文件多了以后既慢又会长时间占着存储锁。现在：
+//   - 统计结果进程内缓存 60 秒；
+//   - Walk 在 s3Mu 之外执行（只锁统计缓存，避免并发重复 Walk）；
+//   - 上传/删除/迁移后主动失效。
+const storageStatsTTL = 60 * time.Second
 
-	cfg := config.AppConfig.R2
-	expireSec := cfg.PresignExpireSeconds
-	if expireSec <= 0 {
-		expireSec = 1800
+var (
+	storageStatsMu         sync.Mutex
+	storageStatsComputedAt time.Time
+	storageStatsFileCount  int64
+	storageStatsTotalBytes int64
+
+	// storageWalk 可在测试中替换为计数器，验证缓存命中不重复遍历。
+	storageWalk = filepath.Walk
+)
+
+// InvalidateStorageStatsCache 让本地文件统计缓存立即失效。
+func InvalidateStorageStatsCache() {
+	storageStatsMu.Lock()
+	storageStatsComputedAt = time.Time{}
+	storageStatsMu.Unlock()
+}
+
+// getLocalStorageStats 返回缓存中的文件数/字节数；缓存过期时才 Walk。
+// 锁覆盖 Walk，保证并发请求只会触发一次遍历。
+func getLocalStorageStats() (int64, int64) {
+	storageStatsMu.Lock()
+	defer storageStatsMu.Unlock()
+
+	if !storageStatsComputedAt.IsZero() && time.Since(storageStatsComputedAt) < storageStatsTTL {
+		return storageStatsFileCount, storageStatsTotalBytes
 	}
 
-	// 统计服务端本地存储目录下的文件数量与总大小
-	var localFileCount int64
-	var localTotalBytes int64
+	var fileCount, totalBytes int64
 	localDir := GetLocalUploadDir()
 	if fi, err := os.Stat(localDir); err == nil && fi.IsDir() {
-		_ = filepath.Walk(localDir, func(p string, info os.FileInfo, err error) error {
+		_ = storageWalk(localDir, func(p string, info os.FileInfo, err error) error {
 			if err == nil && info != nil && !info.IsDir() {
-				localFileCount++
-				localTotalBytes += info.Size()
+				fileCount++
+				totalBytes += info.Size()
 			}
 			return nil
 		})
 	}
 
+	storageStatsFileCount = fileCount
+	storageStatsTotalBytes = totalBytes
+	storageStatsComputedAt = time.Now()
+	return fileCount, totalBytes
+}
+
+// GetStorageStatusBasic 非管理员公开状态：不触发任何磁盘遍历。
+func GetStorageStatusBasic() map[string]interface{} {
+	s3Mu.RLock()
+	configured := isConfigured
+	s3Mu.RUnlock()
+	return map[string]interface{}{
+		"provider":   "Cloudflare R2",
+		"configured": configured,
+	}
+}
+
+// GetStorageStatus 获取存储服务当前公开状态 (不暴露密钥)
+func GetStorageStatus() map[string]interface{} {
+	// 只把 isConfigured 的读取放进 s3Mu；磁盘统计在锁外进行（BE-7）。
+	s3Mu.RLock()
+	configured := isConfigured
+	s3Mu.RUnlock()
+
+	cfg := R2ConfigSnapshot()
+	expireSec := cfg.PresignExpireSeconds
+	if expireSec <= 0 {
+		expireSec = 1800
+	}
+
+	localFileCount, localTotalBytes := getLocalStorageStats()
+
 	return map[string]interface{}{
 		"provider":               "Cloudflare R2",
-		"configured":             isConfigured,
+		"configured":             configured,
 		"account_id":             cfg.AccountID,
 		"bucket":                 cfg.BucketName,
 		"public_domain":          cfg.PublicDomain,
@@ -191,7 +305,7 @@ func GetStorageStatus() map[string]interface{} {
 
 // GetPresignExpireDuration 获取预签名临时下载 URL 的配置有效时长 (默认 30 分钟 / 1800 秒)
 func GetPresignExpireDuration() time.Duration {
-	sec := config.AppConfig.R2.PresignExpireSeconds
+	sec := R2ConfigSnapshot().PresignExpireSeconds
 	if sec <= 0 {
 		sec = 1800
 	}
@@ -218,7 +332,8 @@ func sanitizeFilename(raw string) string {
 
 // GeneratePresignedPutURL 生成用于客户端直接上传到 R2 的预签名 PUT URL
 func GeneratePresignedPutURL(filename, contentType string, size int64) (uploadID, objectKey, presignedURL string, expiresIn int, err error) {
-	if !isConfigured {
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.presign == nil {
 		return "", "", "", 0, errors.New("R2 存储未配置，暂无法生成预签名上传凭证")
 	}
 
@@ -234,13 +349,13 @@ func GeneratePresignedPutURL(filename, contentType string, size int64) (uploadID
 	expiresDuration := time.Duration(expiresIn) * time.Second
 
 	putInput := &s3.PutObjectInput{
-		Bucket:        aws.String(r2Bucket),
+		Bucket:        aws.String(snap.bucket),
 		Key:           aws.String(objectKey),
 		ContentType:   aws.String(contentType),
 		ContentLength: aws.Int64(size),
 	}
 
-	presignedReq, err := presignClient.PresignPutObject(context.TODO(), putInput, s3.WithPresignExpires(expiresDuration))
+	presignedReq, err := snap.presign.PresignPutObject(context.TODO(), putInput, s3.WithPresignExpires(expiresDuration))
 	if err != nil {
 		return "", "", "", 0, fmt.Errorf("failed to presign PUT request: %w", err)
 	}
@@ -250,16 +365,17 @@ func GeneratePresignedPutURL(filename, contentType string, size int64) (uploadID
 
 // VerifyObjectExists 确认对象已实际上传到 R2，并获取真实大小与类型
 func VerifyObjectExists(objectKey string) (size int64, contentType string, err error) {
-	if !isConfigured {
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
 		return 0, "", errors.New("R2 存储未配置")
 	}
 
 	headInput := &s3.HeadObjectInput{
-		Bucket: aws.String(r2Bucket),
+		Bucket: aws.String(snap.bucket),
 		Key:    aws.String(objectKey),
 	}
 
-	res, err := s3Client.HeadObject(context.TODO(), headInput)
+	res, err := snap.client.HeadObject(context.TODO(), headInput)
 	if err != nil {
 		return 0, "", fmt.Errorf("object not found in R2: %w", err)
 	}
@@ -274,19 +390,48 @@ func VerifyObjectExists(objectKey string) (size int64, contentType string, err e
 	return size, contentType, nil
 }
 
-// DeleteObject 从 R2 删除指定对象
+// DeleteObject 删除指定对象：本地主存储与 R2 备份都要清掉。
+//
+// 关键：不能因为 R2 未配置就直接 return —— 本地磁盘才是主存储，
+// 否则「物理删除附件」之后原图仍留在 VPS 上，旧签名 URL 继续可读。
 func DeleteObject(objectKey string) error {
-	if !isConfigured || objectKey == "" {
+	if objectKey == "" {
 		return nil
+	}
+	localErr := DeleteLocalObject(objectKey)
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
+		return localErr
 	}
 
 	delInput := &s3.DeleteObjectInput{
-		Bucket: aws.String(r2Bucket),
+		Bucket: aws.String(snap.bucket),
 		Key:    aws.String(objectKey),
 	}
 
-	_, err := s3Client.DeleteObject(context.TODO(), delInput)
-	return err
+	_, err := snap.client.DeleteObject(context.TODO(), delInput)
+	// 本地统计缓存一并失效：删除动作即使只影响 R2，也避免状态页继续展示旧口径。
+	InvalidateStorageStatsCache()
+	return errors.Join(localErr, err)
+}
+
+// DeleteObjectWithContext 带 context 的删除（长任务/purge 提交后清理用）。
+func DeleteObjectWithContext(ctx context.Context, objectKey string) error {
+	if objectKey == "" {
+		return nil
+	}
+	localErr := DeleteLocalObject(objectKey)
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
+		return localErr
+	}
+	delInput := &s3.DeleteObjectInput{
+		Bucket: aws.String(snap.bucket),
+		Key:    aws.String(objectKey),
+	}
+	_, err := snap.client.DeleteObject(ctx, delInput)
+	InvalidateStorageStatsCache()
+	return errors.Join(localErr, err)
 }
 
 // S3ObjectItem 表示对象存储中的对象元数据
@@ -298,14 +443,15 @@ type S3ObjectItem struct {
 
 // ListObjects 列出指定前缀的对象
 func ListObjects(ctx context.Context, prefix string) ([]S3ObjectItem, error) {
-	if !isConfigured || s3Client == nil {
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
 		return nil, nil
 	}
 	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(r2Bucket),
+		Bucket: aws.String(snap.bucket),
 		Prefix: aws.String(prefix),
 	}
-	output, err := s3Client.ListObjectsV2(ctx, input)
+	output, err := snap.client.ListObjectsV2(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -327,14 +473,15 @@ func ListObjects(ctx context.Context, prefix string) ([]S3ObjectItem, error) {
 
 // GetObject 获取 R2 存储对象的读取流
 func GetObject(ctx context.Context, objectKey string) (io.ReadCloser, int64, error) {
-	if !isConfigured || s3Client == nil {
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.client == nil {
 		return nil, 0, errors.New("对象存储未配置")
 	}
 	input := &s3.GetObjectInput{
-		Bucket: aws.String(r2Bucket),
+		Bucket: aws.String(snap.bucket),
 		Key:    aws.String(objectKey),
 	}
-	output, err := s3Client.GetObject(ctx, input)
+	output, err := snap.client.GetObject(ctx, input)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -349,13 +496,15 @@ func GetPublicURL(objectKey string) string {
 	if strings.HasPrefix(objectKey, "http://") || strings.HasPrefix(objectKey, "https://") {
 		return objectKey
 	}
-	if r2PublicDomain != "" {
-		return fmt.Sprintf("%s/%s", strings.TrimRight(r2PublicDomain, "/"), path.Clean(objectKey))
+	snap := r2ClientsSnapshot()
+	if snap.publicDomain != "" {
+		return fmt.Sprintf("%s/%s", strings.TrimRight(snap.publicDomain, "/"), escapeObjectKeyPath(path.Clean(objectKey)))
 	}
-	if config.AppConfig.R2.Endpoint != "" && r2Bucket != "" {
-		return fmt.Sprintf("%s/%s/%s", strings.TrimRight(config.AppConfig.R2.Endpoint, "/"), r2Bucket, path.Clean(objectKey))
+	cfg := R2ConfigSnapshot()
+	if cfg.Endpoint != "" && snap.bucket != "" {
+		return fmt.Sprintf("%s/%s/%s", strings.TrimRight(cfg.Endpoint, "/"), snap.bucket, escapeObjectKeyPath(path.Clean(objectKey)))
 	}
-	return "/media/" + strings.TrimPrefix(path.Clean(objectKey), "/")
+	return "/media/" + escapeObjectKeyPath(strings.TrimPrefix(path.Clean(objectKey), "/"))
 }
 
 // ExtractObjectKey 从全量 URL 或相对路径中提取出标准的对象存储相对路径 Key (如 "avatar/user.png")
@@ -371,8 +520,14 @@ func ExtractObjectKey(raw string) string {
 		if clean == "." || clean == "/" {
 			return ""
 		}
+		// 签名 URL / 公开 URL 里的路径可能带 %20 等转义，提取时还原成真实键。
+		if decoded, err := url.PathUnescape(clean); err == nil {
+			clean = decoded
+		}
 		return clean
 	}
+
+	snap := r2ClientsSnapshot()
 
 	// 解析全量 URL
 	u, err := url.Parse(raw)
@@ -382,8 +537,8 @@ func ExtractObjectKey(raw string) string {
 
 	// 提取 URL 路径并清洗
 	cleanPath := strings.TrimPrefix(path.Clean(u.Path), "/")
-	if r2Bucket != "" && strings.HasPrefix(cleanPath, r2Bucket+"/") {
-		cleanPath = strings.TrimPrefix(cleanPath, r2Bucket+"/")
+	if snap.bucket != "" && strings.HasPrefix(cleanPath, snap.bucket+"/") {
+		cleanPath = strings.TrimPrefix(cleanPath, snap.bucket+"/")
 	}
 
 	// 如果 URL 带有预签名参数 (X-Amz-*)，无论域名如何，其 Path 即为 ObjectKey
@@ -393,13 +548,14 @@ func ExtractObjectKey(raw string) string {
 
 	// 检查域名是否属于本桶
 	isOurHost := false
-	if r2PublicDomain != "" {
-		if pubU, err := url.Parse(r2PublicDomain); err == nil && pubU.Host == u.Host {
+	if snap.publicDomain != "" {
+		if pubU, err := url.Parse(snap.publicDomain); err == nil && pubU.Host == u.Host {
 			isOurHost = true
 		}
 	}
-	if config.AppConfig.R2.Endpoint != "" {
-		if epU, err := url.Parse(config.AppConfig.R2.Endpoint); err == nil && epU.Host == u.Host {
+	cfg := R2ConfigSnapshot()
+	if cfg.Endpoint != "" {
+		if epU, err := url.Parse(cfg.Endpoint); err == nil && epU.Host == u.Host {
 			isOurHost = true
 		}
 	}
@@ -436,14 +592,16 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	}
 
 	// 未配置 R2 时回退本地或公共域名代理 (RC-44: 本地媒体统一走 /media 前缀)
-	if !isConfigured || presignClient == nil {
-		if r2PublicDomain != "" {
-			return fmt.Sprintf("%s/%s", strings.TrimRight(r2PublicDomain, "/"), path.Clean(objectKey)), expiresIn, nil
+	snap := r2ClientsSnapshot()
+	if !snap.configured || snap.presign == nil {
+		if snap.publicDomain != "" {
+			return fmt.Sprintf("%s/%s", strings.TrimRight(snap.publicDomain, "/"), escapeObjectKeyPath(path.Clean(objectKey))), expiresIn, nil
 		}
-		if config.AppConfig.R2.Endpoint != "" && r2Bucket != "" {
-			return fmt.Sprintf("%s/%s/%s", strings.TrimRight(config.AppConfig.R2.Endpoint, "/"), r2Bucket, path.Clean(objectKey)), expiresIn, nil
+		cfg := R2ConfigSnapshot()
+		if cfg.Endpoint != "" && snap.bucket != "" {
+			return fmt.Sprintf("%s/%s/%s", strings.TrimRight(cfg.Endpoint, "/"), snap.bucket, escapeObjectKeyPath(path.Clean(objectKey))), expiresIn, nil
 		}
-		return "/media/" + strings.TrimPrefix(path.Clean(objectKey), "/"), expiresIn, nil
+		return "/media/" + escapeObjectKeyPath(strings.TrimPrefix(path.Clean(objectKey), "/")), expiresIn, nil
 	}
 
 	cleanKey := strings.TrimPrefix(path.Clean(objectKey), "/")
@@ -468,11 +626,11 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	presignCacheMu.RUnlock()
 
 	getInput := &s3.GetObjectInput{
-		Bucket: aws.String(r2Bucket),
+		Bucket: aws.String(snap.bucket),
 		Key:    aws.String(cleanKey),
 	}
 
-	presignedReq, err := presignClient.PresignGetObject(context.TODO(), getInput, s3.WithPresignExpires(duration))
+	presignedReq, err := snap.presign.PresignGetObject(context.TODO(), getInput, s3.WithPresignExpires(duration))
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to presign GET request: %w", err)
 	}
@@ -530,7 +688,8 @@ func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) 
 	if (strings.HasPrefix(resourcePathOrKey, "http://") || strings.HasPrefix(resourcePathOrKey, "https://")) &&
 		!strings.Contains(resourcePathOrKey, "r2.cloudflarestorage.com") &&
 		!strings.Contains(resourcePathOrKey, "X-Amz-") {
-		if r2PublicDomain == "" || !strings.Contains(resourcePathOrKey, r2PublicDomain) {
+		pubDomain := r2ClientsSnapshot().publicDomain
+		if pubDomain == "" || !strings.Contains(resourcePathOrKey, pubDomain) {
 			return resourcePathOrKey
 		}
 	}
@@ -585,19 +744,20 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 		contentType = "application/octet-stream"
 	}
 
-	r2Ready := isConfigured && s3Client != nil
+	snap := r2ClientsSnapshot()
+	r2Ready := snap.configured && snap.client != nil
 
 	// 旧行为：R2 为主（且不写本地）
 	if !localPrimaryEnabled {
 		if r2Ready {
 			putInput := &s3.PutObjectInput{
-				Bucket:        aws.String(r2Bucket),
+				Bucket:        aws.String(snap.bucket),
 				Key:           aws.String(objectKey),
 				Body:          reader,
 				ContentLength: aws.Int64(size),
 				ContentType:   aws.String(contentType),
 			}
-			_, err := s3Client.PutObject(ctx, putInput)
+			_, err := snap.client.PutObject(ctx, putInput)
 			return err
 		}
 		return writeLocalObject(objectKey, reader, size)
@@ -621,13 +781,13 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 		}
 		// 备份：尽力而为
 		putInput := &s3.PutObjectInput{
-			Bucket:        aws.String(r2Bucket),
+			Bucket:        aws.String(snap.bucket),
 			Key:           aws.String(objectKey),
 			Body:          bytes.NewReader(payload),
 			ContentLength: aws.Int64(int64(len(payload))),
 			ContentType:   aws.String(contentType),
 		}
-		if _, err := s3Client.PutObject(ctx, putInput); err != nil {
+		if _, err := snap.client.PutObject(ctx, putInput); err != nil {
 			// 备份失败不影响主流程，但必须留下痕迹
 			log.Printf("[storage] R2 备份失败（本地已写入成功）：key=%s err=%v", objectKey, err)
 		}
@@ -638,16 +798,40 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 	return writeLocalObject(objectKey, reader, size)
 }
 
+// escapeObjectKeyPath 对对象键逐段做 URL 转义（保留 `/` 分隔符）。
+// 对象键可能包含空格 / `#` / `%` 等字符，直接拼进 URL 会被浏览器或反代截断；
+// 逐段 PathEscape 后既能正确访问，也不会把目录分隔符转义掉。
+func escapeObjectKeyPath(objectKey string) string {
+	segments := strings.Split(strings.TrimPrefix(objectKey, "/"), "/")
+	for i := range segments {
+		segments[i] = url.PathEscape(segments[i])
+	}
+	return strings.Join(segments, "/")
+}
+
 // BuildSafeObjectKey 构建安全、合规的 R2 存储相对路径 Key (例如 avatar/user.png, entries/2026/10/09/uuid-file.png)
 // folder 与 customKey 一律做 Clean + 拒绝路径穿越字符，杜绝写出 data/uploads 之外 (BE-22)
 func BuildSafeObjectKey(folder, filename, customKey string) (string, error) {
 	customKey = strings.TrimSpace(customKey)
 	if customKey != "" {
 		clean := path.Clean(strings.Trim(customKey, "/\\"))
-		if strings.Contains(clean, "..") || strings.HasPrefix(clean, "/") {
-			return "", errors.New("自定义 key 含有非法路径穿越字符")
+		if strings.Contains(clean, "..") || strings.HasPrefix(clean, "/") ||
+			strings.ContainsAny(clean, "?#%\\\x00\r\n") {
+			return "", errors.New("自定义 key 含有非法字符")
 		}
-		return clean, nil
+		folder = strings.TrimSpace(folder)
+		if folder != "" && clean != folder && !strings.HasPrefix(clean, folder+"/") {
+			return "", errors.New("自定义 key 必须位于 " + folder + "/ 目录内")
+		}
+		segs := strings.Split(clean, "/")
+		for i := range segs {
+			if segs[i] == "" || segs[i] == "." || segs[i] == ".." {
+				return "", errors.New("自定义 key 含有非法路径段")
+			}
+		}
+		// 只净化最后一段文件名，目录结构保持原样（白名单与穿越检查已通过）。
+		segs[len(segs)-1] = sanitizeFilename(segs[len(segs)-1])
+		return strings.Join(segs, "/"), nil
 	}
 
 	cleanName := sanitizeFilename(filename)

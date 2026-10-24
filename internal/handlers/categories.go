@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 )
@@ -121,7 +122,7 @@ type UpdateCategoryRequest struct {
 func UpdateCategory(c *gin.Context) {
 	id := c.Param("id")
 	var item models.CategoryOption
-	if err := db.DB.First(&item, id).Error; err != nil {
+	if err := db.DB.First(&item, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "该分类项不存在")
 		return
 	}
@@ -148,52 +149,58 @@ func UpdateCategory(c *gin.Context) {
 		item.SortOrder = *req.SortOrder
 	}
 
-	if err := db.DB.Save(&item).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新分类失败")
-		return
-	}
-
 	// 默认同步更新关联的历史数据记录
 	shouldRename := true
 	if req.RenameRecords != nil {
 		shouldRename = *req.RenameRecords
 	}
-	if shouldRename && newName != "" && newName != oldName {
-		cascadeRenameCategoryRecords(item.Scope, oldName, newName)
+	if err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		if shouldRename && newName != "" && newName != oldName {
+			return cascadeRenameCategoryRecords(tx, item.Scope, oldName, newName)
+		}
+		return nil
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, "更新分类失败: "+err.Error())
+		return
 	}
 
 	Success(c, item)
 }
 
-func cascadeRenameCategoryRecords(scope, oldName, newName string) {
+func cascadeRenameCategoryRecords(tx *gorm.DB, scope, oldName, newName string) error {
 	switch scope {
 	case "expense":
-		db.DB.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", oldName).Update("category", newName)
+		return tx.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", oldName).Update("category", newName).Error
 	case "income":
-		db.DB.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName)
+		return tx.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName).Error
 	case "payment":
-		db.DB.Model(&models.Transaction{}).Where("payment_method = ?", oldName).Update("payment_method", newName)
+		return tx.Model(&models.Transaction{}).Where("payment_method = ?", oldName).Update("payment_method", newName).Error
 	case "project":
-		db.DB.Model(&models.Project{}).Where("category = ?", oldName).Update("category", newName)
+		return tx.Model(&models.Project{}).Where("category = ?", oldName).Update("category", newName).Error
 	case "gear":
 		// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)
 		profileGearMu.Lock()
 		defer profileGearMu.Unlock()
 		var profile models.CuratorProfile
-		if err := db.DB.First(&profile).Error; err == nil {
-			list := loadProfileGear(&profile)
-			changed := false
-			for i := range list {
-				if list[i].Category == oldName {
-					list[i].Category = newName
-					changed = true
-				}
-			}
-			if changed {
-				_ = saveProfileGear(&profile, list)
+		if err := tx.First(&profile).Error; err != nil {
+			return err
+		}
+		list := loadProfileGear(&profile)
+		changed := false
+		for i := range list {
+			if list[i].Category == oldName {
+				list[i].Category = newName
+				changed = true
 			}
 		}
+		if changed {
+			return saveProfileGearWith(tx, &profile, list)
+		}
 	}
+	return nil
 }
 
 // countCategoryRecordsInUse 统计某分类名被历史业务记录引用的条数 (BE-28)
@@ -227,7 +234,7 @@ func countCategoryRecordsInUse(scope, name string) int64 {
 func DeleteCategory(c *gin.Context) {
 	id := c.Param("id")
 	var item models.CategoryOption
-	if err := db.DB.First(&item, id).Error; err != nil {
+	if err := db.DB.First(&item, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "该分类项不存在")
 		return
 	}

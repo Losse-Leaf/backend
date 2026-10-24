@@ -225,7 +225,10 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		}
 	}
 
-	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%d-%s"`, year, len(entries), len(txs), maxUpdated.UnixMilli(), role)
+	// 与列表接口一致：响应内是短期签名媒体地址，ETag 必须带 25 分钟时间桶，
+	// 否则数据不变时会无限 304，客户端一直复用已过期的相片 URL。
+	ttlBucket := time.Now().Unix() / int64(25*60)
+	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%d-%d-%s"`, year, len(entries), len(txs), maxUpdated.UnixMilli(), ttlBucket, role)
 	c.Header("ETag", etag)
 	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
 

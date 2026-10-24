@@ -273,7 +273,7 @@ func CreateCreditChannel(c *gin.Context) {
 func UpdateCreditChannel(c *gin.Context) {
 	id := c.Param("id")
 	var ch models.CreditChannel
-	if err := db.DB.First(&ch, id).Error; err != nil {
+	if err := db.DB.First(&ch, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "信贷渠道不存在")
 		return
 	}
@@ -284,6 +284,7 @@ func UpdateCreditChannel(c *gin.Context) {
 		return
 	}
 
+	oldRepaymentDay := ch.RepaymentDay
 	if strings.TrimSpace(req.Name) != "" {
 		ch.Name = strings.TrimSpace(req.Name)
 	}
@@ -327,15 +328,18 @@ func UpdateCreditChannel(c *gin.Context) {
 			}
 			targetCode = newCode
 		}
-		// 同步更新该渠道下所有分期账目的还款日并按购买时间重算剩余期数
+		// 只有还款日真的变化时才重算剩余期数。
+		// 用户可能手工下调过剩余期数（提前还款），改个渠道名字不该把它覆盖掉。
 		var relatedTxs []models.Transaction
-		if err := tx.Where("is_installment = ? AND installment_channel_code = ?", true, targetCode).Find(&relatedTxs).Error; err == nil {
-			now := time.Now()
-			for _, rtx := range relatedTxs {
-				_, autoRemain := CalculateElapsedInstallmentMonths(rtx.OccurredAt, rtx.InstallmentMonths, ch.RepaymentDay, now)
-				rtx.RepaymentDay = ch.RepaymentDay
-				rtx.InstallmentRemainMonths = autoRemain
-				_ = tx.Save(&rtx).Error
+		if ch.RepaymentDay != oldRepaymentDay {
+			if err := tx.Where("is_installment = ? AND installment_channel_code = ?", true, targetCode).Find(&relatedTxs).Error; err == nil {
+				now := time.Now()
+				for _, rtx := range relatedTxs {
+					_, autoRemain := CalculateElapsedInstallmentMonths(rtx.OccurredAt, rtx.InstallmentMonths, ch.RepaymentDay, now)
+					rtx.RepaymentDay = ch.RepaymentDay
+					rtx.InstallmentRemainMonths = autoRemain
+					_ = tx.Save(&rtx).Error
+				}
 			}
 		}
 		return nil
@@ -352,7 +356,7 @@ func UpdateCreditChannel(c *gin.Context) {
 func DeleteCreditChannel(c *gin.Context) {
 	id := c.Param("id")
 	var ch models.CreditChannel
-	if err := db.DB.First(&ch, id).Error; err != nil {
+	if err := db.DB.First(&ch, "id = ?", id).Error; err != nil {
 		Error(c, http.StatusNotFound, "信贷渠道不存在")
 		return
 	}

@@ -432,66 +432,81 @@ func AddGearAsset(c *gin.Context) {
 		Note:         strings.TrimSpace(req.Note),
 	}
 
-	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
-		return append(list, newGear), nil
+	// 关键：三段写入（档案 EDCGear / 伴生散页 / 联动账单）必须同生共死 ——
+	// 任一失败整体回滚，消除「设备已录入但伴生散页或账单失败」的部分成功分支
+	//（中途失败后重试会产生重复设备）。
+	// 先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
+	// 与 CreateTransaction / SellGearAsset 对齐）。
+	profileGearMu.Lock()
+	defer profileGearMu.Unlock()
+
+	if err := db.DB.Transaction(func(dbTx *gorm.DB) error {
+		if err := mutateProfileGearLocked(dbTx, func(list []models.GearItem) ([]models.GearItem, error) {
+			return append(list, newGear), nil
+		}); err != nil {
+			return err
+		}
+
+		// 伴生创建机制：添置器物时在时间流落一条对应的一级散页，
+		// 使「所有二级对象都能在时间流里查到」这一约定成立。
+		gearOccurredAt, parseErr := ParseFlexTime(purchaseDate)
+		if parseErr != nil {
+			gearOccurredAt = config.NowInBeijing()
+		}
+		if _, err := createGearCompanionEntry(dbTx, newGear, gearOccurredAt); err != nil {
+			return err
+		}
+
+		// 若勾选了同步生成支出账单或启用了分期购置，且金额 > 0，自动生成流水
+		if (req.CreateTransaction || req.IsInstallment) && req.PriceCents > 0 {
+			occurred, parseErr := ParseFlexTime(purchaseDate)
+			if parseErr != nil {
+				occurred = config.NowInBeijing()
+			}
+
+			linkedTx := models.Transaction{
+				Amount: req.PriceCents,
+				Type:   "expense",
+				// 发现 21：联动账单用**兜底后**的分类（省略 category 时应为「数码器材」），
+				// 原先用原始 req.Category，省略时会落一条空分类账目，分类统计出现无名项。
+				Category:      gearCategory,
+				Title:         "购置设备: " + newGear.Name,
+				Note:          fmt.Sprintf("录入设备固资库自动同步流水 (%s)", newGear.Spec),
+				PaymentMethod: strings.TrimSpace(req.PaymentMethod),
+				OccurredAt:    occurred,
+			}
+			if linkedTx.PaymentMethod == "" {
+				linkedTx.PaymentMethod = "设备购置"
+			}
+
+			if req.IsInstallment {
+				AssembleInstallmentTransaction(
+					&linkedTx,
+					req.IsInstallment,
+					req.InstallmentChannelCode,
+					req.InstallmentTotalAmount,
+					req.PriceCents,
+					req.InstallmentMonths,
+					0,
+					0,
+					req.RepaymentDay,
+					dbTx,
+				)
+			}
+
+			if err := dbTx.Create(&linkedTx).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
-		Error(c, http.StatusInternalServerError, "保存设备资产失败: "+err.Error())
+		Error(c, http.StatusInternalServerError, "录入设备失败，已整体回滚: "+err.Error())
 		return
 	}
 
-	// 伴生创建机制：添置器物时在时间流落一条对应的一级散页，
-	// 使「所有二级对象都能在时间流里查到」这一约定成立。
-	gearOccurredAt, parseErr := ParseFlexTime(purchaseDate)
-	if parseErr != nil {
-		gearOccurredAt = config.NowInBeijing()
-	}
-	if _, err := createGearCompanionEntry(db.DB, newGear, gearOccurredAt); err != nil {
-		Error(c, http.StatusInternalServerError, "设备已录入但写入伴生记录失败: "+err.Error())
-		return
-	}
-
-	// 若勾选了同步生成支出账单或启用了分期购置，且金额 > 0，自动生成流水
-	if (req.CreateTransaction || req.IsInstallment) && req.PriceCents > 0 {
-		occurred, err := ParseFlexTime(purchaseDate)
-		if err != nil {
-			occurred = config.NowInBeijing()
-		}
-
-		tx := models.Transaction{
-			Amount: req.PriceCents,
-			Type:   "expense",
-			// 发现 21：联动账单用**兜底后**的分类（省略 category 时应为「数码器材」），
-			// 原先用原始 req.Category，省略时会落一条空分类账目，分类统计出现无名项。
-			Category:      gearCategory,
-			Title:         "购置设备: " + newGear.Name,
-			Note:          fmt.Sprintf("录入设备固资库自动同步流水 (%s)", newGear.Spec),
-			PaymentMethod: strings.TrimSpace(req.PaymentMethod),
-			OccurredAt:    occurred,
-		}
-		if tx.PaymentMethod == "" {
-			tx.PaymentMethod = "设备购置"
-		}
-
-		if req.IsInstallment {
-			AssembleInstallmentTransaction(
-				&tx,
-				req.IsInstallment,
-				req.InstallmentChannelCode,
-				req.InstallmentTotalAmount,
-				req.PriceCents,
-				req.InstallmentMonths,
-				0,
-				0,
-				req.RepaymentDay,
-				db.DB,
-			)
-		}
-
-		if err := db.DB.Create(&tx).Error; err != nil {
-			Error(c, http.StatusInternalServerError, "设备已录入但同步生成购置账单失败: "+err.Error())
-			return
-		}
-	}
+	// 伴生散页（total_entries）与联动账目（month_expense）都改变了 /stats 口径：
+	// 统计缓存必须失效，与其他写路径同口径（第三轮 P2-6）。
+	InvalidateStatsCache()
 
 	Success(c, newGear)
 }
@@ -696,6 +711,9 @@ func RestoreGearAsset(c *gin.Context) {
 		return
 	}
 
+	// 伴生散页取消软删改变了 total_entries：/stats 缓存必须失效（第三轮 P2-6）
+	InvalidateStatsCache()
+
 	Success(c, gin.H{"id": req.ID, "restored": true})
 }
 
@@ -728,6 +746,9 @@ func DeleteGearAsset(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "设备已删除但清理伴生记录失败: "+err.Error())
 		return
 	}
+
+	// 伴生散页被软删除后 total_entries 随之变化，统计缓存必须失效。
+	InvalidateStatsCache()
 
 	Success(c, gin.H{"id": gearID, "deleted": true})
 }

@@ -19,6 +19,22 @@ import (
 	"loose-leaf/internal/storage"
 )
 
+// validWishKinds / validWishStatuses 心愿类型与状态白名单：
+// 非法值直接 400 —— kind/status 都是列表筛选与归册联动的分支维度，
+// 落库一个未知值会让心愿从对应视角里静默消失。
+var validWishKinds = map[string]bool{
+	"item":      true,
+	"travel":    true,
+	"milestone": true,
+}
+
+var validWishStatuses = map[string]bool{
+	"wanting":     true,
+	"fulfilled":   true,
+	"shelved":     true,
+	"relinquished": true,
+}
+
 // populateWishURLs 通过纯逻辑外键加载心愿参考图并签名转化为可访问链接
 func populateWishURLs(w *models.Wish) {
 	if w == nil {
@@ -284,6 +300,10 @@ func CreateWish(c *gin.Context) {
 	if wishKind == "" {
 		wishKind = "item"
 	}
+	if !validWishKinds[wishKind] {
+		Error(c, http.StatusBadRequest, "kind 仅支持 item / travel / milestone")
+		return
+	}
 
 	wish := models.Wish{
 		Title:      strings.TrimSpace(req.Title),
@@ -377,10 +397,6 @@ func UpdateWish(c *gin.Context) {
 	// 字段语义与 profile 一致：**请求携带该 key 即按其值写入**（0 = 清空）
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
-	hasKey := func(k string) bool {
-		_, ok := rawKeys[k]
-		return ok
-	}
 
 	oldStatus := wish.Status
 	oldTitle := wish.Title
@@ -394,7 +410,12 @@ func UpdateWish(c *gin.Context) {
 		wish.Title = title
 	}
 	if req.Kind != "" {
-		wish.Kind = strings.TrimSpace(req.Kind)
+		kind := strings.TrimSpace(req.Kind)
+		if !validWishKinds[kind] {
+			Error(c, http.StatusBadRequest, "kind 仅支持 item / travel / milestone")
+			return
+		}
+		wish.Kind = kind
 	}
 	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
 	// 缺省 / null = 保持原值」。原先 `if req.Note != ""` 让「删光备注/规格后保存」静默失败，
@@ -424,9 +445,17 @@ func UpdateWish(c *gin.Context) {
 		wish.ActualCost = *req.ActualCost
 	}
 	if req.Status != "" {
-		wish.Status = strings.TrimSpace(req.Status)
+		status := strings.TrimSpace(req.Status)
+		if !validWishStatuses[status] {
+			Error(c, http.StatusBadRequest, "status 仅支持 wanting / fulfilled / shelved / relinquished")
+			return
+		}
+		wish.Status = status
 	}
-	if hasKey("target_date") {
+	// 契约 C：三个时间字段统一 hasJSONValue 语义 —— 请求携带且空串 = 清空；
+	// 缺省 / JSON null = 保持原值。原先 hasKey 只判 key 存在，客户端发 null
+	// 会被当成清空（与 profile.go 已修复的同类问题一致，第三轮 P2-3）。
+	if hasJSONValue(rawKeys, "target_date") {
 		if req.TargetDate == "" {
 			wish.TargetDate = nil
 		} else if t, err := ParseFlexTime(req.TargetDate); err != nil {
@@ -437,7 +466,7 @@ func UpdateWish(c *gin.Context) {
 		}
 	}
 	// 补档：许下时刻可改写为过去的时间；显式空串 = 清空
-	if hasKey("planted_at") {
+	if hasJSONValue(rawKeys, "planted_at") {
 		if req.PlantedAt == "" {
 			wish.PlantedAt = nil
 		} else if t, err := ParseFlexTime(req.PlantedAt); err != nil {
@@ -447,7 +476,7 @@ func UpdateWish(c *gin.Context) {
 			wish.PlantedAt = &t
 		}
 	}
-	if hasKey("fulfilled_at") {
+	if hasJSONValue(rawKeys, "fulfilled_at") {
 		if req.FulfilledAt == "" {
 			wish.FulfilledAt = nil
 		} else if t, err := ParseFlexTime(req.FulfilledAt); err != nil {
@@ -606,6 +635,14 @@ func ResolveWish(c *gin.Context) {
 		actualTitle = wish.Title
 	}
 
+	// 联动建 gear 时要先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
+	// 与 CreateTransaction / SellGearAsset 对齐）：原先「事务内取锁」会与其它
+	// 器物写操作互等 SQLite 的唯一写者名额，造成锁序反转死锁。
+	if req.CreateGearAsset && wish.Kind == "item" {
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
+	}
+
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		wish.ResolutionType = resType
 		wish.FulfilledAt = &fulfilledAt
@@ -715,9 +752,8 @@ func ResolveWish(c *gin.Context) {
 				Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
 			}
 
-			// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)，写入仍在当前事务内保持原子
-			profileGearMu.Lock()
-			defer profileGearMu.Unlock()
+			// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)：调用方已在事务外持有
+			// profileGearMu（见函数开头），写入仍在当前事务内保持原子。
 			var profile models.CuratorProfile
 			if err := tx.First(&profile).Error; err == nil {
 				list := append(loadProfileGear(&profile), newGear)
@@ -836,7 +872,15 @@ func DeleteWish(c *gin.Context) {
 	// 关键（发现 14）：伴生散页清理、关联解绑与心愿删除原先分散在多次独立写入，
 	// 中途失败会留下「心愿还在、时间流记录已被删」的半套状态 —— 统一包进同一事务。
 	purged := false
+	var keysToDelete []string
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 先收集伴生散页 id（Unscoped：含此前被单独软删的散页），
+		// 它们的附件 entry_id 不能悬挂在即将删除的散页上（第三轮 P2-5）。
+		var companionIDs []uint
+		if err := tx.Unscoped().Model(&models.LifeEntry{}).Where("wish_id = ?", w.ID).Pluck("id", &companionIDs).Error; err != nil {
+			return err
+		}
+
 		// 删除心愿时**一并软删除**它在时间流里的伴生散页。
 		// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
 		if err := tx.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{}).Error; err != nil {
@@ -854,11 +898,29 @@ func DeleteWish(c *gin.Context) {
 			if err := tx.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
 				return err
 			}
+			// 伴生散页已删：仅归属它们的附件物理清理（媒体在事务提交后删除），
+			// 共享附件只解绑 entry_id，杜绝「不可见且永不可清」的永久孤儿
+			//（与 DeleteLifeEntry purge 同口径，releaseEntryAttachments 共用）。
+			for _, entryID := range companionIDs {
+				keys, err := releaseEntryAttachments(tx, entryID, true)
+				if err != nil {
+					return err
+				}
+				keysToDelete = append(keysToDelete, keys...)
+			}
 			if err := tx.Unscoped().Delete(&w).Error; err != nil {
 				return err
 			}
 			purged = true
 			return nil
+		}
+
+		// 软删：伴生散页进回收站后，其附件的 entry_id 一并解绑，避免指向再也
+		// 回不来的散页；wish_id 保留 —— 软删心愿在 include_deleted 视角仍能看到参考图。
+		for _, entryID := range companionIDs {
+			if _, err := releaseEntryAttachments(tx, entryID, false); err != nil {
+				return err
+			}
 		}
 		return tx.Delete(&w).Error
 	})
@@ -866,6 +928,12 @@ func DeleteWish(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "删除心愿失败: "+err.Error())
 		return
 	}
+	for _, key := range keysToDelete {
+		_ = storage.DeleteObject(key)
+	}
+	// 删除心愿会连带软删除它在时间流里的伴生散页（total_entries 随之变化），
+	// 统计缓存必须失效，否则 /stats 继续返回旧计数。
+	InvalidateStatsCache()
 	if purged {
 		Success(c, gin.H{"id": id, "purged": true})
 		return

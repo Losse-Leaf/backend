@@ -1022,12 +1022,16 @@ func UpdateFootprint(c *gin.Context) {
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
 
+	// 记录请求前的城市：只有本次请求真的改动了城市，才同步伴生散页的城市字段（见下方同步块）
+	oldCityCode := footprint.CityCode
+	oldCityName := footprint.CityName
 	if req.CityCode != "" {
 		footprint.CityCode = strings.TrimSpace(req.CityCode)
 	}
 	if req.CityName != "" {
 		footprint.CityName = strings.TrimSpace(req.CityName)
 	}
+	cityChanged := footprint.CityCode != oldCityCode || footprint.CityName != oldCityName
 	if hasJSONValue(rawKeys, "title") {
 		footprint.Title = strings.TrimSpace(req.Title)
 	}
@@ -1039,10 +1043,19 @@ func UpdateFootprint(c *gin.Context) {
 			return
 		}
 	}
-	if req.DepartedAt != "" {
-		if t, err := ParseFlexTime(req.DepartedAt); err == nil && !t.IsZero() {
-			footprint.DepartedAt = &t
+	// 契约 C：返程日期支持**显式清空** —— 请求携带 departed_at 且为空串时置 nil
+	//（Web 编辑弹窗清空返程时发空串；null/缺省保持原值）。
+	// 非空但解析失败与 visited_at 同口径显式 400，不再静默忽略 —— 静默忽略会让
+	// 「改返程日期」的请求假装成功、旧值原样保留（第三轮 P2-2）。
+	if trimmedDeparted := strings.TrimSpace(req.DepartedAt); trimmedDeparted != "" {
+		t, err := ParseFlexTime(trimmedDeparted)
+		if err != nil || t.IsZero() {
+			Error(c, http.StatusBadRequest, "返程时间格式无法识别")
+			return
 		}
+		footprint.DepartedAt = &t
+	} else if hasJSONValue(rawKeys, "departed_at") {
+		footprint.DepartedAt = nil
 	}
 	if hasJSONValue(rawKeys, "note") {
 		footprint.Note = strings.TrimSpace(req.Note)
@@ -1065,9 +1078,18 @@ func UpdateFootprint(c *gin.Context) {
 		if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
 			var entry models.LifeEntry
 			if err := tx.First(&entry, *footprint.LifeEntryID).Error; err == nil {
-				entry.CityCode = footprint.CityCode
-				entry.CityName = footprint.CityName
-				entry.Location = footprint.CityName
+				// 关键（第三轮 P2-8）：仅当本次请求确实改动了旅程城市时才同步伴生散页的
+				// 城市字段，且**不再用城市名覆盖散页的 Location** —— 用户给散页填的具体
+				// 地点（如「西湖边的小咖啡馆」）不能被任何一次足迹编辑冲掉。
+				// 原先无条件覆盖三字段，改个标题也会把自定义地点重置成城市名。
+				// 散页地点本来就是自动回填的城市名（或为空）→ 随城市改名而跟随。
+				if cityChanged {
+					entry.CityCode = footprint.CityCode
+					entry.CityName = footprint.CityName
+					if entry.Location == "" || entry.Location == oldCityName {
+						entry.Location = footprint.CityName
+					}
+				}
 				entry.OccurredAt = footprint.VisitedAt
 				if hasJSONValue(rawKeys, "title") {
 					entry.Title = footprint.Title
@@ -1186,12 +1208,23 @@ func DeleteFootprint(c *gin.Context) {
 	}
 
 	if purge {
+		var keysToDelete []string
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
 			tx.Model(&models.Attachment{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			tx.Model(&models.Wish{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			// 共享引用保护：先摘除所有条目对该旅程的引用，再删除首生条目 (BE-25)
 			tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
+				// 关键（第三轮 P2-5）：首生散页即将物理删除，仅归属它的附件必须一并
+				// 物理清理、共享附件只解绑 entry_id —— 否则 entry_id 悬挂在已删散页上，
+				// 附件成为任何界面不可见、CleanupUpload 永远拒清的永久孤儿。
+				// 必须在上方 footprint_id 解绑**之后**执行：否则「只归属本旅程+本散页」
+				// 的附件会被判为共享而漏删。媒体文件在事务提交后删除（keysToDelete）。
+				keys, err := releaseEntryAttachments(tx, *f.LifeEntryID, true)
+				if err != nil {
+					return err
+				}
+				keysToDelete = keys
 				if err := tx.Unscoped().Where("id = ?", *f.LifeEntryID).Delete(&models.LifeEntry{}).Error; err != nil {
 					return err
 				}
@@ -1202,6 +1235,9 @@ func DeleteFootprint(c *gin.Context) {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
+		for _, key := range keysToDelete {
+			_ = storage.DeleteObject(key)
+		}
 		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
@@ -1211,6 +1247,13 @@ func DeleteFootprint(c *gin.Context) {
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		// 共享引用保护：其余条目不应指向已软删旅程 (BE-25)
 		tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
+		if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
+			// 第三轮 P2-5：首生散页进回收站后，其附件的 entry_id 一并解绑防悬挂；
+			// footprint_id 保留 —— 软删足迹在 include_deleted 视角仍能看到相片。
+			if _, err := releaseEntryAttachments(tx, *f.LifeEntryID, false); err != nil {
+				return err
+			}
+		}
 		if err := tx.Delete(&f).Error; err != nil {
 			return err
 		}

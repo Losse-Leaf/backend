@@ -29,7 +29,7 @@ func TestAdminAuthRequired(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
 
-	t.Run("Rejects regular write routes even when system is uninitialized (BE-18)", func(t *testing.T) {
+	t.Run("Rejects every protected route when system is uninitialized (no cold-start bypass)", func(t *testing.T) {
 		db.DB.Exec("DELETE FROM site_configs")
 		db.DB.Exec("DELETE FROM devices")
 
@@ -42,25 +42,19 @@ func TestAdminAuthRequired(t *testing.T) {
 			c.JSON(http.StatusOK, gin.H{"status": "bootstrap_pair_ok"})
 		})
 
-		// 1. 常规写接口在未初始化时绝不免密放行，必须返回 401
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/entries", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("expected 401 on regular write route when uninitialized, got %d", w.Code)
-		}
-
-		// 2. 冷启动必需配对接口在未初始化时允许通行
-		reqPair := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
-		wPair := httptest.NewRecorder()
-		r.ServeHTTP(wPair, reqPair)
-		if wPair.Code != http.StatusOK {
-			t.Errorf("expected 200 on /api/v1/auth/pair/init when uninitialized, got %d", wPair.Code)
+		// 未初始化时不存在任何免密旁路：常规写接口与配对接口都必须 401。
+		for _, path := range []string{"/api/v1/entries", "/api/v1/auth/pair/init"} {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401 on %s when uninitialized, got %d", path, w.Code)
+			}
 		}
 	})
 
 	t.Run("Rejects unauthorized request when system is initialized (BE-13, BE-18)", func(t *testing.T) {
-		db.DB.Create(&models.SiteConfig{Initialized: true, MasterPasscode: "hashedpass"})
+		db.DB.Create(&models.SiteConfig{Initialized: true})
 		defer func() {
 			db.DB.Exec("DELETE FROM site_configs")
 		}()

@@ -26,7 +26,6 @@ func TestBE13_AuthenticationBypassPrevention(t *testing.T) {
 	var cfg models.SiteConfig
 	db.DB.FirstOrCreate(&cfg)
 	cfg.Initialized = true
-	cfg.MasterPasscode = middleware.HashToken("my-secret-passcode")
 	db.DB.Save(&cfg)
 
 	r := gin.New()

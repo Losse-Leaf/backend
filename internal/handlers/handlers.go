@@ -348,9 +348,59 @@ func assertAttachmentBindable(att models.Attachment, targets map[string]any) err
 	return check("footprint_id", att.FootprintID)
 }
 
+// releaseEntryAttachments 删除散页（物理 purge 或软删）时处理其附件归属，
+// 防止附件的 entry_id 悬挂在已删散页上成为「永久孤儿」——
+// 任何界面都不可见、CleanupUpload 因 entry_id 非空永远拒清、total_photos 永久虚计。
+//   - purge=true：仅归属本散页（wish/footprint 均为空）的附件连同媒体一并物理删除，
+//     仍有其他实体引用的只解绑 entry_id；
+//   - purge=false（软删）：全部解绑 entry_id（附件行与媒体文件保留）。
+//
+// 返回需要物理删除的对象键 —— 调用方必须在事务提交**之后**再删媒体文件，
+// 避免「对象已删、事务回滚」留下坏链接（DeleteLifeEntry purge 既有约定）。
+// DeleteLifeEntry / DeleteFootprint / DeleteWish 三条删除路径共用本函数。
+func releaseEntryAttachments(dbTx *gorm.DB, entryID uint, purge bool) (keysToDelete []string, err error) {
+	var atts []models.Attachment
+	if err := dbTx.Where("entry_id = ?", entryID).Find(&atts).Error; err != nil {
+		return nil, err
+	}
+	for i := range atts {
+		att := atts[i]
+		if purge && att.WishID == nil && att.FootprintID == nil {
+			if att.ObjectKey != "" {
+				keysToDelete = append(keysToDelete, att.ObjectKey)
+			}
+			if err := dbTx.Unscoped().Delete(&models.Attachment{}, att.ID).Error; err != nil {
+				return keysToDelete, err
+			}
+			continue
+		}
+		if err := dbTx.Model(&models.Attachment{}).Where("id = ?", att.ID).Update("entry_id", nil).Error; err != nil {
+			return keysToDelete, err
+		}
+	}
+	return keysToDelete, nil
+}
+
 // ==========================================
 // 1. Life Entry CRUD (生活档案接口)
 // ==========================================
+
+// validEntryTypes 生活散页类型白名单（RC-128 四维收敛后的全部合法取值）。
+// type 是列表/统计的筛选维度：非法值会让条目从所有分类视角里静默消失，直接 400。
+var validEntryTypes = map[string]bool{
+	"life":    true,
+	"travel":  true,
+	"project": true,
+	"wish":    true,
+}
+
+// validTxTypes 记账 type 白名单：type 是所有汇总口径的过滤维度
+//（GetTransactionSummary / GetGlobalStats / 资产大盘 / 旅程花销聚合都只认 expense/income），
+// 落库一个未知值会让账目从全部统计口径里静默消失 —— 与散页 type / 心愿 kind 同款，非法值直接 400。
+var validTxTypes = map[string]bool{
+	"expense": true,
+	"income":  true,
+}
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
@@ -491,6 +541,11 @@ func CreateLifeEntry(c *gin.Context) {
 	entryType := strings.TrimSpace(req.Type)
 	if entryType == "" {
 		entryType = "life"
+	}
+	// 非法 type 直接 400，绝不静默落库一个四维之外的类型
+	if !validEntryTypes[entryType] {
+		Error(c, http.StatusBadRequest, "type 仅支持 life / travel / project / wish")
+		return
 	}
 
 	entry := models.LifeEntry{
@@ -793,6 +848,10 @@ func UpdateLifeEntry(c *gin.Context) {
 	// 从所有分类视角里**静默消失**。
 	// 保持旧语义（空串 = 未携带），并对非法值直接拒绝。
 	if req.Type != "" {
+		if !validEntryTypes[req.Type] {
+			Error(c, http.StatusBadRequest, "type 仅支持 life / travel / project / wish")
+			return
+		}
 		entry.Type = req.Type
 	}
 	// titleKeyPresent：请求是否显式携带了 title
@@ -936,19 +995,14 @@ func DeleteLifeEntry(c *gin.Context) {
 		// 2) 不会出现「对象已删、数据库事务回滚」留下坏链接。
 		var keysToDelete []string
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
-			// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）
-			var atts []models.Attachment
-			tx.Where("entry_id = ?", entry.ID).Find(&atts)
-			for _, att := range atts {
-				if att.WishID == nil && att.FootprintID == nil {
-					if att.ObjectKey != "" {
-						keysToDelete = append(keysToDelete, att.ObjectKey)
-					}
-					tx.Unscoped().Delete(&att)
-				} else {
-					tx.Model(&att).Update("entry_id", nil)
-				}
+			// 物理硬清理关联的 R2 存储对象与数据库记录（纯逻辑外键下仅删除未与其他实体共用的附件）。
+			// releaseEntryAttachments 与 DeleteFootprint / DeleteWish 共用同一套防孤儿逻辑：
+			// 仅归属本散页的附件物理删除，共享附件只解绑 entry_id。
+			keys, err := releaseEntryAttachments(tx, entry.ID, true)
+			if err != nil {
+				return err
 			}
+			keysToDelete = append(keysToDelete, keys...)
 			// 仅删除由该条目首生、且无其他条目经 footprint_id 引用的足迹 (RC-25 共享引用保护)
 			var bornFps []models.Footprint
 			tx.Where("life_entry_id = ?", entry.ID).Find(&bornFps)
@@ -959,6 +1013,11 @@ func DeleteLifeEntry(c *gin.Context) {
 					Count(&refCount)
 				if refCount == 0 {
 					if err := tx.Unscoped().Delete(&models.Footprint{}, fp.ID).Error; err != nil {
+						return err
+					}
+					// 心愿对该足迹的溯源引用一并解绑，不留指向已物理删除足迹的悬空外键
+					//（与 DeleteFootprint purge 同款处理；第三轮 P2-5 连带项）
+					if err := tx.Model(&models.Wish{}).Where("footprint_id = ?", fp.ID).Update("footprint_id", nil).Error; err != nil {
 						return err
 					}
 				}
@@ -1263,6 +1322,12 @@ func CreateTransaction(c *gin.Context) {
 	if txType == "" {
 		txType = "expense"
 	}
+	// 非法 type 直接 400：所有汇总口径只认 expense/income，
+	// 落库一个未知值会让账目从全部统计里静默消失（与散页 type / 心愿 kind 同款白名单）
+	if !validTxTypes[txType] {
+		Error(c, http.StatusBadRequest, "type 仅支持 expense / income")
+		return
+	}
 
 	record := models.Transaction{
 		Amount:        req.Amount,
@@ -1561,6 +1626,11 @@ func UpdateTransaction(c *gin.Context) {
 	// Update 的语义本就是「部分更新」：空串表示「这次没带这个字段」，
 	// 于是保留原值（而不是回落成默认 expense —— 那样会把 income 账目错改成 expense）。
 	if txType := strings.TrimSpace(req.Type); txType != "" {
+		// 非法 type 直接 400（与创建同白名单）：所有汇总口径只认 expense/income
+		if !validTxTypes[txType] {
+			Error(c, http.StatusBadRequest, "type 仅支持 expense / income")
+			return
+		}
 		tx.Type = txType
 	}
 	tx.Category = strings.TrimSpace(req.Category)
@@ -1578,9 +1648,15 @@ func UpdateTransaction(c *gin.Context) {
 	if req.WishID != nil {
 		tx.WishID = req.WishID
 	}
+	// footprintUnbound：请求显式携带 footprint_id=0（*uint 非 nil 且值为 0 = 解绑旅程）。
+	// 解绑后必须跳过 autoLinkTransactionFootprint 的自动重挂 —— 否则「同城 + 旅程窗口」
+	// 规则会立刻把刚解绑的账目再挂回同一趟旅程，用户眼里等于「解绑了个寂寞」。
+	// footprint_id 为 nil（未携带）时行为不变：仍走自动对齐/挂载。
+	footprintUnbound := false
 	if req.FootprintID != nil {
 		if *req.FootprintID == 0 {
 			tx.FootprintID = nil
+			footprintUnbound = true
 		} else {
 			tx.FootprintID = req.FootprintID
 		}
@@ -1602,7 +1678,9 @@ func UpdateTransaction(c *gin.Context) {
 		tx.OccurredAt = t
 	}
 
-	autoLinkTransactionFootprint(&tx)
+	if !footprintUnbound {
+		autoLinkTransactionFootprint(&tx)
+	}
 	if clearCity {
 		// autoLink 会为已挂足迹的账目回填城市；clear_city 语义优先级最高，再次清空（契约 A）
 		tx.CityCode = ""
@@ -1685,6 +1763,9 @@ func DeleteTransaction(c *gin.Context) {
 		if tx.FootprintID != nil {
 			touchFootprintTimestamps(db.DB, *tx.FootprintID)
 		}
+		// 物理删除同样改变月度支出统计：purge 分支在下方 defer 之前就 return 了，
+		// 必须在这里单独失效，否则 /stats 缓存继续拿着旧数字。
+		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}

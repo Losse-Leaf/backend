@@ -146,7 +146,6 @@ type SiteConfig struct {
 	DefaultLocation      string `json:"default_location,omitempty"`
 	SiteDesc             string `json:"site_desc,omitempty"`
 	Initialized          bool   `gorm:"default:false" json:"initialized"`
-	MasterPasscode       string `gorm:"size:128" json:"-"`                       // 主理人记忆口令哈希
 	InitialLiquidBalance int64  `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
 
 	// 对象存储动态配置 (支持通过管理后台在线配置 Cloudflare R2 / S3 兼容存储)
@@ -207,7 +206,6 @@ type PairTicket struct {
 	PinCode        string     `gorm:"size:16;default:''" json:"-"`                // 兼容已有 SQLite 数据库中可能残留的 NOT NULL 约束，不对外暴露
 	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
 	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
-	WebToken       string     `gorm:"size:128" json:"-"`                         // 首次装帧伴生 Web 设备 Token (单次读取 BE-19)
 	ExpiresAt      time.Time  `gorm:"index;not null" json:"expires_at"`
 	Used           bool       `gorm:"index;default:false" json:"used"`
 	UsedAt         *time.Time `json:"used_at,omitempty"`

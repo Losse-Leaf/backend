@@ -164,7 +164,6 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 
 	var siteConfig models.SiteConfig
 	db.DB.Limit(1).Find(&siteConfig)
-	siteConfig.MasterPasscode = ""
 	siteConfig.R2SecretAccessKey = ""
 
 	var curatorProfile models.CuratorProfile
@@ -875,7 +874,6 @@ func pruneEmergencyCopies(dbPath string, keeping int) {
 //
 // 关键：在**副本**上执行，线上库绝不能被改动。
 // 需要清空的：
-//   - site_configs.master_passcode（主理人口令哈希，可离线爆破）
 //   - site_configs.r2_secret_access_key（R2 桶的写权限密钥，明文列）
 //   - site_configs.r2_access_key_id（配合上面的密钥即可完全控制桶）
 func sanitizeSnapshotDB(snapshotPath string) error {
@@ -886,7 +884,6 @@ func sanitizeSnapshotDB(snapshotPath string) error {
 	defer conn.Close()
 
 	stmts := []string{
-		`UPDATE site_configs SET master_passcode = ''`,
 		`UPDATE site_configs SET r2_secret_access_key = ''`,
 		`UPDATE site_configs SET r2_access_key_id = ''`,
 		`UPDATE site_configs SET r2_password = ''`,

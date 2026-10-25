@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"loose-leaf/internal/authclaim"
 	"loose-leaf/internal/backup"
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
@@ -43,25 +45,37 @@ func main() {
 		log.Println("Notice: Cloudflare R2 storage credentials not configured. Text entries & transactions will work normally.")
 	}
 
-	log.Println("SQLite Master Passcode & Trusted Device Group authentication active.")
+	log.Println("Trusted device group authentication active.")
 
 	// 2. 初始化 SQLite 数据库 (已启用 WAL 模式与连接池优化)
 	_, err := db.InitDB(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	// 本机自救：`./looseleaf --reset-passcode`
-	// 恢复脱敏备份后主密码会被清空；若配对设备也丢失，管理员将无法登录。
-	// 该命令必须在服务器 shell 上执行（等价于 README 里的 sqlite3 重置），
-	// 不接受任何网络请求，因此不会成为远程重置后门。
-	if hasArg("--reset-passcode", "-reset-passcode") {
-		if err := db.DB.Model(&models.SiteConfig{}).
-			Where("1 = 1").
-			Updates(map[string]interface{}{"initialized": false, "master_passcode": ""}).Error; err != nil {
-			log.Fatalf("重置管理员密钥失败: %v", err)
+
+	// --reopen-claim：所有设备全部丢失时的**本机自救通道**（重开首次认领入口）。
+	// 安全边界：该标志只存在于进程启动参数中，不开放任何网络入口 ——
+	// 能执行它的人必然已经物理登录服务器、可直接读写数据库文件，
+	// 因此「重开认领入口」不会扩大任何远程攻击面；远程攻击者依然碰不到
+	// 只打印在服务器标准输出上的一次性认领码。
+	// 认领入口重开后完全复用已验证安全的一次性认领码链路：
+	// 15 分钟 TTL、连续 5 次失败自动轮换（见 internal/authclaim）。
+	if hasStartupFlag("--reopen-claim") {
+		reopenClaimEntry()
+	}
+
+	// 全新实例启动时生成一次性认领码，只打印到标准输出，不落库、不写配置文件。
+	// 认领码 15 分钟内有效；进程重启会重新生成。
+	var siteCfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&siteCfg).Error; err != nil {
+		log.Printf("读取系统初始化状态失败: %v", err)
+	} else if !siteCfg.Initialized {
+		code, _, err := handlers.StartClaimCode()
+		if err != nil {
+			log.Printf("生成首次认领码失败: %v", err)
+		} else {
+			fmt.Printf("首次使用请打开 http://localhost:%s/ 并输入认领码：%s（15 分钟内有效）\n", cfg.Port, authclaim.Format(code))
 		}
-		log.Println("管理员密钥与初始化标记已重置。重启服务后可在 Web 欢迎扉页重新装帧。")
-		return
 	}
 
 	// BE-5：启动回填不再阻塞监听，改到 HTTP server 起来之后后台执行。
@@ -122,12 +136,11 @@ func main() {
 		v1.GET("/config", handlers.GetConfigV1)
 		v1.GET("/profile", handlers.GetCuratorProfile)
 
-		// 系统生命周期与初次装帧冷启动 (BE-18, BE-19)
+		// 系统生命周期与首台设备认领 (BE-18, BE-19)
 		v1.GET("/system/status", handlers.GetSystemStatus)
-		v1.POST("/system/bootstrap", handlers.BootstrapSystem)
+		v1.POST("/auth/claim", handlers.ClaimDevice)
 
-		// 欢迎扉页管理员密钥登录与设备配对握手/轮询 (公开接口 BE-18, BE-19)
-		v1.POST("/auth/verify", handlers.VerifyPasscode)
+		// 设备配对握手/轮询 (公开接口；需系统已完成首次认领)
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
 		v1.GET("/auth/pair/status", handlers.PollPairingStatus)
 		v1.GET("/auth/pair/qr", handlers.RenderPairQRCode)
@@ -312,6 +325,48 @@ func main() {
 	log.Println("Loose-Leaf server exited cleanly.")
 }
 
+// hasStartupFlag 判断启动参数中是否携带了指定标志（如 --reopen-claim）。
+// 兼容 `--flag` 与 `--flag=value` 两种写法；标志仅来自本机命令行，不构成网络入口。
+func hasStartupFlag(name string) bool {
+	for _, arg := range os.Args[1:] {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// reopenClaimEntry 把 site_configs.initialized 置回 false，重新开启首次认领入口。
+//
+// 这是「所有受信任设备全部丢失」时的自救通道：保留全部业务数据（无需删库），
+// 置回后下方原有的启动逻辑会立即生成并打印新的一次性认领码，/auth/claim 入口
+// 随之重新开放，主理人用新码认领一台新设备即可重新拿回系统控制权。
+//
+// 关键（有意设计）：本函数**只能**经由 --reopen-claim 启动标志触达 ——
+// 即仅限能在服务器上执行启动命令的物理访问者使用，不经任何网络暴露；
+// 若重开失败（读库/写库出错）直接终止启动，绝不带着「以为重开了、实际没有」
+// 的假象继续运行。
+func reopenClaimEntry() {
+	var cfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
+		log.Fatalf("--reopen-claim: 读取站点配置失败: %v", err)
+	}
+	if cfg.ID == 0 {
+		log.Println("--reopen-claim: 站点尚未初始化，首次认领入口本就开放，无需重开。")
+		return
+	}
+	if !cfg.Initialized {
+		log.Println("--reopen-claim: 首次认领入口当前已处于开放状态，无需重开。")
+		return
+	}
+	if err := db.DB.Model(&models.SiteConfig{}).
+		Where("id = ?", cfg.ID).
+		Update("initialized", false).Error; err != nil {
+		log.Fatalf("--reopen-claim: 重开认领入口失败: %v", err)
+	}
+	log.Println("已重新开启首次认领入口（--reopen-claim，业务数据全部保留），请查看下方打印的新认领码。")
+}
+
 // lifecycleGuard 为每个访问数据库的请求持有生命周期读锁。
 //
 // 恢复进行中直接 503；若恢复已开始但尚未拿到写锁（例如在等在途读写排空），
@@ -368,16 +423,4 @@ func abortRestoring(c *gin.Context) {
 		"message": "系统正在从备份恢复，读写操作暂时不可用，请稍后重试",
 		"data":    nil,
 	})
-}
-
-// hasArg 判断命令行是否包含任一目标参数（支持 --flag / -flag / --flag=true）。
-func hasArg(names ...string) bool {
-	for _, arg := range os.Args[1:] {
-		for _, name := range names {
-			if arg == name || strings.HasPrefix(arg, name+"=") {
-				return true
-			}
-		}
-	}
-	return false
 }

@@ -154,6 +154,14 @@ func UpdateCategory(c *gin.Context) {
 	if req.RenameRecords != nil {
 		shouldRename = *req.RenameRecords
 	}
+	// gear 分类的级联重命名要读-改-写档案的 EDCGear JSON 列：
+	// 先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
+	// 与 CreateTransaction / SellGearAsset 对齐），避免「事务内取锁」
+	// 与其它器物写操作互等 SQLite 唯一写者名额的锁序反转死锁。
+	if item.Scope == "gear" {
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
+	}
 	if err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -181,9 +189,8 @@ func cascadeRenameCategoryRecords(tx *gorm.DB, scope, oldName, newName string) e
 	case "project":
 		return tx.Model(&models.Project{}).Where("category = ?", oldName).Update("category", newName).Error
 	case "gear":
-		// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
+		// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)：调用方（UpdateCategory）
+		// 已在事务外持有 profileGearMu（锁序 profileGearMu → DB）。
 		var profile models.CuratorProfile
 		if err := tx.First(&profile).Error; err != nil {
 			return err

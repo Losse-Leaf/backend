@@ -11,9 +11,8 @@ import (
 //
 // 背景：原先把 VACUUM 出来的**原始数据库**直接打进 ZIP，
 // 而脱敏只作用于 metadata/data.json 那份镜像 ——
-// 于是 `site_configs.r2_secret_access_key`（明文列）与主理人口令哈希
-// 原样进了备份包。拿到 ZIP = 同时拿到全部私人内容 + R2 桶写权限密钥
-// + 可离线爆破的口令哈希。
+// 于是 `site_configs.r2_secret_access_key`（明文列）原样进了备份包。
+// 拿到 ZIP = 同时拿到全部私人内容 + R2 桶写权限密钥。
 func TestSanitizeSnapshotDBClearsCredentials(t *testing.T) {
 	dir := t.TempDir()
 	snapshotPath := filepath.Join(dir, "snapshot.db")
@@ -26,7 +25,6 @@ func TestSanitizeSnapshotDBClearsCredentials(t *testing.T) {
 	_, err = conn.Exec(`CREATE TABLE site_configs (
 		id integer primary key,
 		curator_name text,
-		master_passcode text,
 		r2_access_key_id text,
 		r2_secret_access_key text,
 		r2_password text
@@ -35,8 +33,8 @@ func TestSanitizeSnapshotDBClearsCredentials(t *testing.T) {
 		t.Fatalf("建表失败: %v", err)
 	}
 	_, err = conn.Exec(`INSERT INTO site_configs
-		(id, curator_name, master_passcode, r2_access_key_id, r2_secret_access_key, r2_password)
-		VALUES (1, '迟暮', '$2a$10$hashhashhash', 'AKIAEXAMPLE', 'super-secret-key', 'pw')`)
+		(id, curator_name, r2_access_key_id, r2_secret_access_key, r2_password)
+		VALUES (1, '迟暮', 'AKIAEXAMPLE', 'super-secret-key', 'pw')`)
 	if err != nil {
 		t.Fatalf("插入数据失败: %v", err)
 	}
@@ -54,15 +52,12 @@ func TestSanitizeSnapshotDBClearsCredentials(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	var masterPasscode, accessKeyID, secretKey, password, curator string
-	row := conn2.QueryRow(`SELECT master_passcode, r2_access_key_id, r2_secret_access_key, r2_password, curator_name FROM site_configs WHERE id = 1`)
-	if err := row.Scan(&masterPasscode, &accessKeyID, &secretKey, &password, &curator); err != nil {
+	var accessKeyID, secretKey, password, curator string
+	row := conn2.QueryRow(`SELECT r2_access_key_id, r2_secret_access_key, r2_password, curator_name FROM site_configs WHERE id = 1`)
+	if err := row.Scan(&accessKeyID, &secretKey, &password, &curator); err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}
 
-	if masterPasscode != "" {
-		t.Errorf("主理人口令哈希必须清空，实际 %q", masterPasscode)
-	}
 	if secretKey != "" {
 		t.Errorf("R2 密钥必须清空，实际 %q", secretKey)
 	}

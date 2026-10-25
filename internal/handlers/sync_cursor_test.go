@@ -60,7 +60,7 @@ func TestSyncCursorHeaderIsAuthoritativeAndInclusive(t *testing.T) {
 
 	// 建一条记录
 	body, _ := json.Marshal(CreateEntryRequest{
-		Type:       "thought",
+		Type:       "life",
 		Title:      "游标记录",
 		Content:    "内容",
 		OccurredAt: "2026-10-10T08:00:00Z",
@@ -116,7 +116,7 @@ func TestSyncCursorCoversSoftDeletedRecords(t *testing.T) {
 	r.DELETE("/api/v1/entries/:id", DeleteLifeEntry)
 
 	body, _ := json.Marshal(CreateEntryRequest{
-		Type:       "thought",
+		Type:       "life",
 		Title:      "将被软删除",
 		Content:    "内容",
 		OccurredAt: "2026-10-10T08:00:00Z",

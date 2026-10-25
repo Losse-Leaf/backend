@@ -12,7 +12,6 @@ import (
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
-	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -29,142 +28,9 @@ func GetSystemStatus(c *gin.Context) {
 	}
 
 	Success(c, gin.H{
-		"initialized":      cfg.Initialized,
-		"has_passcode_set": strings.TrimSpace(cfg.MasterPasscode) != "",
-		"site_name":        siteName,
-		"curator_name":     cfg.CuratorName,
-	})
-}
-
-type BootstrapRequest struct {
-	CuratorName     string `json:"curator_name" binding:"required"`
-	Location        string `json:"location"`
-	MasterPasscode  string `json:"master_passcode"`
-	ConfirmPasscode string `json:"confirm_passcode"`
-	HubURL          string `json:"hub_url"`
-}
-
-func BootstrapSystem(c *gin.Context) {
-	var cfg models.SiteConfig
-	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "读取站点初始化状态失败")
-		return
-	}
-
-	if cfg.Initialized {
-		if strings.TrimSpace(cfg.MasterPasscode) != "" {
-			Error(c, http.StatusForbidden, "自留地已完成初次装帧，禁止二次重复初始化")
-			return
-		}
-		// 脱敏恢复后的空密码不是首次初始化，必须由仍有效的配对设备授权。
-		if !middleware.IsAdmin(c) {
-			Error(c, http.StatusUnauthorized, "恢复后重设管理员密钥需要有效的已配对设备凭据")
-			return
-		}
-	}
-
-	var req BootstrapRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "缺少必要的主理人初始信息")
-		return
-	}
-
-	masterPasscode := strings.TrimSpace(req.MasterPasscode)
-	confirmPasscode := strings.TrimSpace(req.ConfirmPasscode)
-	if masterPasscode == "" {
-		Error(c, http.StatusBadRequest, "请设定管理员密码")
-		return
-	}
-	if masterPasscode != confirmPasscode {
-		Error(c, http.StatusBadRequest, "两次输入的密码不一致")
-		return
-	}
-
-	// 若尚未完成首台设备配对激活 (Initialized == false) 但已设定过密码：
-	// 仅允许使用相同密码继续装帧与签发新配对票据，禁止外部攻击者恶意覆盖
-	if strings.TrimSpace(cfg.MasterPasscode) != "" {
-		if !CheckPasscode(masterPasscode, cfg.MasterPasscode) {
-			Error(c, http.StatusForbidden, "自留地已设定管理员密钥，配对激活前禁止覆盖初始化")
-			return
-		}
-	}
-
-	curatorName := strings.TrimSpace(req.CuratorName)
-	location := strings.TrimSpace(req.Location)
-
-	// 1. 保存 SiteConfig (此时保持 Initialized = false，等待首台设备配对激活 BE-19)
-	if cfg.ID == 0 {
-		db.DB.FirstOrCreate(&cfg)
-	}
-	if cfg.SiteName == "" {
-		cfg.SiteName = "散页 · 个人生活志"
-	}
-	cfg.CuratorName = curatorName
-	cfg.DefaultLocation = location
-	hashedPasscode, err := HashPasscode(masterPasscode)
-	if err != nil {
-		Error(c, http.StatusInternalServerError, "加密管理员密钥失败: "+err.Error())
-		return
-	}
-	cfg.MasterPasscode = hashedPasscode
-	// 关键（发现 4a）：不再无条件把 Initialized 打回 false。
-	// 冷启动路径它本来就是 false（无操作）；而「恢复脱敏备份后重新设密」路径
-	// initialized 已是 true —— 若打回 false，全部已配对设备的凭证会被
-	// AdminAuthRequired 拒之门外（未初始化时只放行 bootstrap/pair 路径），
-	// 主人只能重新走一遍配对才能进门。
-	cfg.UpdatedAt = time.Now()
-	if err := db.DB.Save(&cfg).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "保存站点配置失败: "+err.Error())
-		return
-	}
-
-	// 2. 初始化 CuratorProfile (未填写的字段保持纯净空字符串或空数组 RC-52)
-	var profile models.CuratorProfile
-	db.DB.FirstOrCreate(&profile)
-	profile.Name = curatorName
-	profile.Location = location
-	profile.CurrentCity = location
-	if strings.TrimSpace(profile.SocialLinks) == "" {
-		profile.SocialLinks = "{}"
-	}
-	if strings.TrimSpace(profile.EDCGear) == "" {
-		profile.EDCGear = "[]"
-	}
-	profile.UpdatedAt = time.Now()
-	db.DB.Save(&profile)
-
-	// 3. 结合前端上报的 hub_url 签发 5 分钟有效的首台设备配对工单 (BE-19, BE-20)
-	smartHubURL, candidates := ResolveSmartHubURL(req.HubURL, c)
-
-	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
-	expiresIn := 300 // 5 分钟
-	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
-
-	ticket := models.PairTicket{
-		Ticket:    ticketStr,
-		PinCode:   "",
-		HubURL:    smartHubURL,
-		ExpiresAt: expiresAt,
-		Used:      false,
-	}
-	if err := db.DB.Create(&ticket).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "生成配对工单失败: "+err.Error())
-		return
-	}
-
-	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", smartHubURL, ticketStr)
-	qrDataURL := generateQRCodeDataURL(qrPayload)
-
-	Success(c, gin.H{
-		"curator_name":       curatorName,
-		"location":           location,
-		"ticket":             ticketStr,
-		"hub_url":            smartHubURL,
-		"qr_payload":         qrPayload,
-		"qr_code_data_url":   qrDataURL,
-		"candidates":         candidates,
-		"expires_at":         expiresAt.Format(time.RFC3339),
-		"expires_in_seconds": expiresIn,
+		"initialized":  cfg.Initialized,
+		"site_name":    siteName,
+		"curator_name": cfg.CuratorName,
 	})
 }
 

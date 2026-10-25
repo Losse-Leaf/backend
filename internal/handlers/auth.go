@@ -2,9 +2,9 @@ package handlers
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image/color"
 	"net/http"
@@ -18,7 +18,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	qrcode "github.com/skip2/go-qrcode"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -180,6 +179,12 @@ func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window tim
 	return true
 }
 
+// errPairTicketRedeemed 并发窗口内配对工单已被另一请求抢先核销（双花）
+var errPairTicketRedeemed = errors.New("配对工单已被核销")
+
+// errLastActiveDevice 最后一台 active 设备不可吊销（防全端锁死）
+var errLastActiveDevice = errors.New("这是最后一台受信任设备，请先配对一台新设备再吊销最后一台")
+
 // ConfirmPairing 新设备通过扫码或配对深链提交 Ticket 完成握手，获取永久 Device Token；
 // 若当前系统尚未初始化 (initialized == false)，在同一事务中将 initialized 置为 true (BE-19)
 func ConfirmPairing(c *gin.Context) {
@@ -197,6 +202,17 @@ func ConfirmPairing(c *gin.Context) {
 	ticketVal := strings.TrimSpace(req.Ticket)
 	if ticketVal == "" {
 		Error(c, http.StatusBadRequest, "必须提供配对工单 ticket 进行握手验证")
+		return
+	}
+
+	// 首台设备必须先通过一次性认领码认领；未初始化时配对入口保持关闭。
+	var cfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "读取系统初始化状态失败")
+		return
+	}
+	if cfg.ID == 0 || !cfg.Initialized {
+		Error(c, http.StatusForbidden, "系统尚未完成首次认领，请先使用启动时打印的认领码认领首台设备")
 		return
 	}
 
@@ -238,52 +254,32 @@ func ConfirmPairing(c *gin.Context) {
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&device).Error; err != nil {
-			return err
+		// 事务内**条件核销**：UPDATE pair_tickets SET used=1, ... WHERE ticket=? AND used=0。
+		// 原先「事务外读 ticket.Used 再无核销条件地 Save」存在 check-then-act 并发窗口，
+		// 两台设备可各持同一工单同时握手成功（工单双花）。这里以受影响行数做原子裁决：
+		// 抢不到核销权（RowsAffected != 1）的请求整体回滚，不创建设备。
+		res := tx.Model(&models.PairTicket{}).
+			Where("ticket = ? AND used = ?", ticketVal, false).
+			Updates(map[string]any{
+				"used":             true,
+				"used_at":          now,
+				"paired_device_id": device.DeviceID,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errPairTicketRedeemed
 		}
 
-		var cfg models.SiteConfig
-		tx.Limit(1).Find(&cfg)
-		if cfg.ID == 0 {
-			tx.FirstOrCreate(&cfg)
-		}
-
-		webCompanionToken := ""
-		// 若系统尚未完成首次装帧激活，在此事务中正式将 initialized 置为 true，并为发起装帧的浏览器签发伴生令牌 (BE-19)
-		if !cfg.Initialized {
-			if platform != "web" {
-				webCompanionToken = fmt.Sprintf("lldt_%s", generateRandomHex(16))
-				webDev := models.Device{
-					DeviceID:     fmt.Sprintf("dev_web_%s_%s", dateTag, generateRandomHex(2)),
-					Name:         fmt.Sprintf("Web 浏览器 · 伴生授权 (%s)", deviceName),
-					Platform:     "web",
-					TokenHash:    middleware.HashToken(webCompanionToken),
-					Status:       "active",
-					PairedAt:     now,
-					LastActiveAt: now,
-				}
-				if err := tx.Create(&webDev).Error; err != nil {
-					return err
-				}
-			} else {
-				webCompanionToken = rawDeviceToken
-			}
-
-			cfg.Initialized = true
-			cfg.UpdatedAt = now
-			if err := tx.Save(&cfg).Error; err != nil {
-				return err
-			}
-		}
-
-		ticket.Used = true
-		ticket.UsedAt = &now
-		ticket.PairedDeviceID = device.DeviceID
-		ticket.WebToken = webCompanionToken
-		return tx.Save(&ticket).Error
+		return tx.Create(&device).Error
 	})
 
 	if err != nil {
+		if errors.Is(err, errPairTicketRedeemed) {
+			Error(c, http.StatusBadRequest, errPairTicketRedeemed.Error())
+			return
+		}
 		Error(c, http.StatusInternalServerError, "保存配对设备记录失败: "+err.Error())
 		return
 	}
@@ -352,20 +348,10 @@ func PollPairingStatus(c *gin.Context) {
 			}
 		}
 
-		webToken := ticket.WebToken
-		if webToken != "" {
-			// 单次读取后立即清除数据库中的伴生明文令牌，防止重放泄露 (BE-19)
-			db.DB.Model(&ticket).Update("web_token", "")
-			// MOB-P1-69：伴生令牌同时下发 HttpOnly 会话 Cookie ——
-			// 浏览器端从此不必把令牌写进 localStorage
-			middleware.SetSessionCookie(c, webToken)
-		}
-
 		Success(c, gin.H{
 			"status":      "paired",
 			"initialized": cfg.Initialized,
 			"device":      devInfo,
-			"web_token":   webToken,
 		})
 		return
 	}
@@ -410,10 +396,46 @@ func RevokeDevice(c *gin.Context) {
 		return
 	}
 
-	device.Status = "revoked"
-	if err := db.DB.Save(&device).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "吊销设备失败: "+err.Error())
-		return
+	// 关键：吊销的是最后一台 active 设备时必须拒绝 —— 否则系统里再无任何有效凭据，
+	// 主人将被**永久锁死**在门外（启动打印的一次性认领码早已消费、入口永久关闭）。
+	// 吊销非最后一台（包括当前请求所用的设备）仍允许：换机后主动吊销旧机是正常操作。
+	// 锁死后的自救通道：可由服务器 shell 以 `--reopen-claim` 启动标志重开认领入口
+	//（见 main.go：业务数据全部保留并重印一次性认领码）；除此之外**不提供任何网络旁路**。
+	//
+	// 关键（并发，第三轮 P1）：拒绝裁决必须在**同一写事务**内完成「计数 + 改写」——
+	// 原先在事务外先 Count 再 Save 是 check-then-act：仅剩两台 active 时，
+	// 两台并发吊销都能通过「count > 1」检查后各自写入 revoked，把 active 设备清空。
+	// SQLite 单写者保证下面这条条件 UPDATE 的子查询计数与改写原子；
+	// 目标已是 revoked 时跳过（幂等放行，重复吊销不报错）。
+	if device.Status == "active" {
+		err := db.DB.Transaction(func(tx *gorm.DB) error {
+			res := tx.Model(&models.Device{}).
+				Where("id = ? AND status = ? AND (SELECT COUNT(*) FROM devices AS d WHERE d.status = 'active') > 1", device.ID, "active").
+				Update("status", "revoked")
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 1 {
+				return nil
+			}
+			// 没抢到改写权：要么只剩这一台（拒绝），要么刚好被并发请求吊销（幂等成功）
+			var cur models.Device
+			if err := tx.Where("id = ?", device.ID).First(&cur).Error; err != nil {
+				return err
+			}
+			if cur.Status != "active" {
+				return nil
+			}
+			return errLastActiveDevice
+		})
+		if err != nil {
+			if errors.Is(err, errLastActiveDevice) {
+				Error(c, http.StatusBadRequest, errLastActiveDevice.Error())
+				return
+			}
+			Error(c, http.StatusInternalServerError, "吊销设备失败: "+err.Error())
+			return
+		}
 	}
 
 	Success(c, gin.H{
@@ -468,158 +490,6 @@ func UpdateDeviceName(c *gin.Context) {
 	}
 
 	Success(c, device)
-}
-
-// ==========================================
-// 5. 日常欢迎扉页：输入管理员密钥以主人身份进入 (Verify Admin Key BE-18)
-// ==========================================
-
-type VerifyPasscodeRequest struct {
-	Passcode    string `json:"passcode" binding:"required"`
-	DeviceName  string `json:"device_name"`
-	Platform    string `json:"platform"`
-	DeviceModel string `json:"device_model"`
-}
-
-// HashPasscode 使用 bcrypt 进行加盐慢哈希加密 (杜绝彩虹表与硬件离线爆破)
-func HashPasscode(passcode string) (string, error) {
-	bytes, err := bcrypt.GenerateFromPassword([]byte(passcode), bcrypt.DefaultCost)
-	return string(bytes), err
-}
-
-// CheckPasscode 校验密码：优先匹配 bcrypt，并向下兼容旧有裸 SHA-256 哈希
-func CheckPasscode(passcode, hashed string) bool {
-	if strings.HasPrefix(hashed, "$2a$") || strings.HasPrefix(hashed, "$2b$") {
-		return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(passcode)) == nil
-	}
-	inputHash := middleware.HashToken(passcode)
-	return subtle.ConstantTimeCompare([]byte(inputHash), []byte(hashed)) == 1
-}
-
-var verifyPasscodeLimiter = &ipAttemptTracker{
-	attempts: make(map[string][]time.Time),
-}
-
-// VerifyPasscode 校验 site_configs.master_passcode 的哈希（bcrypt / SHA-256），限速防爆破并签发设备凭据 (BE-18)
-func VerifyPasscode(c *gin.Context) {
-	if !verifyPasscodeLimiter.checkRateLimit(c.ClientIP(), 5, time.Minute) {
-		Error(c, http.StatusTooManyRequests, "密码尝试过于频繁，请稍后再试")
-		return
-	}
-
-	var req VerifyPasscodeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "请输入管理员密钥")
-		return
-	}
-
-	inputPasscode := strings.TrimSpace(req.Passcode)
-	if inputPasscode == "" {
-		Error(c, http.StatusBadRequest, "管理员密钥不能为空")
-		return
-	}
-
-	var cfg models.SiteConfig
-	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 || strings.TrimSpace(cfg.MasterPasscode) == "" {
-		Error(c, http.StatusUnauthorized, "系统尚未完成首次装帧或未设定管理员密钥")
-		return
-	}
-
-	if !CheckPasscode(inputPasscode, cfg.MasterPasscode) {
-		Error(c, http.StatusUnauthorized, "管理员密钥不正确，请重新输入")
-		return
-	}
-
-	// 渐进式平滑升级：旧有 SHA-256 密码在首次验证成功后自动升级为 bcrypt 加盐慢哈希
-	if !strings.HasPrefix(cfg.MasterPasscode, "$2a$") && !strings.HasPrefix(cfg.MasterPasscode, "$2b$") {
-		if newBcryptHash, err := HashPasscode(inputPasscode); err == nil {
-			cfg.MasterPasscode = newBcryptHash
-			db.DB.Model(&cfg).Update("master_passcode", newBcryptHash)
-		}
-	}
-
-	now := time.Now()
-	rawToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
-	tokenHash := middleware.HashToken(rawToken)
-
-	platform := strings.ToLower(strings.TrimSpace(req.Platform))
-	if platform == "" {
-		platform = "web"
-	}
-
-	deviceName := strings.TrimSpace(req.DeviceName)
-	if deviceName == "" {
-		switch platform {
-		case "macos":
-			deviceName = "Mac · 主人密钥登录"
-		case "ios":
-			deviceName = "iOS 设备 · 主人密钥登录"
-		case "android":
-			deviceName = "Android 设备 · 主人密钥登录"
-		default:
-			deviceName = "Web 浏览器 · 主人密钥登录"
-		}
-	}
-
-	// 检查是否已存在同平台同名的设备记录，避免同一客户端重复登录无限累积记录
-	var existingDevice models.Device
-	if err := db.DB.Where("platform = ? AND name = ?", platform, deviceName).Limit(1).Find(&existingDevice).Error; err == nil && existingDevice.ID != 0 {
-		existingDevice.TokenHash = tokenHash
-		existingDevice.Status = "active"
-		existingDevice.LastActiveAt = now
-		if req.DeviceModel != "" {
-			existingDevice.DeviceModel = strings.TrimSpace(req.DeviceModel)
-		}
-		if err := db.DB.Save(&existingDevice).Error; err != nil {
-			Error(c, http.StatusInternalServerError, "更新设备凭证失败: "+err.Error())
-			return
-		}
-		// MOB-P1-69：同步下发 HttpOnly 会话 Cookie（浏览器端不再需要把令牌落盘）
-		middleware.SetSessionCookie(c, rawToken)
-
-		c.JSON(http.StatusOK, Response{
-			Code:    http.StatusOK,
-			Message: "密钥验证通过，已授权以主人身份进入",
-			Data: gin.H{
-				"token":       rawToken,
-				"device_id":   existingDevice.DeviceID,
-				"device_name": existingDevice.Name,
-				"platform":    existingDevice.Platform,
-			},
-		})
-		return
-	}
-
-	dateTag := now.Format("20060102")
-	deviceID := fmt.Sprintf("dev_%s_%s_%s", platform, dateTag, generateRandomHex(2))
-	device := models.Device{
-		DeviceID:     deviceID,
-		Name:         deviceName,
-		Platform:     platform,
-		DeviceModel:  strings.TrimSpace(req.DeviceModel),
-		TokenHash:    tokenHash,
-		Status:       "active",
-		PairedAt:     now,
-		LastActiveAt: now,
-	}
-	if err := db.DB.Create(&device).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "签发设备凭证失败: "+err.Error())
-		return
-	}
-
-	// MOB-P1-69：同步下发 HttpOnly 会话 Cookie
-	middleware.SetSessionCookie(c, rawToken)
-
-	c.JSON(http.StatusOK, Response{
-		Code:    http.StatusOK,
-		Message: "密钥验证通过，已授权以主人身份进入",
-		Data: gin.H{
-			"token":       rawToken,
-			"device_id":   deviceID,
-			"device_name": deviceName,
-			"platform":    platform,
-		},
-	})
 }
 
 // ==========================================

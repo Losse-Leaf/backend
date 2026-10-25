@@ -87,23 +87,6 @@ func ClearSessionCookie(c *gin.Context) {
 	})
 }
 
-// isSystemInitialized 检查系统是否已完成初次装帧并绑定激活首台设备 (BE-18, BE-19)
-func isSystemInitialized() bool {
-	if db.DB == nil {
-		return false
-	}
-	var cfg models.SiteConfig
-	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 {
-		return false
-	}
-	return cfg.Initialized
-}
-
-// isBootstrapOrPairingPath 判断当前请求是否为冷启动装帧或配对必需路径 (BE-18)
-func isBootstrapOrPairingPath(path string) bool {
-	return path == "/api/v1/system/status" || path == "/api/v1/system/bootstrap" || strings.HasPrefix(path, "/api/v1/auth/pair/")
-}
-
 // IsAdmin 判定当前请求是否具备主理人权限 (仅認 devices 表中 status = 'active' 的有效设备凭证 BE-18)
 func IsAdmin(c *gin.Context) bool {
 	if authType, exists := c.Get("auth_type"); exists && authType == "device" {
@@ -126,7 +109,7 @@ func IsAdmin(c *gin.Context) bool {
 
 // AdminAuthRequired 管理员写操作与私密接口鉴权中间件 (BE-18)
 // 唯一凭证源：校验 SQLite devices 表中处于 active 状态的设备子钥匙 (token_hash)
-// 若系统尚未初始化 (initialized == false)，仅放行 /api/v1/system/* 与 /api/v1/auth/pair/* 等冷启动必需接口，严禁免密放行常规写接口
+// 未初始化时不存在任何免密旁路；首台设备只能通过公开的 /api/v1/auth/claim 认领。
 func AdminAuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := ExtractToken(c)
@@ -149,13 +132,6 @@ func AdminAuthRequired() gin.HandlerFunc {
 				c.Next()
 				return
 			}
-		}
-
-		// 若系统未初始化且请求属于冷启动装帧/配对路径，允许通行以完成首台设备引导 (BE-18)
-		if !isSystemInitialized() && isBootstrapOrPairingPath(c.Request.URL.Path) {
-			c.Set("auth_type", "bootstrap_open")
-			c.Next()
-			return
 		}
 
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{

@@ -241,7 +241,7 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 
 	// 1. Create initial entry
 	req1 := CreateEntryRequest{
-		Type:       "thought",
+		Type:       "life",
 		Title:      "First Entry",
 		Content:    "Content 1",
 		OccurredAt: "2026-10-10T08:00:00Z",
@@ -278,7 +278,7 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 
 	// 4. Create second entry
 	req2 := CreateEntryRequest{
-		Type:       "thought",
+		Type:       "life",
 		Title:      "Second Entry",
 		Content:    "Content 2",
 		OccurredAt: "2026-10-10T09:00:00Z",

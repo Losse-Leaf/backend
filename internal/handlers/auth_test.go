@@ -317,42 +317,5 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("9. VerifyPasscode with macos platform", func(t *testing.T) {
-		var cfg models.SiteConfig
-		db.DB.FirstOrCreate(&cfg)
-		hash, _ := HashPasscode("master-password-123")
-		cfg.MasterPasscode = hash
-		db.DB.Save(&cfg)
-
-		r.POST("/api/v1/auth/verify", VerifyPasscode)
-		verifyBody, _ := json.Marshal(map[string]string{
-			"passcode":     "master-password-123",
-			"device_name":  "MacBook Air · macOS",
-			"platform":     "macos",
-			"device_model": "Mac",
-		})
-		vReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/verify", bytes.NewReader(verifyBody))
-		vReq.Header.Set("Content-Type", "application/json")
-		vW := httptest.NewRecorder()
-		r.ServeHTTP(vW, vReq)
-		if vW.Code != http.StatusOK {
-			t.Fatalf("expected 200 on verify with macos platform, got %d: %s", vW.Code, vW.Body.String())
-		}
-		var vRes struct {
-			Data struct {
-				DeviceID   string `json:"device_id"`
-				DeviceName string `json:"device_name"`
-				Platform   string `json:"platform"`
-			} `json:"data"`
-		}
-		_ = json.Unmarshal(vW.Body.Bytes(), &vRes)
-		if !strings.HasPrefix(vRes.Data.DeviceID, "dev_macos_") {
-			t.Fatalf("expected dev_macos_ prefix, got %s", vRes.Data.DeviceID)
-		}
-		if vRes.Data.Platform != "macos" {
-			t.Fatalf("expected macos platform, got %s", vRes.Data.Platform)
-		}
-	})
-
 	_ = deviceToken
 }

@@ -19,6 +19,45 @@ var validCategoryScopes = map[string]bool{
 	"project": true,
 }
 
+// transactionCategoryAllowed 账目分类字典收口（表单契约修复）：
+// category 必须真实存在于有效字典，杜绝「income+餐饮」这类自由文本错挂
+// 让分类视角与改名级联（cascadeRenameCategoryRecords）永久漂移。
+//
+// 有效字典的口径与 GetCategories 的兜底完全一致：
+//   - expense 账单按 **expense ∪ gear 并集** —— 器物联动（AddGearAsset 的自动账单）
+//     直接把 gear scope 的分类写进账单 Category，四端从设备表单带出的分类属 gear scope；
+//   - income 账单按 income scope（器物转卖回血固定用 income 内建的「二手回血」）；
+//   - 某 scope 在库里没有行时，回落 DefaultCategoriesMap 的内建默认列表
+//     （GetCategories 对空 scope 的既有兜底口径）。
+func transactionCategoryAllowed(txType, category string) bool {
+	name := strings.TrimSpace(category)
+	if name == "" {
+		return false
+	}
+	scopes := []string{"expense", "gear"}
+	if txType == "income" {
+		scopes = []string{"income"}
+	}
+	for _, scope := range scopes {
+		var rowCount int64
+		db.DB.Model(&models.CategoryOption{}).Where("scope = ?", scope).Count(&rowCount)
+		if rowCount == 0 {
+			for _, def := range db.DefaultCategoriesMap[scope] {
+				if def == name {
+					return true
+				}
+			}
+			continue
+		}
+		var hit int64
+		db.DB.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", scope, name).Count(&hit)
+		if hit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // GetCategories 获取分类字典列表 (支持 ?scope= 过滤，同时返回列表和按 scope 分组的字典)
 func GetCategories(c *gin.Context) {
 	scope := strings.TrimSpace(c.Query("scope"))

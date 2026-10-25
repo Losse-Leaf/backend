@@ -403,6 +403,23 @@ func AddGearAsset(c *gin.Context) {
 		return
 	}
 
+	// 设备价格不能为负（兜底校验修复）：负价格会污染在用固资价值（联动流水本身有 >0 保护）
+	if req.PriceCents < 0 {
+		Error(c, http.StatusBadRequest, "设备价格不能为负数")
+		return
+	}
+	// 分期参数兜底校验（与记账入口同口径）：期数上限、渠道真实存在。
+	if req.IsInstallment {
+		if req.InstallmentMonths > installmentMonthsLimit {
+			Error(c, http.StatusBadRequest, "分期期数上限为 60 期")
+			return
+		}
+		if !InstallmentChannelExists(nil, req.InstallmentChannelCode) {
+			Error(c, http.StatusBadRequest, "分期渠道不存在")
+			return
+		}
+	}
+
 	var profile models.CuratorProfile
 	if err := db.DB.First(&profile).Error; err != nil {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")

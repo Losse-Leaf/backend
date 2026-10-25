@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"loose-leaf/internal/db"
-	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
@@ -237,8 +236,8 @@ func TestLifeEntryTypeWhitelist(t *testing.T) {
 }
 
 func TestWishKindStatusWhitelist(t *testing.T) {
+	// setupContractRouter 已注册 POST /wishes / PUT /wishes/:id
 	r, token := setupContractRouter(t)
-	r.POST("/api/v1/wishes", middleware.AdminAuthRequired(), CreateWish)
 
 	// 非法 kind 创建 → 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/wishes", token, map[string]any{

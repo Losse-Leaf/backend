@@ -431,6 +431,21 @@ type UpdateFootprintRequest struct {
 	ClearAttachments bool `json:"clear_attachments"`
 }
 
+// normalizeFootprintCity 足迹城市归一（兜底校验修复）：
+// 足迹 city_code 原先只 trim 不清洗，任意伪 code 落库后城市图谱按 code 分组、
+// 省份抽屉按前缀 LIKE 都会碎片化，账目自动挂载的同城匹配也永久失配。
+// 这里统一走 ResolveCityCodeAndName（非法 code 清空、纯文本反查回字典），
+// 且 code 命中国标字典时以字典全称为准 —— 客户端自带的矛盾城市名不落库。
+func normalizeFootprintCity(cityCode, cityName string) (string, string) {
+	code, name, _ := ResolveCityCodeAndName(cityCode, cityName, "")
+	if code != "" {
+		if standardName, ok := CodeToCityName[code]; ok {
+			name = standardName
+		}
+	}
+	return code, name
+}
+
 // expandFootprintDateRange 当新的动态发生日期超出当前旅程起止范围（跨天）时自动扩展旅程起止日期
 func expandFootprintDateRange(fp *models.Footprint, t time.Time) bool {
 	if fp == nil || t.IsZero() {
@@ -856,6 +871,8 @@ func CreateFootprint(c *gin.Context) {
 
 	cityCode := strings.TrimSpace(req.CityCode)
 	cityName := strings.TrimSpace(req.CityName)
+	// 足迹城市统一过国标字典（兜底校验修复），名称与字典冲突时以字典全称为准
+	cityCode, cityName = normalizeFootprintCity(cityCode, cityName)
 	title := strings.TrimSpace(req.Title)
 	note := strings.TrimSpace(req.Note)
 	lifeEntryID := req.LifeEntryID
@@ -1031,6 +1048,10 @@ func UpdateFootprint(c *gin.Context) {
 	if req.CityName != "" {
 		footprint.CityName = strings.TrimSpace(req.CityName)
 	}
+	// 城市字段有变动时统一过国标字典（兜底校验修复，与创建同口径）
+	if req.CityCode != "" || req.CityName != "" {
+		footprint.CityCode, footprint.CityName = normalizeFootprintCity(footprint.CityCode, footprint.CityName)
+	}
 	cityChanged := footprint.CityCode != oldCityCode || footprint.CityName != oldCityName
 	if hasJSONValue(rawKeys, "title") {
 		footprint.Title = strings.TrimSpace(req.Title)
@@ -1056,6 +1077,13 @@ func UpdateFootprint(c *gin.Context) {
 		footprint.DepartedAt = &t
 	} else if hasJSONValue(rawKeys, "departed_at") {
 		footprint.DepartedAt = nil
+	}
+	// 返程早于到访的矛盾载荷（兜底校验修复）：与 CreateFootprint 同口径自动交换，
+	// 不再原样落库 —— 倒挂旅程会让展示与 expandFootprintDateRange 扩展逻辑错乱。
+	if footprint.DepartedAt != nil && !footprint.DepartedAt.IsZero() && footprint.DepartedAt.Before(footprint.VisitedAt) {
+		swappedVisited := footprint.VisitedAt
+		footprint.VisitedAt = *footprint.DepartedAt
+		footprint.DepartedAt = &swappedVisited
 	}
 	if hasJSONValue(rawKeys, "note") {
 		footprint.Note = strings.TrimSpace(req.Note)

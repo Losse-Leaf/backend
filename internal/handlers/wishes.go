@@ -29,9 +29,9 @@ var validWishKinds = map[string]bool{
 }
 
 var validWishStatuses = map[string]bool{
-	"wanting":     true,
-	"fulfilled":   true,
-	"shelved":     true,
+	"wanting":      true,
+	"fulfilled":    true,
+	"shelved":      true,
 	"relinquished": true,
 }
 
@@ -305,6 +305,12 @@ func CreateWish(c *gin.Context) {
 		return
 	}
 
+	// 预算不能为负（兜底校验修复）：负预算会污染心愿成本口径
+	if req.Budget < 0 {
+		Error(c, http.StatusBadRequest, "预算不能为负数")
+		return
+	}
+
 	wish := models.Wish{
 		Title:      strings.TrimSpace(req.Title),
 		Kind:       wishKind,
@@ -437,11 +443,20 @@ func UpdateWish(c *gin.Context) {
 	if hasJSONValue(rawKeys, "city_code") && req.CityCode == "" {
 		wish.CityName = ""
 	}
-	// 关键：预算要能改成 0；null 保持原值。
+	// 关键：预算要能改成 0；null 保持原值；负数直接 400（兜底校验修复）。
 	if req.Budget != 0 || hasJSONValue(rawKeys, "budget") {
+		if req.Budget < 0 {
+			Error(c, http.StatusBadRequest, "预算不能为负数")
+			return
+		}
 		wish.Budget = req.Budget
 	}
+	// 实际花费要能改成 0；null 保持原值；负数直接 400（兜底校验修复）。
 	if req.ActualCost != nil {
+		if *req.ActualCost < 0 {
+			Error(c, http.StatusBadRequest, "实际花费不能为负数")
+			return
+		}
 		wish.ActualCost = *req.ActualCost
 	}
 	if req.Status != "" {
@@ -607,6 +622,32 @@ func ResolveWish(c *gin.Context) {
 		return
 	}
 
+	// 实际花费不能为负（兜底校验修复）：负数会被静默落库成负 ActualCost，
+	// 且不满足建流水条件（>0）——「归册成功却无流水」的静默分叉。
+	if req.ActualCost < 0 {
+		Error(c, http.StatusBadRequest, "实际花费不能为负数")
+		return
+	}
+
+	// 重复归册守卫（兜底校验修复）：ResolveWish 原先不检查当前状态，
+	// 已 fulfilled 的心愿再归册一次会再建一笔流水/再建 gear/再建散页 —— 重复负债。
+	if wish.Status == "fulfilled" {
+		Error(c, http.StatusBadRequest, "该心愿已归册，不能重复归册")
+		return
+	}
+
+	// 分期参数兜底校验（与记账入口同口径）：期数上限、渠道真实存在。
+	if req.IsInstallment {
+		if req.InstallmentMonths > installmentMonthsLimit {
+			Error(c, http.StatusBadRequest, "分期期数上限为 60 期")
+			return
+		}
+		if !InstallmentChannelExists(nil, req.InstallmentChannelCode) {
+			Error(c, http.StatusBadRequest, "分期渠道不存在")
+			return
+		}
+	}
+
 	// 达成时间解析与校验 (必须 <= now，杜绝穿越)
 	fulfilledAt := config.NowInBeijing()
 	if req.FulfilledAt != "" {
@@ -626,8 +667,11 @@ func ResolveWish(c *gin.Context) {
 	if resType == "" {
 		resType = "exact"
 	}
+	// 非法归册方式直接 400（表单契约修复）：原先静默钳到 exact 会改写用户意图 ——
+	// 用户选「理性拔草」却把字段拼错时，静默 exact 会直接生成一笔支出流水。
 	if resType != "exact" && resType != "altered" && resType != "relinquished" {
-		resType = "exact"
+		Error(c, http.StatusBadRequest, "resolution_type 仅支持 exact / altered / relinquished")
+		return
 	}
 
 	actualTitle := strings.TrimSpace(req.ActualTitle)

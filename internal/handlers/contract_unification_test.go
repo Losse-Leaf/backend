@@ -31,6 +31,7 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	if err := db.DB.AutoMigrate(
 		&models.LifeEntry{}, &models.Transaction{}, &models.Attachment{},
 		&models.Footprint{}, &models.Wish{}, &models.Device{}, &models.CuratorProfile{},
+		&models.Project{}, &models.CreditChannel{},
 	); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
 	}
@@ -54,10 +55,15 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	r.POST("/api/v1/entries", middleware.AdminAuthRequired(), CreateLifeEntry)
 	r.PUT("/api/v1/entries/:id", middleware.AdminAuthRequired(), UpdateLifeEntry)
 	r.PUT("/api/v1/wishes/:id", middleware.AdminAuthRequired(), UpdateWish)
+	r.POST("/api/v1/wishes", middleware.AdminAuthRequired(), CreateWish)
+	r.POST("/api/v1/wishes/:id/resolve", middleware.AdminAuthRequired(), ResolveWish)
 	r.POST("/api/v1/transactions", middleware.AdminAuthRequired(), CreateTransaction)
 	r.PUT("/api/v1/transactions/:id", middleware.AdminAuthRequired(), UpdateTransaction)
 	r.GET("/api/v1/footprints/:id", GetFootprintByID)
+	r.POST("/api/v1/footprints", middleware.AdminAuthRequired(), CreateFootprint)
 	r.PUT("/api/v1/footprints/:id", middleware.AdminAuthRequired(), UpdateFootprint)
+	r.POST("/api/v1/projects", middleware.AdminAuthRequired(), CreateProject)
+	r.PUT("/api/v1/projects/:id", middleware.AdminAuthRequired(), UpdateProject)
 	r.POST("/api/v1/assets/gear", middleware.AdminAuthRequired(), AddGearAsset)
 	r.POST("/api/v1/assets/gear/:id/sell", middleware.AdminAuthRequired(), SellGearAsset)
 	return r, token
@@ -459,7 +465,12 @@ func TestCreateEntryRollsBackWhenFootprintSyncFails(t *testing.T) {
 
 func TestCreateEntryProjectCompanionPersistsIdempotencyKey(t *testing.T) {
 	r, token := setupContractRouter(t)
-	projectID := uint(42)
+	// 兜底校验修复后 project_id 必须指向真实存在的造物行
+	project := models.Project{Title: "造物四十二", Status: "进行中"}
+	if err := db.DB.Create(&project).Error; err != nil {
+		t.Fatalf("创建造物失败: %v", err)
+	}
+	projectID := project.ID
 	companion := models.LifeEntry{Type: "project", Title: "造物伴生", Content: "初始内容", ProjectID: &projectID}
 	if err := db.DB.Create(&companion).Error; err != nil {
 		t.Fatal(err)

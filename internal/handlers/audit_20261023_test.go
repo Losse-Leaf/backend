@@ -285,7 +285,9 @@ func TestCleanupUploadKeepsSharedAttachments(t *testing.T) {
 	}
 }
 
-// 显式清空契约：content 为空串、clear_city=true 必须真正清空，不能被“省略=保持”吞掉。
+// 显式清空契约：content 为空串、clear_city=true 必须真正清空城市归属，不能被“省略=保持”吞掉。
+// 契约 A 修正：clear_city 只清城市归属（city_code/city_name），location 归契约 C 管理 ——
+// 未显式携带 location 时保持原值；全清需显式携带 location 空串。
 func TestEntryExplicitClearContentAndCity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
@@ -314,8 +316,27 @@ func TestEntryExplicitClearContentAndCity(t *testing.T) {
 
 	var got models.LifeEntry
 	db.DB.First(&got, entry.ID)
-	if got.Content != "" || got.CityCode != "" || got.CityName != "" || got.Location != "" {
-		t.Fatalf("explicit clear failed: content=%q city=%q/%q loc=%q", got.Content, got.CityCode, got.CityName, got.Location)
+	if got.Content != "" || got.CityCode != "" || got.CityName != "" {
+		t.Fatalf("explicit clear failed: content=%q city=%q/%q", got.Content, got.CityCode, got.CityName)
+	}
+	// clear_city 不再连带清空 location：用户填写的具体地点由契约 C 显式管理
+	if got.Location != "西湖边" {
+		t.Fatalf("clear_city 后 location 应保持原值, 实际 %q", got.Location)
+	}
+
+	// 全清路径：显式携带 location 空串才清空地点（契约 C）
+	body2 := `{"content":"","clear_city":true,"location":""}`
+	req2 := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/entries/%d", entry.ID), bytes.NewBufferString(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+adminKey)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("update failed: %d %s", w2.Code, w2.Body.String())
+	}
+	db.DB.First(&got, entry.ID)
+	if got.Location != "" {
+		t.Fatalf("显式携带 location 空串应清空地点, 实际 %q", got.Location)
 	}
 }
 

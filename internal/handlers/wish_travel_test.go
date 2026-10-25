@@ -245,7 +245,7 @@ func TestWishAndTravelModules(t *testing.T) {
 			Title:       "手工胡桃木托盘",
 			Description: "打磨一块温润的桌面置物木盘",
 			Category:    "手艺造物",
-			Status:      "Active",
+			Status:      "进行中",
 		}
 		projBody, _ := json.Marshal(projCreate)
 		wProj := httptest.NewRecorder()

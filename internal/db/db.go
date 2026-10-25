@@ -113,13 +113,73 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	// 统一归入 life（gear_id 仍保留器物关联），并推进 updated_at，
 	// 否则已缓存旧 type 的客户端走增量同步永远收不到这次修正。
 	_ = database.Exec("UPDATE life_entries SET type = 'life', updated_at = ? WHERE type = 'gear'", config.NowInBeijing()).Error
+	// 项目状态一次性归一到中文四态（表单契约兜底修复）：历史英文四态与 mac 旧值
+	// 「持续维护」统一映射，并推进 updated_at 让增量同步把修正推给各端；
+	// 归一后后端 status 白名单收紧为中文四态，未知值直接 400。
+	NormalizeProjectStatuses(database)
+	// Web 端「信用卡 / 自定义分期」历史上直接发 installment_channel_code='custom'
+	//（无渠道行，资产大盘为其现造伪渠道）。升级为真实渠道行后 custom 与普通渠道同规则：
+	// 必须存在、还款日单源化。幂等确保行存在；还款日取现存 custom 账目的众数（历史口径）。
+	EnsureCustomInstallmentChannel(database)
+	// 「好物购置」为心愿归册自动账单的生成分类（wishes.go ResolveWish），
+	// 存量库 targeted 补种（SeedDefaultCategories 的 force=false 只补空 scope），
+	// 否则分类字典收口后历史心愿账目在编辑时会被 400。
+	var goodBuyCount int64
+	database.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", "expense", "好物购置").Count(&goodBuyCount)
+	if goodBuyCount == 0 {
+		database.Create(&models.CategoryOption{Scope: "expense", Name: "好物购置", SortOrder: 105, IsBuiltin: true})
+	}
 	seedData(database)
 	return database, nil
 }
 
+// NormalizeProjectStatuses 项目状态一次性归一到中文四态（幂等启动迁移）。
+// 映射：Active/WIP→进行中、Maintained/持续维护→维护中、Archived→已搁置。
+// 归一只改 projects.status，伴生散页标题里的历史状态文本（「状态演进 (Active)」）属历史记录不改写。
+func NormalizeProjectStatuses(database *gorm.DB) {
+	now := config.NowInBeijing()
+	_ = database.Exec("UPDATE projects SET status = '进行中', updated_at = ? WHERE status IN ('Active','WIP')", now).Error
+	_ = database.Exec("UPDATE projects SET status = '维护中', updated_at = ? WHERE status IN ('Maintained','持续维护')", now).Error
+	_ = database.Exec("UPDATE projects SET status = '已搁置', updated_at = ? WHERE status = 'Archived'", now).Error
+}
+
+// EnsureCustomInstallmentChannel 幂等确保 code='custom' 的真实渠道行存在（幂等启动迁移）。
+// 还款日取现存 custom 分期账目中出现最多的还款日（沿用历史口径），无历史账目时兜底 10。
+// 行标记为内置：不可删除 —— 删掉会让 Web 端「自定义分期」表单立即 400。
+func EnsureCustomInstallmentChannel(database *gorm.DB) {
+	var count int64
+	database.Model(&models.CreditChannel{}).Where("code = ?", "custom").Count(&count)
+	if count > 0 {
+		return
+	}
+	day := 10
+	var modes []struct {
+		Day int
+		N   int64
+	}
+	database.Model(&models.Transaction{}).
+		Select("repayment_day AS day, COUNT(*) AS n").
+		Where("installment_channel_code = ? AND repayment_day > 0", "custom").
+		Group("repayment_day").Order("n DESC, day ASC").Limit(1).Scan(&modes)
+	if len(modes) > 0 && modes[0].Day > 0 {
+		day = modes[0].Day
+	}
+	database.Create(&models.CreditChannel{
+		Code:         "custom",
+		Name:         "自定义分期",
+		RepaymentDay: day,
+		IsBuiltin:    true,
+		Color:        "var(--accent-warm)",
+	})
+}
+
 // DefaultCategoriesMap 系统预置的五大分类字典默认值
+//
+// 注：「好物购置」由心愿归册自动账单写入（wishes.go ResolveWish），虽非表单选项
+// 但属于系统生成的合法 expense 分类 —— 收口后必须真实存在，否则历史心愿账目在
+// 编辑时会被分类字典校验 400。
 var DefaultCategoriesMap = map[string][]string{
-	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "其他"},
+	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "好物购置", "其他"},
 	"income":  {"工资收入", "二手回血", "稿酬设计", "投资理财", "礼金红包", "退款报销", "其他收入"},
 	"gear":    {"数码器材", "影像与暗房", "工作台与算力", "手冲咖啡工坊", "夜骑巡航", "纸笔与日常", "生活好物"},
 	"payment": {"微信支付", "支付宝", "银行卡", "现金", "其他"},

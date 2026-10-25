@@ -395,11 +395,22 @@ var validEntryTypes = map[string]bool{
 }
 
 // validTxTypes 记账 type 白名单：type 是所有汇总口径的过滤维度
-//（GetTransactionSummary / GetGlobalStats / 资产大盘 / 旅程花销聚合都只认 expense/income），
+// （GetTransactionSummary / GetGlobalStats / 资产大盘 / 旅程花销聚合都只认 expense/income），
 // 落库一个未知值会让账目从全部统计口径里静默消失 —— 与散页 type / 心愿 kind 同款，非法值直接 400。
 var validTxTypes = map[string]bool{
 	"expense": true,
 	"income":  true,
+}
+
+// validProjectStatuses 项目状态白名单（表单契约修复·严格化）：
+// 四端统一为中文四态；存量英文四态与 mac 历史值「持续维护」由启动迁移
+// NormalizeProjectStatuses（db.go）一次性归一，此后未知值直接 400 ——
+// 两套枚举混存会让项目在各端筛选里口径漂移。
+var validProjectStatuses = map[string]bool{
+	"进行中": true,
+	"已完成": true,
+	"维护中": true,
+	"已搁置": true,
 }
 
 // CreateEntryRequest 新增生活记录请求载荷
@@ -546,6 +557,52 @@ func CreateLifeEntry(c *gin.Context) {
 	if !validEntryTypes[entryType] {
 		Error(c, http.StatusBadRequest, "type 仅支持 life / travel / project / wish")
 		return
+	}
+
+	// 散页类型与归属外键配对（兜底校验修复）：project_id 仅 type=project、wish_id 仅 type=wish，
+	// 否则一条散页同时挂进多个视角，伴生同步机制也无法纠正（城市/足迹不限 —— 自然下渗是设计行为）。
+	if req.ProjectID != nil && *req.ProjectID > 0 && entryType != "project" {
+		Error(c, http.StatusBadRequest, "project_id 仅支持 type=project 的散页")
+		return
+	}
+	if req.WishID != nil && *req.WishID > 0 && entryType != "wish" {
+		Error(c, http.StatusBadRequest, "wish_id 仅支持 type=wish 的散页")
+		return
+	}
+
+	// 逻辑外键兜底校验（兜底校验修复）：0 归一化为 nil；引用不存在的行直接 400，杜绝静默挂空。
+	if req.ProjectID != nil && *req.ProjectID == 0 {
+		req.ProjectID = nil
+	}
+	if req.WishID != nil && *req.WishID == 0 {
+		req.WishID = nil
+	}
+	if req.FootprintID != nil && *req.FootprintID == 0 {
+		req.FootprintID = nil
+	}
+	if req.ProjectID != nil && *req.ProjectID > 0 {
+		var projectCount int64
+		db.DB.Unscoped().Model(&models.Project{}).Where("id = ?", *req.ProjectID).Count(&projectCount)
+		if projectCount == 0 {
+			Error(c, http.StatusBadRequest, "关联的造物不存在")
+			return
+		}
+	}
+	if req.WishID != nil && *req.WishID > 0 {
+		var wishCount int64
+		db.DB.Unscoped().Model(&models.Wish{}).Where("id = ?", *req.WishID).Count(&wishCount)
+		if wishCount == 0 {
+			Error(c, http.StatusBadRequest, "关联的心愿不存在")
+			return
+		}
+	}
+	if req.FootprintID != nil && *req.FootprintID > 0 {
+		var fpCount int64
+		db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
+		if fpCount == 0 {
+			Error(c, http.StatusBadRequest, "关联的旅程不存在")
+			return
+		}
 	}
 
 	entry := models.LifeEntry{
@@ -870,12 +927,17 @@ func UpdateLifeEntry(c *gin.Context) {
 			entry.Title = DeriveTitleFromContent(entry.Content, 40)
 		}
 	}
-	// 契约 A：clear_city 显式清空城市归属，优先级高于 city_code / city_name /
-	// location 字段本身（携带也被忽略）；不清空时才走字段驱动的属地解析。
+	// 契约 A（修正）：clear_city 只清城市归属（city_code / city_name），不再连带清空 location ——
+	// location 归契约 C 管理：请求显式携带（空串 = 清空）即按其值写入。
+	// 原先连带清空会把用户填写的具体地点（「西湖边的小咖啡馆」）一起抹掉；
+	// Web（EntryDetailModal）/ mac（EditEntrySheetView）/ Android（StreamDialogs）三端
+	// 的「全清」路径均已显式携带 location 字段（空串 = 清空），语义拆分后三端行为不变。
 	if req.ClearCity {
 		entry.CityCode = ""
 		entry.CityName = ""
-		entry.Location = ""
+		if hasJSONValue(rawKeys, "location") {
+			entry.Location = strings.TrimSpace(req.Location)
+		}
 	} else if hasJSONValue(rawKeys, "location") || hasJSONValue(rawKeys, "city_code") || hasJSONValue(rawKeys, "city_name") ||
 		req.Location != "" || req.CityCode != "" || req.CityName != "" {
 		curCode := entry.CityCode
@@ -903,6 +965,17 @@ func UpdateLifeEntry(c *gin.Context) {
 		}
 	}
 	if req.FootprintID != nil {
+		// 0 归一化为解绑、引用不存在的行直接 400（兜底校验修复，与记账入口同口径）
+		if *req.FootprintID == 0 {
+			req.FootprintID = nil
+		} else {
+			var fpCount int64
+			db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
+			if fpCount == 0 {
+				Error(c, http.StatusBadRequest, "关联的旅程不存在")
+				return
+			}
+		}
 		entry.FootprintID = req.FootprintID
 		// clear_city 优先级最高：显式清空属地时不允许再从旅程回填城市（契约 A）
 		if *req.FootprintID > 0 && entry.CityCode == "" && !req.ClearCity {
@@ -920,12 +993,67 @@ func UpdateLifeEntry(c *gin.Context) {
 	if entry.CityCode != "" && entry.Location == "" && !hasJSONValue(rawKeys, "location") {
 		entry.Location = entry.CityName
 	}
-	// 指针字段：携带 key 才写（null = 解绑）
+	// 指针字段：携带 key 才写（null = 解绑）；0 归一化为解绑、引用不存在的行直接 400（兜底校验修复）。
 	if _, present := rawKeys["project_id"]; present {
+		if req.ProjectID != nil && *req.ProjectID == 0 {
+			req.ProjectID = nil
+		}
+		if req.ProjectID != nil && *req.ProjectID > 0 {
+			var projectCount int64
+			db.DB.Unscoped().Model(&models.Project{}).Where("id = ?", *req.ProjectID).Count(&projectCount)
+			if projectCount == 0 {
+				Error(c, http.StatusBadRequest, "关联的造物不存在")
+				return
+			}
+		}
 		entry.ProjectID = req.ProjectID
 	}
 	if _, present := rawKeys["wish_id"]; present {
+		if req.WishID != nil && *req.WishID == 0 {
+			req.WishID = nil
+		}
+		if req.WishID != nil && *req.WishID > 0 {
+			var wishCount int64
+			db.DB.Unscoped().Model(&models.Wish{}).Where("id = ?", *req.WishID).Count(&wishCount)
+			if wishCount == 0 {
+				Error(c, http.StatusBadRequest, "关联的心愿不存在")
+				return
+			}
+		}
 		entry.WishID = req.WishID
+	}
+
+	// 散页类型与归属外键配对（兜底校验修复）：
+	// - 携带归属外键时必须与（最终）type 配对；
+	// - 切走类型时存量归属必须**显式解绑**（project_id / wish_id 携带 null）后才允许修改，
+	//   否则「造物条目改成日常」会在时间流里留下双挂矛盾（未携带 type 的普通编辑不受影响）。
+	if req.ProjectID != nil && *req.ProjectID > 0 && entry.Type != "project" {
+		Error(c, http.StatusBadRequest, "project_id 仅支持 type=project 的散页")
+		return
+	}
+	if req.WishID != nil && *req.WishID > 0 && entry.Type != "wish" {
+		Error(c, http.StatusBadRequest, "wish_id 仅支持 type=wish 的散页")
+		return
+	}
+	if req.Type != "" && req.Type != "project" {
+		boundProject := entry.ProjectID
+		if _, present := rawKeys["project_id"]; present {
+			boundProject = req.ProjectID
+		}
+		if boundProject != nil && *boundProject > 0 {
+			Error(c, http.StatusBadRequest, "切换类型前需显式解绑 project_id（携带 null）")
+			return
+		}
+	}
+	if req.Type != "" && req.Type != "wish" {
+		boundWish := entry.WishID
+		if _, present := rawKeys["wish_id"]; present {
+			boundWish = req.WishID
+		}
+		if boundWish != nil && *boundWish > 0 {
+			Error(c, http.StatusBadRequest, "切换类型前需显式解绑 wish_id（携带 null）")
+			return
+		}
 	}
 
 	if req.OccurredAt != "" {
@@ -1329,6 +1457,74 @@ func CreateTransaction(c *gin.Context) {
 		return
 	}
 
+	// 分期仅支持支出（兜底校验修复）：资产大盘只核算 expense 分期（assets.go），
+	// income+分期会让分期字段变成不进任何口径的死数据；
+	// type=income 时连分期字段一并拒绝，杜绝「income 账挂着分期参数」的矛盾载荷。
+	if txType == "income" {
+		if (req.IsInstallment != nil && *req.IsInstallment) || req.InstallmentChannelCode != "" ||
+			req.InstallmentTotalAmount > 0 || req.InstallmentMonths > 0 || req.InstallmentMonthlyPay > 0 ||
+			req.InstallmentRemainMonths > 0 || req.RepaymentDay > 0 {
+			Error(c, http.StatusBadRequest, "分期仅支持支出类型")
+			return
+		}
+	}
+
+	// 分类字典收口（兜底修复）：category 必须真实存在于有效字典，
+	// 「income+支出分类」这类自由文本错挂会让分类视角与改名级联永久漂移。
+	if !transactionCategoryAllowed(txType, req.Category) {
+		Error(c, http.StatusBadRequest, "分类不存在于分类字典")
+		return
+	}
+
+	// 分期参数兜底校验（兜底校验修复）：期数上限、渠道真实存在、分期总额与账单金额一致。
+	// 伪造 code 会在资产大盘现造伪渠道并合并出错误还款日；
+	// total 与 amount 分叉会让月度支出（按 amount）与负债（按 total）两套账。
+	if req.IsInstallment != nil && *req.IsInstallment {
+		if req.InstallmentMonths > installmentMonthsLimit {
+			Error(c, http.StatusBadRequest, "分期期数上限为 60 期")
+			return
+		}
+		if !InstallmentChannelExists(nil, req.InstallmentChannelCode) {
+			Error(c, http.StatusBadRequest, "分期渠道不存在")
+			return
+		}
+		if req.InstallmentTotalAmount > 0 && req.InstallmentTotalAmount != req.Amount {
+			Error(c, http.StatusBadRequest, "分期总额必须与账单金额一致")
+			return
+		}
+	}
+
+	// 逻辑外键兜底校验（兜底校验修复）：0 归一化为 nil（携带 0 = 解绑意图，
+	// 落 0 会留下悬挂引用）；引用不存在的行直接 400，杜绝静默挂空。
+	if req.WishID != nil && *req.WishID == 0 {
+		req.WishID = nil
+	}
+	if req.FootprintID != nil && *req.FootprintID == 0 {
+		req.FootprintID = nil
+	}
+	if req.WishID != nil && *req.WishID > 0 {
+		var wishCount int64
+		db.DB.Unscoped().Model(&models.Wish{}).Where("id = ?", *req.WishID).Count(&wishCount)
+		if wishCount == 0 {
+			Error(c, http.StatusBadRequest, "关联的心愿不存在")
+			return
+		}
+	}
+	if req.FootprintID != nil && *req.FootprintID > 0 {
+		var fpCount int64
+		db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
+		if fpCount == 0 {
+			Error(c, http.StatusBadRequest, "关联的旅程不存在")
+			return
+		}
+	}
+	// wish/footprint 互斥（兜底修复）：一笔账同时计入心愿实付与旅程花销
+	// 属于矛盾归属 —— 心愿归册要走 /wishes/:id/resolve 的联动口径，不允许双挂。
+	if req.WishID != nil && req.FootprintID != nil {
+		Error(c, http.StatusBadRequest, "心愿与足迹只能二选一")
+		return
+	}
+
 	record := models.Transaction{
 		Amount:        req.Amount,
 		Type:          txType,
@@ -1633,20 +1829,35 @@ func UpdateTransaction(c *gin.Context) {
 		}
 		tx.Type = txType
 	}
-	tx.Category = strings.TrimSpace(req.Category)
-	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
-	// 缺省 / null = 保持原值」。原先无条件覆盖，客户端省略 note 时会把备注清掉。
-	if req.Title != "" || hasJSONValue(rawKeys, "title") {
-		tx.Title = strings.TrimSpace(req.Title)
+
+	// 分期仅支持支出（兜底校验修复）：把分期账改成 income 会让负债从资产大盘凭空消失。
+	// 例外：同一请求显式 clear_installment 降级时允许改 type —— 先取消分期再改类型是合法操作。
+	// 老客户端形态（is_installment 恒写 false、分期字段全零）不会命中本分支。
+	if tx.Type == "income" {
+		carriesInstallmentFields := req.InstallmentChannelCode != "" || req.InstallmentTotalAmount > 0 ||
+			req.InstallmentMonths > 0 || req.InstallmentMonthlyPay > 0 ||
+			req.InstallmentRemainMonths > 0 || req.RepaymentDay > 0
+		if (req.IsInstallment != nil && *req.IsInstallment) ||
+			((tx.IsInstallment || carriesInstallmentFields) && !req.ClearInstallment) {
+			Error(c, http.StatusBadRequest, "分期仅支持支出类型")
+			return
+		}
 	}
-	if req.Note != "" || hasJSONValue(rawKeys, "note") {
-		tx.Note = strings.TrimSpace(req.Note)
-	}
-	if req.PaymentMethod != "" || hasJSONValue(rawKeys, "payment_method") {
-		tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
-	}
+
+	// 逻辑外键兜底校验（兜底校验修复）：wish_id=0 归一化为解绑（原先会落 0 留下悬挂引用，
+	// 且账目从此无法解绑心愿）；引用不存在的行直接 400。
 	if req.WishID != nil {
-		tx.WishID = req.WishID
+		if *req.WishID == 0 {
+			tx.WishID = nil
+		} else {
+			var wishCount int64
+			db.DB.Unscoped().Model(&models.Wish{}).Where("id = ?", *req.WishID).Count(&wishCount)
+			if wishCount == 0 {
+				Error(c, http.StatusBadRequest, "关联的心愿不存在")
+				return
+			}
+			tx.WishID = req.WishID
+		}
 	}
 	// footprintUnbound：请求显式携带 footprint_id=0（*uint 非 nil 且值为 0 = 解绑旅程）。
 	// 解绑后必须跳过 autoLinkTransactionFootprint 的自动重挂 —— 否则「同城 + 旅程窗口」
@@ -1658,8 +1869,40 @@ func UpdateTransaction(c *gin.Context) {
 			tx.FootprintID = nil
 			footprintUnbound = true
 		} else {
+			var fpCount int64
+			db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
+			if fpCount == 0 {
+				Error(c, http.StatusBadRequest, "关联的旅程不存在")
+				return
+			}
 			tx.FootprintID = req.FootprintID
 		}
+	}
+	// wish/footprint 互斥（兜底修复）：一笔账同时计入心愿实付与旅程花销属于矛盾归属。
+	// 只拦「本次请求让两者同时绑定」的载荷 —— 存量双挂历史行不携带外键的普通编辑不受影响。
+	wishCarriedBound := req.WishID != nil && *req.WishID > 0
+	footprintCarriedBound := req.FootprintID != nil && *req.FootprintID > 0
+	if (wishCarriedBound && tx.FootprintID != nil) || (footprintCarriedBound && tx.WishID != nil) {
+		Error(c, http.StatusBadRequest, "心愿与足迹只能二选一")
+		return
+	}
+
+	// 分类字典收口（兜底修复）：category 必须真实存在于有效字典（与创建同口径）。
+	if !transactionCategoryAllowed(tx.Type, req.Category) {
+		Error(c, http.StatusBadRequest, "分类不存在于分类字典")
+		return
+	}
+	tx.Category = strings.TrimSpace(req.Category)
+	// 契约 C：可清空文本字段统一「请求携带该 key 即按其值写入（空串 = 清空），
+	// 缺省 / null = 保持原值」。原先无条件覆盖，客户端省略 note 时会把备注清掉。
+	if req.Title != "" || hasJSONValue(rawKeys, "title") {
+		tx.Title = strings.TrimSpace(req.Title)
+	}
+	if req.Note != "" || hasJSONValue(rawKeys, "note") {
+		tx.Note = strings.TrimSpace(req.Note)
+	}
+	if req.PaymentMethod != "" || hasJSONValue(rawKeys, "payment_method") {
+		tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
 	}
 	// 契约 A：clear_city 显式清空城市归属，优先级高于 city_code 字段本身。
 	clearCity := req.ClearCity
@@ -1687,6 +1930,19 @@ func UpdateTransaction(c *gin.Context) {
 	}
 
 	if req.IsInstallment != nil && *req.IsInstallment {
+		// 分期参数兜底校验（与创建同口径）：期数上限、渠道真实存在、总额与金额一致。
+		if req.InstallmentMonths > installmentMonthsLimit {
+			Error(c, http.StatusBadRequest, "分期期数上限为 60 期")
+			return
+		}
+		if !InstallmentChannelExists(nil, req.InstallmentChannelCode) {
+			Error(c, http.StatusBadRequest, "分期渠道不存在")
+			return
+		}
+		if req.InstallmentTotalAmount > 0 && req.InstallmentTotalAmount != req.Amount {
+			Error(c, http.StatusBadRequest, "分期总额必须与账单金额一致")
+			return
+		}
 		tx.IsInstallment = true
 		if req.InstallmentChannelCode != "" {
 			tx.InstallmentChannelCode = strings.TrimSpace(req.InstallmentChannelCode)
@@ -1704,8 +1960,24 @@ func UpdateTransaction(c *gin.Context) {
 		} else if tx.InstallmentMonths > 0 {
 			tx.InstallmentMonthlyPay = tx.InstallmentTotalAmount / int64(tx.InstallmentMonths)
 		}
-		if req.RepaymentDay >= 1 && req.RepaymentDay <= 31 {
-			tx.RepaymentDay = req.RepaymentDay
+		// 客户端值钳制到 1~31（越界 clamp 不落原值，缺省保持原值）
+		if req.RepaymentDay > 0 {
+			day := req.RepaymentDay
+			if day < 1 {
+				day = 1
+			}
+			if day > 31 {
+				day = 31
+			}
+			tx.RepaymentDay = day
+		}
+		// 还款日单源化（兜底校验修复）：渠道存在时以渠道还款日为准，
+		// 忽略客户端自带的矛盾值 —— 否则账目页与资产大盘各算一套剩余期数。
+		if tx.InstallmentChannelCode != "" {
+			var ch models.CreditChannel
+			if err := db.DB.Where("code = ?", tx.InstallmentChannelCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
+				tx.RepaymentDay = ch.RepaymentDay
+			}
 		}
 		_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, tx.InstallmentMonths, tx.RepaymentDay, time.Now())
 		if req.InstallmentRemainMonths >= 0 && req.InstallmentRemainMonths <= autoRemain {
@@ -1811,10 +2083,14 @@ func CreateProject(c *gin.Context) {
 		return
 	}
 
-	// MOB-P1-35：省略 status 时回落到默认「进行中」
+	// MOB-P1-35：省略 status 时回落到默认「进行中」；未知状态直接 400（兜底校验修复）
 	projectStatus := strings.TrimSpace(req.Status)
 	if projectStatus == "" {
 		projectStatus = "进行中"
+	}
+	if !validProjectStatuses[projectStatus] {
+		Error(c, http.StatusBadRequest, "status 仅支持 进行中/已完成/维护中/已搁置")
+		return
 	}
 
 	p := models.Project{
@@ -1826,9 +2102,6 @@ func CreateProject(c *gin.Context) {
 		GithubURL:   strings.TrimSpace(req.GithubURL),
 		Status:      projectStatus,
 		Order:       req.Order,
-	}
-	if p.Status == "" {
-		p.Status = "Active"
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
@@ -1987,6 +2260,11 @@ func UpdateProject(c *gin.Context) {
 	if req.Status != nil {
 		status := strings.TrimSpace(*req.Status)
 		if status != "" {
+			// 未知状态直接 400（兜底校验修复，与创建同白名单）
+			if !validProjectStatuses[status] {
+				Error(c, http.StatusBadRequest, "status 仅支持 进行中/已完成/维护中/已搁置")
+				return
+			}
 			p.Status = status
 		}
 	}

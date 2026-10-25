@@ -129,6 +129,52 @@ func CalculateInstallmentAmounts(totalAmount int64, totalMonths int, monthlyPay 
 	return paidAmount, remainingDebt
 }
 
+// installmentMonthsLimit 分期期数上限 (兜底校验修复)：伪造的超长期数会让
+// 剩余期数/月供口径在资产大盘里永久失真，四端分期选项最长为 24 期，取 60 留足余量。
+const installmentMonthsLimit = 60
+
+// InstallmentChannelExists 校验分期渠道 code 是否真实存在 (兜底校验修复)。
+// 空 code 合法（组装时回落内置 huabei）。custom 已由启动迁移升级为真实渠道行
+// （db.EnsureCustomInstallmentChannel），与普通渠道同规则 —— 必须存在，不再特判放行。
+// 查询本身出错（如测试夹具未迁移渠道表）按存在处理 —— 兜底校验只在能确认「行不存在」时拒绝。
+func InstallmentChannelExists(dbTx *gorm.DB, code string) bool {
+	chCode := strings.TrimSpace(code)
+	if chCode == "" {
+		return true
+	}
+	if dbTx == nil {
+		dbTx = db.DB
+	}
+	var count int64
+	if err := dbTx.Model(&models.CreditChannel{}).Where("code = ?", chCode).Count(&count).Error; err != nil {
+		return true
+	}
+	return count > 0
+}
+
+// ResolveChannelRepaymentDay 分期还款日单源化 (兜底校验修复)：
+// 渠道存在且配置了还款日时，一律以渠道还款日为准（忽略客户端自带的矛盾值）——
+// 否则账目列表按 tx.RepaymentDay、资产大盘按渠道 day 各算一套剩余期数，
+// 已还/待还/净资产全口径分叉。渠道不存在（含 custom，已由启动迁移保证存在，
+// 这里仅防御迁移前的极端时序）时钳制客户端值：缺省（<=0）回落 10 号
+// （MOB-P1-35 契约），越界 clamp 到 1~31，绝不原样落库。
+func ResolveChannelRepaymentDay(dbTx *gorm.DB, channelCode string, clientDay int) int {
+	if dbTx == nil {
+		dbTx = db.DB
+	}
+	var ch models.CreditChannel
+	if err := dbTx.Where("code = ?", channelCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
+		return ch.RepaymentDay
+	}
+	if clientDay <= 0 {
+		return 10
+	}
+	if clientDay > 31 {
+		return 31
+	}
+	return clientDay
+}
+
 // AssembleInstallmentTransaction 组装分期账单核心字段 (根据购买时间 OccurredAt 与渠道还款日自动推算剩余期数)
 func AssembleInstallmentTransaction(
 	tx *models.Transaction,
@@ -173,20 +219,12 @@ func AssembleInstallmentTransaction(
 	}
 	tx.InstallmentMonthlyPay = mPay
 
-	rDay := repaymentDay
-	var ch models.CreditChannel
-	if err := dbTx.Where("code = ?", chCode).First(&ch).Error; err == nil && ch.RepaymentDay > 0 {
-		if rDay <= 0 {
-			rDay = ch.RepaymentDay
-		}
-	}
-	if rDay <= 0 {
-		rDay = 10
-	}
-	tx.RepaymentDay = rDay
+	// 还款日单源化（兜底校验修复）：渠道存在时无视客户端 rDay，强制采用渠道还款日；
+	// custom/无渠道时沿用客户端值并钳制到 1~31（缺省回落 10）。
+	tx.RepaymentDay = ResolveChannelRepaymentDay(dbTx, chCode, repaymentDay)
 
 	// 根据购买时间 (tx.OccurredAt) 与每月还款日自动核算剩余期数
-	_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, months, rDay, time.Now())
+	_, autoRemain := CalculateElapsedInstallmentMonths(tx.OccurredAt, months, tx.RepaymentDay, time.Now())
 	if remainMonths <= 0 || remainMonths == months || remainMonths > autoRemain {
 		tx.InstallmentRemainMonths = autoRemain
 	} else {

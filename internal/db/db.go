@@ -91,6 +91,8 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.Project{},
 		&models.Transaction{},
 		&models.CreditChannel{},
+		&models.InstallmentPlan{},
+		&models.InstallmentItem{},
 		&models.CategoryOption{},
 		&models.SiteConfig{},
 		&models.Device{},
@@ -128,6 +130,12 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	database.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", "expense", "好物购置").Count(&goodBuyCount)
 	if goodBuyCount == 0 {
 		database.Create(&models.CategoryOption{Scope: "expense", Name: "好物购置", SortOrder: 105, IsBuiltin: true})
+	}
+	// 「利息手续费」为分期还款手续费的内置分类 (RC-140)
+	var feeCount int64
+	database.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", "expense", "利息手续费").Count(&feeCount)
+	if feeCount == 0 {
+		database.Create(&models.CategoryOption{Scope: "expense", Name: "利息手续费", SortOrder: 106, IsBuiltin: true})
 	}
 	seedData(database)
 	return database, nil
@@ -179,7 +187,7 @@ func EnsureCustomInstallmentChannel(database *gorm.DB) {
 // 但属于系统生成的合法 expense 分类 —— 收口后必须真实存在，否则历史心愿账目在
 // 编辑时会被分类字典校验 400。
 var DefaultCategoriesMap = map[string][]string{
-	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "好物购置", "其他"},
+	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "好物购置", "利息手续费", "其他"},
 	"income":  {"工资收入", "二手回血", "稿酬设计", "投资理财", "礼金红包", "退款报销", "其他收入"},
 	"gear":    {"数码器材", "影像与暗房", "工作台与算力", "手冲咖啡工坊", "夜骑巡航", "纸笔与日常", "生活好物"},
 	"payment": {"微信支付", "支付宝", "银行卡", "现金", "其他"},

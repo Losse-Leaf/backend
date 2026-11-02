@@ -31,7 +31,7 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	if err := db.DB.AutoMigrate(
 		&models.LifeEntry{}, &models.Transaction{}, &models.Attachment{},
 		&models.Footprint{}, &models.Wish{}, &models.Device{}, &models.CuratorProfile{},
-		&models.Project{}, &models.CreditChannel{},
+		&models.Project{}, &models.CreditChannel{}, &models.InstallmentPlan{}, &models.InstallmentItem{},
 	); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
 	}

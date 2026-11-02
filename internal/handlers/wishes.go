@@ -733,6 +733,7 @@ func ResolveWish(c *gin.Context) {
 			wish.ActualTitle = actualTitle
 		}
 
+		var createdTx *models.Transaction
 		// 联动 1: 账本支出流水 (支持分期信贷联动 RC-53)
 		if req.CreateTransaction && req.ActualCost > 0 {
 			category := "好物购置"
@@ -743,13 +744,23 @@ func ResolveWish(c *gin.Context) {
 			if resType == "altered" && actualTitle != "" {
 				displayTitle = fmt.Sprintf("心愿替代达成: %s (原: %s)", actualTitle, wish.Title)
 			}
+			paymentMethod := "心愿支出"
+			if req.IsInstallment {
+				paymentMethod = "分期付款"
+				if req.InstallmentChannelCode != "" {
+					var ch models.CreditChannel
+					if tx.Where("code = ?", req.InstallmentChannelCode).First(&ch).Error == nil && ch.Name != "" {
+						paymentMethod = ch.Name
+					}
+				}
+			}
 			newTx := models.Transaction{
 				Amount:        req.ActualCost,
 				Type:          "expense",
 				Category:      category,
 				Title:         displayTitle,
 				Note:          fmt.Sprintf("三维心愿归册支出 (类别: %s, 方案: %s)", wish.Kind, resType),
-				PaymentMethod: "心愿支出",
+				PaymentMethod: paymentMethod,
 				WishID:        &wish.ID,
 				CityCode:      wish.CityCode,
 				OccurredAt:    fulfilledAt,
@@ -774,6 +785,7 @@ func ResolveWish(c *gin.Context) {
 				return err
 			}
 			wish.TransactionID = &newTx.ID
+			createdTx = &newTx
 		}
 
 		// 联动 2: 固定资产设备入库 (item 专属，双向联动 RC-53)
@@ -804,6 +816,30 @@ func ResolveWish(c *gin.Context) {
 				if err := saveProfileGearWith(tx, &profile, list); err != nil {
 					return err
 				}
+			}
+		}
+
+		if createdTx != nil && req.IsInstallment {
+			gearID := ""
+			kind := "expense"
+			if wish.GearID != nil {
+				gearID = *wish.GearID
+				kind = "asset"
+			}
+			_, _, err := CreatePlanForTransactionTx(
+				tx,
+				createdTx,
+				req.InstallmentMonths,
+				req.InstallmentChannelCode,
+				"",
+				0,
+				"",
+				req.RepaymentDay,
+				kind,
+				gearID,
+			)
+			if err != nil {
+				return err
 			}
 		}
 

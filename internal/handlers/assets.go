@@ -196,13 +196,13 @@ func GetAssetsOverview(c *gin.Context) {
 
 	var nonInstallmentExpense int64
 	db.DB.Model(&models.Transaction{}).
-		Where("type = 'expense' AND (is_installment = ? OR is_installment IS NULL)", false).
+		Where("type = 'expense' AND (is_installment = ? OR is_installment IS NULL) AND (source IS NULL OR source != 'installment_purchase')", false).
 		Select("COALESCE(SUM(amount), 0)").
 		Scan(&nonInstallmentExpense)
 
-	// 仅查询分期账目进行分期还款核算与信贷渠道聚合
+	// 仅查询遗留历史分期账目（未关联新计划的老账目）
 	var installmentTxs []models.Transaction
-	db.DB.Where("type = 'expense' AND is_installment = ?", true).Find(&installmentTxs)
+	db.DB.Where("type = 'expense' AND is_installment = ? AND (installment_plan_id IS NULL OR installment_plan_id = 0)", true).Find(&installmentTxs)
 
 	var totalLiabilities int64
 	var monthlyLiabilities int64
@@ -230,6 +230,53 @@ func GetAssetsOverview(c *gin.Context) {
 		}
 		channelMap[ch.Code] = summary
 		channelOrder = append(channelOrder, ch.Code)
+	}
+
+	// 聚合新分期计划与期次负债 (RC-140)
+	var activePlans []models.InstallmentPlan
+	db.DB.Where("status = 'active'").Find(&activePlans)
+
+	for _, plan := range activePlans {
+		var scheduledItems []models.InstallmentItem
+		db.DB.Where("plan_id = ? AND status = 'scheduled'", plan.ID).Order("seq ASC").Find(&scheduledItems)
+		if len(scheduledItems) == 0 {
+			continue
+		}
+
+		var planRemainingPrincipal int64
+		for _, it := range scheduledItems {
+			planRemainingPrincipal += it.PrincipalPart
+		}
+
+		totalLiabilities += planRemainingPrincipal
+
+		// 本月/下次应还取第一笔未还期次
+		nextItem := scheduledItems[0]
+		monthlyLiabilities += (nextItem.PrincipalPart + nextItem.FeePart)
+
+		chCode := plan.ChannelCode
+		if chCode == "" {
+			chCode = "huabei"
+		}
+		summary, exists := channelMap[chCode]
+		if !exists {
+			summary = &ChannelLiabilitySummary{
+				ChannelCode:        chCode,
+				ChannelName:        plan.ChannelName,
+				RepaymentDay:       plan.RepayDay,
+				Color:              "var(--accent-warm)",
+				TotalDebt:          0,
+				MonthlyPay:         0,
+				DaysUntilRepayment: calculateDaysUntilRepayment(plan.RepayDay),
+				ActiveCount:        0,
+				Installments:       make([]models.Transaction, 0),
+			}
+			channelMap[chCode] = summary
+			channelOrder = append(channelOrder, chCode)
+		}
+		summary.TotalDebt += planRemainingPrincipal
+		summary.MonthlyPay += (nextItem.PrincipalPart + nextItem.FeePart)
+		summary.ActiveCount++
 	}
 
 	// 分期剩余期数按当前时间即时推算展示，不落库 (BE-24：GET 保持只读语义)
@@ -493,7 +540,17 @@ func AddGearAsset(c *gin.Context) {
 				OccurredAt:    occurred,
 			}
 			if linkedTx.PaymentMethod == "" {
-				linkedTx.PaymentMethod = "设备购置"
+				if req.IsInstallment {
+					linkedTx.PaymentMethod = "分期付款"
+					if req.InstallmentChannelCode != "" {
+						var ch models.CreditChannel
+						if dbTx.Where("code = ?", req.InstallmentChannelCode).First(&ch).Error == nil && ch.Name != "" {
+							linkedTx.PaymentMethod = ch.Name
+						}
+					}
+				} else {
+					linkedTx.PaymentMethod = "设备购置"
+				}
 			}
 
 			if req.IsInstallment {
@@ -513,6 +570,24 @@ func AddGearAsset(c *gin.Context) {
 
 			if err := dbTx.Create(&linkedTx).Error; err != nil {
 				return err
+			}
+
+			if req.IsInstallment {
+				_, _, err := CreatePlanForTransactionTx(
+					dbTx,
+					&linkedTx,
+					req.InstallmentMonths,
+					req.InstallmentChannelCode,
+					"",
+					0,
+					"",
+					req.RepaymentDay,
+					"asset",
+					newGear.ID,
+				)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		return nil

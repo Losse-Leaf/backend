@@ -285,6 +285,11 @@ func DeleteCategory(c *gin.Context) {
 		return
 	}
 
+	if item.IsBuiltin && (item.Name == "利息手续费" || item.Name == "好物购置") {
+		Error(c, http.StatusBadRequest, fmt.Sprintf("「%s」为系统内置分类，不可删除", item.Name))
+		return
+	}
+
 	var count int64
 	db.DB.Model(&models.CategoryOption{}).Where("scope = ?", item.Scope).Count(&count)
 	if count <= 1 {

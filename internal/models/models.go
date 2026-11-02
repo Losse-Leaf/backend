@@ -92,6 +92,12 @@ type Transaction struct {
 	InstallmentMonthlyPay   int64  `gorm:"default:0" json:"installment_monthly_pay"`                // 每期还款额（分）
 	InstallmentRemainMonths int    `gorm:"default:0" json:"installment_remain_months"`              // 剩余期数
 	RepaymentDay            int    `gorm:"default:10" json:"repayment_day"`                         // 绑定渠道的每月独立还款日 (1~31)
+	// 真实分期流水扩展 (RC-140)
+	Source            string `gorm:"size:32;index" json:"source,omitempty"`              // "installment_repay" | "installment_purchase"
+	InstallmentPlanID *uint  `gorm:"index" json:"installment_plan_id,omitempty"`        // 关联分期计划 ID
+	InstallmentItemID *uint  `gorm:"index" json:"installment_item_id,omitempty"`        // 关联分期期次 ID
+	PrincipalAmount   int64  `gorm:"default:0" json:"principal_amount"`                  // 还款本金（分）
+	FeeAmount         int64  `gorm:"default:0" json:"fee_amount"`                        // 还款手续费（分）
 	// ClientRequestID 幂等创建标识（跨端统一契约 B，语义同 LifeEntry）
 	ClientRequestID *string        `gorm:"size:64;uniqueIndex" json:"client_request_id,omitempty"`
 	CreatedAt       time.Time      `json:"created_at"`
@@ -109,6 +115,49 @@ type CreditChannel struct {
 	Color        string    `gorm:"size:32" json:"color,omitempty"`           // 标签色彩胶囊 (纸墨/朱砂/靛蓝)
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// InstallmentPlan 分期还款计划主表 (RC-140)
+type InstallmentPlan struct {
+	ID              uint           `gorm:"primaryKey" json:"id"`
+	ChannelID       uint           `gorm:"index;not null" json:"channel_id"`
+	ChannelCode     string         `gorm:"size:32;index;not null" json:"channel_code"` // huabei, baitiao, custom_xxx
+	ChannelName     string         `gorm:"size:64" json:"channel_name,omitempty"`     // 冗余渠道名，方便直显
+	Title           string         `gorm:"size:128;not null" json:"title"`            // 计划名称，如 "MacBook Pro 16"
+	Kind            string         `gorm:"size:16;not null" json:"kind"`              // "asset" (购入装备) | "expense" (一笔消费)
+	Principal       int64          `gorm:"not null" json:"principal"`                 // 总本金（分）
+	Periods         int            `gorm:"not null" json:"periods"`                   // 总期数 (3, 6, 12, 24 等)
+	FeeMode         string         `gorm:"size:32;not null" json:"fee_mode"`          // "none" | "fixed_per_period" | "rate_per_period" | "total_fee"
+	FeeValue        int64          `gorm:"default:0" json:"fee_value"`                // 手续费数值：分，或基点/万分比 (如 50 代表 0.50%)
+	TotalFee        int64          `gorm:"default:0" json:"total_fee"`                // 计划总手续费（分）
+	FirstDueDate    string         `gorm:"size:10;not null" json:"first_due_date"`    // 首期还款日 YYYY-MM-DD
+	RepayDay        int            `gorm:"not null" json:"repay_day"`                 // 每月还款日 (1~31)
+	AssetID         string         `gorm:"size:64;index" json:"asset_id,omitempty"`   // 关联装备 ID
+	CategoryID      *uint          `gorm:"index" json:"category_id,omitempty"`        // 关联分类 ID (类型 B)
+	CategoryName    string         `gorm:"size:64" json:"category_name,omitempty"`    // 关联分类名称 (类型 B)
+	PurchaseEntryID *uint          `gorm:"index" json:"purchase_entry_id,omitempty"`  // 类型 B 生成的购买账目 ID
+	Status          string         `gorm:"size:16;index;not null;default:'active'" json:"status"` // "active" | "settled" | "cancelled"
+	Note            string         `json:"note,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"index" json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+}
+
+// InstallmentItem 分期计划期次明细表 (RC-140)
+type InstallmentItem struct {
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	PlanID        uint       `gorm:"index:idx_plan_seq,priority:1;not null" json:"plan_id"`
+	Seq           int        `gorm:"index:idx_plan_seq,priority:2;not null" json:"seq"`           // 第几期 (1..periods)
+	DueDate       string     `gorm:"size:10;index;not null" json:"due_date"`                      // 到期日 YYYY-MM-DD
+	PrincipalPart int64      `gorm:"not null" json:"principal_part"`                              // 本期应还本金（分）
+	FeePart       int64      `gorm:"not null" json:"fee_part"`                                    // 本期应还手续费（分）
+	Status        string     `gorm:"size:16;index;not null;default:'scheduled'" json:"status"`    // "scheduled" | "paid"
+	PaidAt        *time.Time `json:"paid_at,omitempty"`                                           // 实际还款时间
+	PaidAmount    int64      `gorm:"default:0" json:"paid_amount"`                                // 实际支付金额（分）
+	PayAccount    string     `gorm:"size:64" json:"pay_account,omitempty"`                        // 付款账户（如 "招商银行储蓄卡"）
+	TransactionID *uint      `gorm:"index" json:"transaction_id,omitempty"`                       // 关联生成的还款账目 ID
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // CategoryOption 用户自定义分类与字典配置表

@@ -24,7 +24,7 @@ import (
 func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
-	if err := db.DB.AutoMigrate(&models.Transaction{}, &models.Device{}); err != nil {
+	if err := db.DB.AutoMigrate(&models.Transaction{}, &models.Device{}, &models.InstallmentPlan{}, &models.InstallmentItem{}); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
 	}
 
@@ -164,7 +164,7 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 func TestTransactionRejectsNonPositiveAmount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
-	if err := db.DB.AutoMigrate(&models.Transaction{}, &models.Device{}); err != nil {
+	if err := db.DB.AutoMigrate(&models.Transaction{}, &models.Device{}, &models.InstallmentPlan{}, &models.InstallmentItem{}); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
 	}
 

@@ -37,6 +37,8 @@ func setupTestFullDB(t *testing.T) {
 		&models.Wish{},
 		&models.Footprint{},
 		&models.CreditChannel{},
+		&models.InstallmentPlan{},
+		&models.InstallmentItem{},
 		&models.CategoryOption{},
 	)
 	database.Create(&models.CreditChannel{

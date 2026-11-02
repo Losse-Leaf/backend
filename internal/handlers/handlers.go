@@ -40,6 +40,7 @@ func Success(c *gin.Context, data interface{}) {
 }
 
 func Error(c *gin.Context, status int, message string) {
+	log.Printf("[Handler Error %d] %s", status, message)
 	c.JSON(status, Response{
 		Code:    status,
 		Message: message,
@@ -1399,6 +1400,9 @@ type TransactionRequest struct {
 	InstallmentMonthlyPay   int64  `json:"installment_monthly_pay"`
 	InstallmentRemainMonths int    `json:"installment_remain_months"`
 	RepaymentDay            int    `json:"repayment_day"`
+	InstallmentFeeMode      string `json:"installment_fee_mode"`
+	InstallmentFeeValue     int64  `json:"installment_fee_value"`
+	FirstDueDate            string `json:"first_due_date"`
 	// 双向联动：记账大件同步收录至随身设备库 (RC-53)
 	LinkGearAsset bool   `json:"link_gear_asset"`
 	GearCategory  string `json:"gear_category"`
@@ -1574,13 +1578,15 @@ func CreateTransaction(c *gin.Context) {
 			return err
 		}
 
+		var newGearID string
 		if linkGear {
 			gearCategory := strings.TrimSpace(req.GearCategory)
 			if gearCategory == "" {
 				gearCategory = record.Category
 			}
+			newGearID = fmt.Sprintf("gear_%s", generateRandomHex(8))
 			newGear := models.GearItem{
-				ID:           fmt.Sprintf("gear_%s", generateRandomHex(8)),
+				ID:           newGearID,
 				Name:         record.Title,
 				Spec:         strings.TrimSpace(req.GearSpec),
 				Category:     gearCategory,
@@ -1592,6 +1598,28 @@ func CreateTransaction(c *gin.Context) {
 			if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
 				return append(list, newGear), nil
 			}); err != nil {
+				return err
+			}
+		}
+
+		if req.IsInstallment != nil && *req.IsInstallment && record.Type == "expense" {
+			kind := "expense"
+			if linkGear {
+				kind = "asset"
+			}
+			_, _, err := CreatePlanForTransactionTx(
+				tx,
+				&record,
+				req.InstallmentMonths,
+				req.InstallmentChannelCode,
+				req.InstallmentFeeMode,
+				req.InstallmentFeeValue,
+				req.FirstDueDate,
+				req.RepaymentDay,
+				kind,
+				newGearID,
+			)
+			if err != nil {
 				return err
 			}
 		}
@@ -1751,7 +1779,7 @@ func GetTransactionSummary(c *gin.Context) {
 	end := start.AddDate(0, 1, 0)
 
 	var txs []models.Transaction
-	db.DB.Select("type, category, amount").Where("occurred_at >= ? AND occurred_at < ?", start, end).Find(&txs)
+	db.DB.Select("type, category, amount, source, fee_amount").Where("occurred_at >= ? AND occurred_at < ?", start, end).Find(&txs)
 
 	var totalExpense int64
 	var totalIncome int64
@@ -1759,8 +1787,17 @@ func GetTransactionSummary(c *gin.Context) {
 
 	for _, tx := range txs {
 		if tx.Type == "expense" {
-			totalExpense += tx.Amount
-			categoryBreakdown[tx.Category] += tx.Amount
+			expensePart := tx.Amount
+			cat := tx.Category
+			if tx.Source == "installment_repay" {
+				// 分期还款账目：仅手续费计入月支出统计；本金排除在月支出外 (RC-140)
+				expensePart = tx.FeeAmount
+				cat = "利息手续费"
+			}
+			if expensePart > 0 {
+				totalExpense += expensePart
+				categoryBreakdown[cat] += expensePart
+			}
 		} else if tx.Type == "income" {
 			totalIncome += tx.Amount
 		}
@@ -1807,6 +1844,12 @@ func UpdateTransaction(c *gin.Context) {
 	// 金额：**负数**必须被拒绝（会反向冲减所有汇总）；amount 必填非 0（上方已校验）。
 	if req.Amount < 0 {
 		Error(c, http.StatusBadRequest, "金额必须大于 0")
+		return
+	}
+
+	// 分期还款账目金额保护：禁止直接修改金额 (RC-140)
+	if tx.Source == "installment_repay" && req.Amount != tx.Amount {
+		Error(c, http.StatusBadRequest, "分期还款账目金额不可直接修改；如需变动请在分期计划中撤销还款后重新标记")
 		return
 	}
 
@@ -2044,6 +2087,27 @@ func DeleteTransaction(c *gin.Context) {
 
 	// 同上：删除账目后统计缓存必须失效
 	defer InvalidateStatsCache()
+
+	// 若删除的是分期还款账目，联动将对应期次撤销为 scheduled (RC-140)
+	if tx.Source == "installment_repay" && tx.InstallmentItemID != nil {
+		var item models.InstallmentItem
+		if err := db.DB.First(&item, "id = ?", *tx.InstallmentItemID).Error; err == nil {
+			item.Status = "scheduled"
+			item.PaidAt = nil
+			item.PaidAmount = 0
+			item.PayAccount = ""
+			item.TransactionID = nil
+			item.UpdatedAt = config.NowInBeijing()
+			_ = db.DB.Save(&item).Error
+
+			var plan models.InstallmentPlan
+			if err := db.DB.First(&plan, "id = ?", item.PlanID).Error; err == nil && plan.Status == "settled" {
+				plan.Status = "active"
+				plan.UpdatedAt = config.NowInBeijing()
+				_ = db.DB.Save(&plan).Error
+			}
+		}
+	}
 
 	if err := db.DB.Delete(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())

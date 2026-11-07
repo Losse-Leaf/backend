@@ -413,6 +413,9 @@ type CreateFootprintRequest struct {
 	LifeEntryID   *uint  `json:"life_entry_id"`
 	WishID        *uint  `json:"wish_id"`
 	AttachmentIDs []uint `json:"attachment_ids"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
+	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
+	ClientRequestID string `json:"client_request_id"`
 }
 
 // UpdateFootprintRequest 修改足迹/旅程请求
@@ -853,6 +856,18 @@ func CreateFootprint(c *gin.Context) {
 		return
 	}
 
+	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
+	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
+	clientRequestID := strings.TrimSpace(req.ClientRequestID)
+	if clientRequestID != "" {
+		var existing models.Footprint
+		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			populateFootprintURLs(&existing)
+			Success(c, existing)
+			return
+		}
+	}
+
 	visited, err := ParseFlexTime(req.VisitedAt)
 	if err != nil && strings.TrimSpace(req.VisitedAt) != "" {
 		Error(c, http.StatusBadRequest, "到访时间格式无法识别")
@@ -978,6 +993,9 @@ func CreateFootprint(c *gin.Context) {
 			LifeEntryID: lifeEntryID,
 			WishID:      req.WishID,
 		}
+		if clientRequestID != "" {
+			footprint.ClientRequestID = &clientRequestID
+		}
 
 		if err := tx.Create(&footprint).Error; err != nil {
 			return err
@@ -1002,6 +1020,15 @@ func CreateFootprint(c *gin.Context) {
 	})
 
 	if err != nil {
+		// 并发重复提交：唯一索引兜底，回读已有记录按幂等语义返回。
+		if clientRequestID != "" {
+			var existing models.Footprint
+			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				populateFootprintURLs(&existing)
+				Success(c, existing)
+				return
+			}
+		}
 		if errors.Is(err, errAttachmentClaimConflict) {
 			Error(c, http.StatusBadRequest, "保存足迹记录失败: "+err.Error())
 			return

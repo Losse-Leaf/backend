@@ -140,6 +140,123 @@ func TestCreateTransactionIdempotentByClientRequestID(t *testing.T) {
 	}
 }
 
+// ── 契约 B：同一 client_request_id 重复创建造物 → 返回同一条记录
+func TestCreateProjectIdempotentByClientRequestID(t *testing.T) {
+	r, token := setupContractRouter(t)
+
+	body := map[string]any{
+		"title": "幂等造物", "client_request_id": "crid-project-0001",
+	}
+	w1 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("首次创建造物失败: %d %s", w1.Code, w1.Body.String())
+	}
+	var first struct {
+		Data models.Project `json:"data"`
+	}
+	_ = json.Unmarshal(w1.Body.Bytes(), &first)
+
+	w2 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("重复提交应幂等返回 200: %d %s", w2.Code, w2.Body.String())
+	}
+	var second struct {
+		Data models.Project `json:"data"`
+	}
+	_ = json.Unmarshal(w2.Body.Bytes(), &second)
+
+	if first.Data.ID != second.Data.ID {
+		t.Fatalf("同一 client_request_id 应返回同一条造物: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
+	}
+	var count int64
+	db.DB.Model(&models.Project{}).Where("client_request_id = ?", "crid-project-0001").Count(&count)
+	if count != 1 {
+		t.Fatalf("幂等创建造物不得重复落库: 实际 %d 条", count)
+	}
+}
+
+// ── 契约 B：同一 client_request_id 重复许愿 → 返回同一条记录，且不重复伴生散页
+func TestCreateWishIdempotentByClientRequestID(t *testing.T) {
+	r, token := setupContractRouter(t)
+
+	body := map[string]any{
+		"title": "幂等心愿", "client_request_id": "crid-wish-0001",
+	}
+	w1 := doJSON(r, http.MethodPost, "/api/v1/wishes", token, body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("首次许愿失败: %d %s", w1.Code, w1.Body.String())
+	}
+	var first struct {
+		Data models.Wish `json:"data"`
+	}
+	_ = json.Unmarshal(w1.Body.Bytes(), &first)
+
+	w2 := doJSON(r, http.MethodPost, "/api/v1/wishes", token, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("重复提交应幂等返回 200: %d %s", w2.Code, w2.Body.String())
+	}
+	var second struct {
+		Data models.Wish `json:"data"`
+	}
+	_ = json.Unmarshal(w2.Body.Bytes(), &second)
+
+	if first.Data.ID != second.Data.ID {
+		t.Fatalf("同一 client_request_id 应返回同一条心愿: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
+	}
+	var count int64
+	db.DB.Model(&models.Wish{}).Where("client_request_id = ?", "crid-wish-0001").Count(&count)
+	if count != 1 {
+		t.Fatalf("幂等许愿不得重复落库: 实际 %d 条", count)
+	}
+	var entryCount int64
+	db.DB.Model(&models.LifeEntry{}).Where("wish_id = ?", first.Data.ID).Count(&entryCount)
+	if entryCount != 1 {
+		t.Fatalf("幂等许愿不得重复创建伴生散页: 实际 %d 条", entryCount)
+	}
+}
+
+// ── 契约 B：同一 client_request_id 重复创建足迹 → 返回同一条记录
+func TestCreateFootprintIdempotentByClientRequestID(t *testing.T) {
+	r, token := setupContractRouter(t)
+
+	body := map[string]any{
+		"city_code": "330100", "city_name": "杭州市",
+		"visited_at":        "2026-11-01T10:00:00+08:00",
+		"client_request_id": "crid-footprint-0001",
+	}
+	w1 := doJSON(r, http.MethodPost, "/api/v1/footprints", token, body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("首次创建足迹失败: %d %s", w1.Code, w1.Body.String())
+	}
+	var first struct {
+		Data models.Footprint `json:"data"`
+	}
+	_ = json.Unmarshal(w1.Body.Bytes(), &first)
+
+	w2 := doJSON(r, http.MethodPost, "/api/v1/footprints", token, body)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("重复提交应幂等返回 200: %d %s", w2.Code, w2.Body.String())
+	}
+	var second struct {
+		Data models.Footprint `json:"data"`
+	}
+	_ = json.Unmarshal(w2.Body.Bytes(), &second)
+
+	if first.Data.ID != second.Data.ID {
+		t.Fatalf("同一 client_request_id 应返回同一条足迹: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
+	}
+	var count int64
+	db.DB.Model(&models.Footprint{}).Where("client_request_id = ?", "crid-footprint-0001").Count(&count)
+	if count != 1 {
+		t.Fatalf("幂等创建足迹不得重复落库: 实际 %d 条", count)
+	}
+	var entryCount int64
+	db.DB.Model(&models.LifeEntry{}).Where("footprint_id = ?", first.Data.ID).Count(&entryCount)
+	if entryCount != 1 {
+		t.Fatalf("幂等创建足迹不得重复创建伴生散页: 实际 %d 条", entryCount)
+	}
+}
+
 // ── 契约 A：clear_city 显式清空散页属地，且优先于 city_code 字段
 func TestUpdateEntryClearCity(t *testing.T) {
 	r, token := setupContractRouter(t)

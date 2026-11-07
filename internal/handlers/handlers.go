@@ -2132,6 +2132,9 @@ type ProjectRequest struct {
 	GithubURL   string `json:"github_url"`
 	Status      string `json:"status"`
 	Order       int    `json:"order"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
+	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
+	ClientRequestID string `json:"client_request_id"`
 }
 
 func CreateProject(c *gin.Context) {
@@ -2139,6 +2142,17 @@ func CreateProject(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "项目标题必填且格式有效")
 		return
+	}
+
+	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
+	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
+	clientRequestID := strings.TrimSpace(req.ClientRequestID)
+	if clientRequestID != "" {
+		var existing models.Project
+		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			Success(c, existing)
+			return
+		}
 	}
 
 	title := strings.TrimSpace(req.Title)
@@ -2167,6 +2181,9 @@ func CreateProject(c *gin.Context) {
 		Status:      projectStatus,
 		Order:       req.Order,
 	}
+	if clientRequestID != "" {
+		p.ClientRequestID = &clientRequestID
+	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&p).Error; err != nil {
@@ -2178,6 +2195,14 @@ func CreateProject(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		// 并发重复提交：唯一索引兜底，回读已有记录按幂等语义返回。
+		if clientRequestID != "" {
+			var existing models.Project
+			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				Success(c, existing)
+				return
+			}
+		}
 		Error(c, http.StatusInternalServerError, "创建项目及伴生记录失败: "+err.Error())
 		return
 	}

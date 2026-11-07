@@ -102,6 +102,9 @@ type CreateWishRequest struct {
 	// PlantedAt 许下心愿的时刻（可选，支持补录过去的心愿）
 	PlantedAt     string `json:"planted_at"`
 	AttachmentIDs []uint `json:"attachment_ids"`
+	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
+	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
+	ClientRequestID string `json:"client_request_id"`
 }
 
 // UpdateWishRequest 更新心愿请求
@@ -270,6 +273,18 @@ func CreateWish(c *gin.Context) {
 		return
 	}
 
+	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
+	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
+	clientRequestID := strings.TrimSpace(req.ClientRequestID)
+	if clientRequestID != "" {
+		var existing models.Wish
+		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			populateWishURLs(&existing)
+			Success(c, existing)
+			return
+		}
+	}
+
 	var targetDate *time.Time
 	if req.TargetDate != "" {
 		t, err := ParseFlexTime(req.TargetDate)
@@ -323,6 +338,9 @@ func CreateWish(c *gin.Context) {
 		TargetDate: targetDate,
 		PlantedAt:  plantedAt,
 	}
+	if clientRequestID != "" {
+		wish.ClientRequestID = &clientRequestID
+	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&wish).Error; err != nil {
@@ -370,6 +388,15 @@ func CreateWish(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		// 并发重复提交：唯一索引兜底，回读已有记录按幂等语义返回。
+		if clientRequestID != "" {
+			var existing models.Wish
+			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				populateWishURLs(&existing)
+				Success(c, existing)
+				return
+			}
+		}
 		if errors.Is(err, errAttachmentClaimConflict) {
 			Error(c, http.StatusBadRequest, "创建心愿失败: "+err.Error())
 			return

@@ -4,7 +4,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -36,10 +35,15 @@ const (
 // 客户端永远只能看到同一批「最老」的墓碑，游标无法向前推进。
 // 这里用纳秒级单调时间让每条墓碑都有唯一顺序；响应不做截断时它只是
 // 让排序稳定，不依赖客户端解析亚秒精度。
+//
+// 时区必须与 GORM 自动时间戳一致（time.Now() 的服务器本地时区）：
+// SQLite 驱动把 time.Time 写成「本地墙钟 + 偏移」文本，过滤条件
+// `deleted_at >= since` 是字符串比较。若墓碑固定写北京时间，在 UTC
+// 服务器上会比其它行「快 8 小时」，future since 也过滤不掉它。
 var lastTombstoneNano int64
 
 func nextTombstoneTime() time.Time {
-	now := time.Now().In(config.BeijingLocation).UnixNano()
+	now := time.Now().UnixNano()
 	for {
 		prev := atomic.LoadInt64(&lastTombstoneNano)
 		next := now
@@ -47,7 +51,8 @@ func nextTombstoneTime() time.Time {
 			next = prev + 1
 		}
 		if atomic.CompareAndSwapInt64(&lastTombstoneNano, prev, next) {
-			return time.Unix(0, next).In(config.BeijingLocation)
+			// time.Unix 返回本地时区，与 GORM 自动时间戳的存储格式对齐。
+			return time.Unix(0, next)
 		}
 	}
 }

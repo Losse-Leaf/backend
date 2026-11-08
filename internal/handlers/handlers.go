@@ -2236,6 +2236,9 @@ func GetProjectsV1(c *gin.Context) {
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
+	if offset, err := strconv.Atoi(c.Query("offset")); err == nil && offset > 0 {
+		query = query.Offset(offset)
+	}
 
 	// BE-2：聚合与 304 协商前置，命中时不再加载项目列表。
 	agg, err := aggregateListQuery(query)

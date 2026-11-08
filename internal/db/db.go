@@ -100,6 +100,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.CuratorProfile{},
 		&models.Wish{},
 		&models.Footprint{},
+		&models.SyncTombstone{},
 	)
 	if err != nil {
 		return nil, err

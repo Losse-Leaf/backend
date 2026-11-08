@@ -781,7 +781,8 @@ func GetFootprints(c *gin.Context) {
 		return
 	}
 	// 按角色脱敏的列表禁用 If-Modified-Since 跨角色协商。
-	if negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
 		return
 	}
 
@@ -789,6 +790,15 @@ func GetFootprints(c *gin.Context) {
 	if err := query.Find(&footprints).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取足迹列表失败")
 		return
+	}
+
+	// P2-3：只在「不传 limit」的增量请求里注入 purge 墓碑。
+	// 传 limit 的调用方按 has_more 分页，墓碑会打乱 offset 语义，故不注入。
+	if limit == 0 && sinceStr != "" {
+		if err := injectFootprintTombstones(&footprints, sinceStr); err != nil {
+			Error(c, http.StatusInternalServerError, "获取足迹列表失败")
+			return
+		}
 	}
 
 	hasMore := false
@@ -1293,6 +1303,13 @@ func DeleteFootprint(c *gin.Context) {
 				if err := tx.Unscoped().Where("id = ?", *f.LifeEntryID).Delete(&models.LifeEntry{}).Error; err != nil {
 					return err
 				}
+				// P2-3：首生散页被级联物理删除，补墓碑。
+				if err := recordSyncTombstone(tx, TombstoneEntityEntry, *f.LifeEntryID); err != nil {
+					return err
+				}
+			}
+			if err := recordSyncTombstone(tx, TombstoneEntityFootprint, f.ID); err != nil {
+				return err
 			}
 			return tx.Unscoped().Delete(&f).Error
 		})

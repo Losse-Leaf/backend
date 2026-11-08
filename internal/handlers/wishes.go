@@ -203,7 +203,8 @@ func GetWishes(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取心愿列表失败")
 		return
 	}
-	if negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
 		return
 	}
 
@@ -212,6 +213,14 @@ func GetWishes(c *gin.Context) {
 	if err := query.Offset(offset).Limit(pageSize).Find(&wishes).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取心愿列表失败")
 		return
+	}
+
+	// P2-3：只在增量第一页注入 purge 墓碑。
+	if page == 1 && sinceStr != "" {
+		if err := injectWishTombstones(&wishes, sinceStr); err != nil {
+			Error(c, http.StatusInternalServerError, "获取心愿列表失败")
+			return
+		}
 	}
 
 	populateWishURLsBatch(wishes)
@@ -1024,6 +1033,12 @@ func DeleteWish(c *gin.Context) {
 					return err
 				}
 				keysToDelete = append(keysToDelete, keys...)
+			}
+			// P2-3：心愿本体被物理删除，写墓碑让离线客户端能删掉本地行。
+			// 伴生散页走的是软删除（上方 tx.Delete），它们的 deleted_at 已经
+			// 会出现在增量 entries 结果里，无需额外墓碑。
+			if err := recordSyncTombstone(tx, TombstoneEntityWish, w.ID); err != nil {
+				return err
 			}
 			if err := tx.Unscoped().Delete(&w).Error; err != nil {
 				return err

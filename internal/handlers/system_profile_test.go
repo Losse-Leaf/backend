@@ -40,6 +40,7 @@ func setupTestFullDB(t *testing.T) {
 		&models.InstallmentPlan{},
 		&models.InstallmentItem{},
 		&models.CategoryOption{},
+		&models.SyncTombstone{},
 	)
 	database.Create(&models.CreditChannel{
 		Code:         "huabei",

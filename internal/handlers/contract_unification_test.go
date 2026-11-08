@@ -32,6 +32,7 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 		&models.LifeEntry{}, &models.Transaction{}, &models.Attachment{},
 		&models.Footprint{}, &models.Wish{}, &models.Device{}, &models.CuratorProfile{},
 		&models.Project{}, &models.CreditChannel{}, &models.InstallmentPlan{}, &models.InstallmentItem{},
+		&models.SyncTombstone{},
 	); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
 	}

@@ -760,7 +760,9 @@ func GetLifeEntriesV1(c *gin.Context) {
 		return
 	}
 	// 按角色脱敏 + 软删除会改变 total：禁用 If-Modified-Since，只走 ETag。
-	if negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	// 增量请求（since）跳过 304：响应体除了数据库行还会合成 purge 墓碑，
+	// 而 ETag 聚合只覆盖真实行，命中 304 会让墓碑永远送不出去。
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
 		return
 	}
 
@@ -769,6 +771,14 @@ func GetLifeEntriesV1(c *gin.Context) {
 	if err := query.Offset(offset).Limit(pageSize).Find(&entries).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取生活档案失败")
 		return
+	}
+
+	// P2-3：只在增量第一页注入 purge 墓碑（后续页的 offset 仍按真实行计算）。
+	if page == 1 && sinceStr != "" {
+		if err := injectEntryTombstones(&entries, sinceStr); err != nil {
+			Error(c, http.StatusInternalServerError, "获取生活档案失败")
+			return
+		}
 	}
 
 	populateEntryURLsBatch(entries)
@@ -1154,6 +1164,11 @@ func DeleteLifeEntry(c *gin.Context) {
 					if err := tx.Unscoped().Delete(&models.Footprint{}, fp.ID).Error; err != nil {
 						return err
 					}
+					// P2-3：足迹被级联物理删除，必须留下墓碑；否则离线客户端
+					// 只会看到它从增量结果里静默消失，本地永远保留这趟旅程。
+					if err := recordSyncTombstone(tx, TombstoneEntityFootprint, fp.ID); err != nil {
+						return err
+					}
 					// 心愿对该足迹的溯源引用一并解绑，不留指向已物理删除足迹的悬空外键
 					//（与 DeleteFootprint purge 同款处理；第三轮 P2-5 连带项）
 					if err := tx.Model(&models.Wish{}).Where("footprint_id = ?", fp.ID).Update("footprint_id", nil).Error; err != nil {
@@ -1162,6 +1177,9 @@ func DeleteLifeEntry(c *gin.Context) {
 				}
 			}
 			tx.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
+			if err := recordSyncTombstone(tx, TombstoneEntityEntry, entry.ID); err != nil {
+				return err
+			}
 			return tx.Unscoped().Delete(&entry).Error
 		})
 		if err != nil {
@@ -1735,7 +1753,8 @@ func GetTransactions(c *gin.Context) {
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
-	if offset, err := strconv.Atoi(c.Query("offset")); err == nil && offset > 0 {
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if offset > 0 {
 		query = query.Offset(offset)
 	}
 
@@ -1745,7 +1764,8 @@ func GetTransactions(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取记账列表失败")
 		return
 	}
-	if negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
 		return
 	}
 
@@ -1753,6 +1773,14 @@ func GetTransactions(c *gin.Context) {
 	if err := query.Find(&txs).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取记账列表失败")
 		return
+	}
+
+	// P2-3：只在增量第一页（offset=0）注入 purge 墓碑。
+	if offset == 0 && sinceStr != "" {
+		if err := injectTransactionTombstones(&txs, sinceStr); err != nil {
+			Error(c, http.StatusInternalServerError, "获取记账列表失败")
+			return
+		}
 	}
 
 	// 分期剩余期数按当前时间即时推算展示，不落库 (BE-24：GET 保持只读语义，避免扰动 ETag/304 与并发竞态)
@@ -2091,7 +2119,14 @@ func DeleteTransaction(c *gin.Context) {
 	}
 
 	if purge {
-		if err := db.DB.Unscoped().Delete(&tx).Error; err != nil {
+		// P2-3：物理删除与墓碑必须同一事务提交，避免「行没了、墓碑没写」
+		// 导致离线客户端永久保留一条幽灵账目。
+		if err := db.DB.Transaction(func(txDB *gorm.DB) error {
+			if err := recordSyncTombstone(txDB, TombstoneEntityTransaction, tx.ID); err != nil {
+				return err
+			}
+			return txDB.Unscoped().Delete(&tx).Error
+		}); err != nil {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
@@ -2266,7 +2301,8 @@ func GetProjectsV1(c *gin.Context) {
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
-	if offset, err := strconv.Atoi(c.Query("offset")); err == nil && offset > 0 {
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if offset > 0 {
 		query = query.Offset(offset)
 	}
 
@@ -2276,7 +2312,8 @@ func GetProjectsV1(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取项目列表失败")
 		return
 	}
-	if negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
 		return
 	}
 
@@ -2284,6 +2321,14 @@ func GetProjectsV1(c *gin.Context) {
 	if err := query.Find(&projects).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取项目列表失败")
 		return
+	}
+
+	// P2-3：只在增量第一页（offset=0）注入 purge 墓碑。
+	if offset == 0 && sinceStr != "" {
+		if err := injectProjectTombstones(&projects, sinceStr); err != nil {
+			Error(c, http.StatusInternalServerError, "获取项目列表失败")
+			return
+		}
 	}
 
 	// MOB-P1-36：服务端权威增量游标（保持本页语义）
@@ -2456,8 +2501,23 @@ func DeleteProject(c *gin.Context) {
 
 	if purge {
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
-			// 物理删除项目时，一并物理删除它在时间流里的伴生散页
-			tx.Unscoped().Where("project_id = ?", p.ID).Delete(&models.LifeEntry{})
+			// 物理删除项目时，一并物理删除它在时间流里的伴生散页。
+			// P2-3：先收集 id 再删，给每条被级联物理删除的散页补墓碑。
+			var companionIDs []uint
+			if err := tx.Unscoped().Model(&models.LifeEntry{}).
+				Where("project_id = ?", p.ID).
+				Pluck("id", &companionIDs).Error; err != nil {
+				return err
+			}
+			if err := tx.Unscoped().Where("project_id = ?", p.ID).Delete(&models.LifeEntry{}).Error; err != nil {
+				return err
+			}
+			if err := recordSyncTombstones(tx, TombstoneEntityEntry, companionIDs); err != nil {
+				return err
+			}
+			if err := recordSyncTombstone(tx, TombstoneEntityProject, p.ID); err != nil {
+				return err
+			}
 			return tx.Unscoped().Delete(&p).Error
 		})
 		if err != nil {

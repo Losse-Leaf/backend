@@ -296,6 +296,22 @@ type Wish struct {
 	DeletedAt       gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 }
 
+// SyncTombstone 增量同步墓碑表。
+//
+// 物理删除（?purge=true）会把原行从数据库里彻底抹掉，增量同步的
+// `updated_at/deleted_at >= since` 过滤就再也看不到它 —— 离线超过软删窗口的
+// 客户端会永久保留一条服务端已经不存在的记录。
+//
+// 因此 purge 时在同一事务里写一条最小墓碑（只保留 id / 类型 / 删除时刻），
+// 五类增量列表接口在带 since 的请求里把墓碑合成回对应模型的 JSON 行，
+// 客户端沿用现有的 deleted_at 合并逻辑即可删除本地行。
+type SyncTombstone struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	EntityType string    `gorm:"size:32;not null;uniqueIndex:idx_sync_tombstone_entity" json:"entity_type"`
+	EntityID   uint      `gorm:"not null;uniqueIndex:idx_sync_tombstone_entity" json:"entity_id"`
+	DeletedAt  time.Time `gorm:"index;not null" json:"deleted_at"`
+}
+
 // Footprint 城市旅游足迹与旅程档案表 (支持单日打卡或多日旅程挂载多条动态与多笔消费)
 type Footprint struct {
 	ID               uint         `gorm:"primaryKey;index:idx_fp_visited_id,priority:2" json:"id"`

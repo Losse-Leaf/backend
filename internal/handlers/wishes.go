@@ -279,6 +279,11 @@ func CreateWish(c *gin.Context) {
 	if clientRequestID != "" {
 		var existing models.Wish
 		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			c.Header("X-Idempotent-Replay", "true")
+			if existing.DeletedAt.Valid {
+				Error(c, http.StatusGone, "记录已在服务端被删除")
+				return
+			}
 			populateWishURLs(&existing)
 			Success(c, existing)
 			return
@@ -392,6 +397,11 @@ func CreateWish(c *gin.Context) {
 		if clientRequestID != "" {
 			var existing models.Wish
 			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				c.Header("X-Idempotent-Replay", "true")
+				if existing.DeletedAt.Valid {
+					Error(c, http.StatusGone, "记录已在服务端被删除")
+					return
+				}
 				populateWishURLs(&existing)
 				Success(c, existing)
 				return

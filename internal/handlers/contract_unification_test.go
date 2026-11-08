@@ -168,10 +168,48 @@ func TestCreateProjectIdempotentByClientRequestID(t *testing.T) {
 	if first.Data.ID != second.Data.ID {
 		t.Fatalf("同一 client_request_id 应返回同一条造物: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
 	}
+	if w2.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("重复创建应带 X-Idempotent-Replay: true 响应头")
+	}
 	var count int64
 	db.DB.Model(&models.Project{}).Where("client_request_id = ?", "crid-project-0001").Count(&count)
 	if count != 1 {
 		t.Fatalf("幂等创建造物不得重复落库: 实际 %d 条", count)
+	}
+}
+
+// OPT-08: 软删除记录幂等重放时返回 410 Gone，并带 X-Idempotent-Replay 响应头
+func TestOPT08_SoftDeletedRecordIdempotentReplayReturns410(t *testing.T) {
+	r, token := setupContractRouter(t)
+
+	body := map[string]any{
+		"title": "即将被删的造物", "client_request_id": "crid-opt08-deleted-proj",
+	}
+	w1 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("创建失败: %d", w1.Code)
+	}
+	if w1.Header().Get("X-Idempotent-Replay") != "" {
+		t.Fatalf("首次创建不应带 X-Idempotent-Replay 头")
+	}
+
+	var created struct {
+		Data models.Project `json:"data"`
+	}
+	_ = json.Unmarshal(w1.Body.Bytes(), &created)
+
+	// 软删除该造物
+	if err := db.DB.Delete(&models.Project{}, created.Data.ID).Error; err != nil {
+		t.Fatalf("软删除失败: %v", err)
+	}
+
+	// 再次重放同一 client_request_id
+	w2 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	if w2.Code != http.StatusGone {
+		t.Fatalf("软删记录幂等重放应返回 410 Gone, 实际得到: %d %s", w2.Code, w2.Body.String())
+	}
+	if w2.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("软删重放应带 X-Idempotent-Replay: true")
 	}
 }
 

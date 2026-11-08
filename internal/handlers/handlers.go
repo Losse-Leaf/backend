@@ -454,7 +454,12 @@ func CreateLifeEntry(c *gin.Context) {
 	clientRequestID := strings.TrimSpace(req.ClientRequestID)
 	if clientRequestID != "" {
 		var existing models.LifeEntry
-		if err := db.DB.Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			c.Header("X-Idempotent-Replay", "true")
+			if existing.DeletedAt.Valid {
+				Error(c, http.StatusGone, "记录已在服务端被删除")
+				return
+			}
 			populateEntryURLs(&existing)
 			Success(c, existing)
 			return
@@ -643,6 +648,11 @@ func CreateLifeEntry(c *gin.Context) {
 		if clientRequestID != "" {
 			var existing models.LifeEntry
 			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				c.Header("X-Idempotent-Replay", "true")
+				if existing.DeletedAt.Valid {
+					Error(c, http.StatusGone, "记录已在服务端被删除")
+					return
+				}
 				populateEntryURLs(&existing)
 				Success(c, existing)
 				return
@@ -1443,7 +1453,12 @@ func CreateTransaction(c *gin.Context) {
 	clientRequestID := strings.TrimSpace(req.ClientRequestID)
 	if clientRequestID != "" {
 		var existing models.Transaction
-		if err := db.DB.Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			c.Header("X-Idempotent-Replay", "true")
+			if existing.DeletedAt.Valid {
+				Error(c, http.StatusGone, "记录已在服务端被删除")
+				return
+			}
 			Success(c, existing)
 			return
 		}
@@ -1648,6 +1663,11 @@ func CreateTransaction(c *gin.Context) {
 		if clientRequestID != "" {
 			var existing models.Transaction
 			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				c.Header("X-Idempotent-Replay", "true")
+				if existing.DeletedAt.Valid {
+					Error(c, http.StatusGone, "记录已在服务端被删除")
+					return
+				}
 				Success(c, existing)
 				return
 			}
@@ -2150,6 +2170,11 @@ func CreateProject(c *gin.Context) {
 	if clientRequestID != "" {
 		var existing models.Project
 		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			c.Header("X-Idempotent-Replay", "true")
+			if existing.DeletedAt.Valid {
+				Error(c, http.StatusGone, "记录已在服务端被删除")
+				return
+			}
 			Success(c, existing)
 			return
 		}
@@ -2199,6 +2224,11 @@ func CreateProject(c *gin.Context) {
 		if clientRequestID != "" {
 			var existing models.Project
 			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				c.Header("X-Idempotent-Replay", "true")
+				if existing.DeletedAt.Valid {
+					Error(c, http.StatusGone, "记录已在服务端被删除")
+					return
+				}
 				Success(c, existing)
 				return
 			}

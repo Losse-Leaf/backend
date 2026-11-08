@@ -862,6 +862,11 @@ func CreateFootprint(c *gin.Context) {
 	if clientRequestID != "" {
 		var existing models.Footprint
 		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
+			c.Header("X-Idempotent-Replay", "true")
+			if existing.DeletedAt.Valid {
+				Error(c, http.StatusGone, "记录已在服务端被删除")
+				return
+			}
 			populateFootprintURLs(&existing)
 			Success(c, existing)
 			return
@@ -1024,6 +1029,11 @@ func CreateFootprint(c *gin.Context) {
 		if clientRequestID != "" {
 			var existing models.Footprint
 			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
+				c.Header("X-Idempotent-Replay", "true")
+				if existing.DeletedAt.Valid {
+					Error(c, http.StatusGone, "记录已在服务端被删除")
+					return
+				}
 				populateFootprintURLs(&existing)
 				Success(c, existing)
 				return

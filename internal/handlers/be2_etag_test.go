@@ -247,3 +247,24 @@ func TestBE2_200ResponseShapeUnchanged(t *testing.T) {
 		t.Fatalf("expected total=1 from reused aggregate, got %v", data["total"])
 	}
 }
+
+// OPT-12: aggregateListQuery 必须剥除 OFFSET，避免带 offset 的分页查询计算出的 Total 变为 0。
+func TestBE2_AggregateListQueryIgnoresOffset(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setupTestFullDB(t)
+
+	for i := 0; i < 5; i++ {
+		if err := db.DB.Create(&models.Project{Title: "proj"}).Error; err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+	}
+
+	agg, err := aggregateListQuery(db.DB.Model(&models.Project{}).Offset(3))
+	if err != nil {
+		t.Fatalf("aggregateListQuery failed: %v", err)
+	}
+	if agg.Total != 5 {
+		t.Fatalf("expected aggregate total=5 regardless of offset, got %d", agg.Total)
+	}
+}
+

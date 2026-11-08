@@ -70,6 +70,17 @@ func TestBE3_SyncSinceQueryPlanUsesUpdatedAtIndex(t *testing.T) {
 			t.Fatalf("seed transaction: %v", err)
 		}
 	}
+	for i := 0; i < 50; i++ {
+		if err := db.DB.Create(&models.Project{Title: "proj"}).Error; err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+		if err := db.DB.Create(&models.Wish{Title: "wish", Kind: "item"}).Error; err != nil {
+			t.Fatalf("seed wish: %v", err)
+		}
+		if err := db.DB.Create(&models.Footprint{CityCode: "330100", CityName: "杭州", VisitedAt: time.Now()}).Error; err != nil {
+			t.Fatalf("seed footprint: %v", err)
+		}
+	}
 	since := time.Now().Add(-time.Hour).Format(time.RFC3339Nano)
 
 	t.Run("entries", func(t *testing.T) {
@@ -97,6 +108,48 @@ func TestBE3_SyncSinceQueryPlanUsesUpdatedAtIndex(t *testing.T) {
 		}
 		if strings.Contains(plan, "SCAN transactions\n") {
 			t.Fatalf("transactions plan must not full-scan transactions, got:\n%s", plan)
+		}
+	})
+
+	t.Run("projects", func(t *testing.T) {
+		plan := queryPlan(t, func(tx *gorm.DB) *gorm.DB {
+			var projs []models.Project
+			q := applySyncSince(tx.Model(&models.Project{}).Order("`order` ASC, id DESC"), &models.Project{}, since)
+			return q.Limit(50).Find(&projs)
+		})
+		if !strings.Contains(plan, "idx_projects_updated_at") && !strings.Contains(plan, "MULTI-INDEX OR") {
+			t.Fatalf("projects plan should use updated_at index / MULTI-INDEX OR, got:\n%s", plan)
+		}
+		if strings.Contains(plan, "SCAN projects\n") {
+			t.Fatalf("projects plan must not full-scan projects, got:\n%s", plan)
+		}
+	})
+
+	t.Run("wishes", func(t *testing.T) {
+		plan := queryPlan(t, func(tx *gorm.DB) *gorm.DB {
+			var ws []models.Wish
+			q := applySyncSince(tx.Model(&models.Wish{}).Order("created_at DESC, id DESC"), &models.Wish{}, since)
+			return q.Limit(50).Find(&ws)
+		})
+		if !strings.Contains(plan, "idx_wishes_updated_at") && !strings.Contains(plan, "MULTI-INDEX OR") {
+			t.Fatalf("wishes plan should use updated_at index / MULTI-INDEX OR, got:\n%s", plan)
+		}
+		if strings.Contains(plan, "SCAN wishes\n") {
+			t.Fatalf("wishes plan must not full-scan wishes, got:\n%s", plan)
+		}
+	})
+
+	t.Run("footprints", func(t *testing.T) {
+		plan := queryPlan(t, func(tx *gorm.DB) *gorm.DB {
+			var fps []models.Footprint
+			q := applySyncSince(tx.Model(&models.Footprint{}).Order("visited_at DESC, id DESC"), &models.Footprint{}, since)
+			return q.Limit(50).Find(&fps)
+		})
+		if !strings.Contains(plan, "idx_footprints_updated_at") && !strings.Contains(plan, "MULTI-INDEX OR") {
+			t.Fatalf("footprints plan should use updated_at index / MULTI-INDEX OR, got:\n%s", plan)
+		}
+		if strings.Contains(plan, "SCAN footprints\n") {
+			t.Fatalf("footprints plan must not full-scan footprints, got:\n%s", plan)
 		}
 	})
 }

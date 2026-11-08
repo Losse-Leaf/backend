@@ -48,6 +48,7 @@ func aggregateListQuery(query *gorm.DB) (listAggregate, error) {
 		Select("COUNT(*) AS total, MAX(updated_at) AS max_updated, MAX(deleted_at) AS max_deleted")
 	delete(aggQuery.Statement.Clauses, "ORDER BY")
 	delete(aggQuery.Statement.Clauses, "LIMIT")
+	delete(aggQuery.Statement.Clauses, "OFFSET")
 
 	if err := aggQuery.Scan(&row).Error; err != nil {
 		return listAggregate{}, err

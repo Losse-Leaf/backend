@@ -395,12 +395,14 @@ func CreateInstallmentPlan(c *gin.Context) {
 		return
 	}
 
+	// 联动建 gear 时先取器物互斥锁再开事务（锁序 profileGearMu → DB，与 CreateTransaction / ResolveWish 一致）
+	if req.Kind == "asset" {
+		profileGearMu.Lock()
+		defer profileGearMu.Unlock()
+	}
+
 	dbTx := db.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-		}
-	}()
+	defer dbTx.Rollback()
 
 	now := config.NowInBeijing()
 	purchaseDateStr := strings.TrimSpace(req.PurchaseDate)
@@ -587,10 +589,22 @@ func GetInstallmentPlans(c *gin.Context) {
 	todayStr := config.NowInBeijing().Format("2006-01-02")
 	todayDate, _ := time.ParseInLocation("2006-01-02", todayStr, config.BeijingLocation)
 
+	itemsByPlanID := make(map[uint][]models.InstallmentItem, len(plans))
+	if len(plans) > 0 {
+		planIDs := make([]uint, len(plans))
+		for i, p := range plans {
+			planIDs[i] = p.ID
+		}
+		var allItems []models.InstallmentItem
+		db.DB.Where("plan_id IN ?", planIDs).Order("plan_id ASC, seq ASC").Find(&allItems)
+		for _, it := range allItems {
+			itemsByPlanID[it.PlanID] = append(itemsByPlanID[it.PlanID], it)
+		}
+	}
+
 	results := make([]InstallmentPlanItemSummary, 0, len(plans))
 	for _, plan := range plans {
-		var items []models.InstallmentItem
-		db.DB.Where("plan_id = ?", plan.ID).Order("seq ASC").Find(&items)
+		items := itemsByPlanID[plan.ID]
 
 		summary := InstallmentPlanItemSummary{
 			InstallmentPlan: plan,
@@ -839,11 +853,26 @@ func PayInstallmentItem(c *gin.Context) {
 	}
 
 	dbTx := db.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-		}
-	}()
+	defer dbTx.Rollback()
+
+	// 在事务内原子抢占 scheduled 状态，防止并发重复点击产生双份还款流水
+	claimRes := dbTx.Model(&models.InstallmentItem{}).
+		Where("id = ? AND status = ?", item.ID, "scheduled").
+		Updates(map[string]any{
+			"status":      "paid",
+			"paid_at":     &paidAt,
+			"paid_amount": paidAmount,
+			"pay_account": payAccount,
+			"updated_at":  now,
+		})
+	if claimRes.Error != nil {
+		Error(c, http.StatusInternalServerError, "更新期次状态失败: "+claimRes.Error.Error())
+		return
+	}
+	if claimRes.RowsAffected == 0 {
+		Error(c, http.StatusBadRequest, "该期次已标记还款，不得重复入账")
+		return
+	}
 
 	// 生成还款支出账目流水
 	repayTx := models.Transaction{
@@ -862,24 +891,23 @@ func PayInstallmentItem(c *gin.Context) {
 		UpdatedAt:         now,
 	}
 	if err := dbTx.Create(&repayTx).Error; err != nil {
-		dbTx.Rollback()
 		Error(c, http.StatusInternalServerError, "创建还款流水失败: "+err.Error())
 		return
 	}
 
-	// 更新期次状态
+	if err := dbTx.Model(&models.InstallmentItem{}).
+		Where("id = ?", item.ID).
+		Update("transaction_id", repayTx.ID).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "绑定还款流水失败: "+err.Error())
+		return
+	}
+
 	item.Status = "paid"
 	item.PaidAt = &paidAt
 	item.PaidAmount = paidAmount
 	item.PayAccount = payAccount
 	item.TransactionID = &repayTx.ID
 	item.UpdatedAt = now
-
-	if err := dbTx.Save(&item).Error; err != nil {
-		dbTx.Rollback()
-		Error(c, http.StatusInternalServerError, "更新期次状态失败: "+err.Error())
-		return
-	}
 
 	// 检查是否全期已还完
 	var remainingCount int64
@@ -924,11 +952,7 @@ func UnpayInstallmentItem(c *gin.Context) {
 	}
 
 	dbTx := db.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-		}
-	}()
+	defer dbTx.Rollback()
 
 	// 软删除关联的流水记录
 	if item.TransactionID != nil {
@@ -1042,11 +1066,23 @@ func SettleInstallmentPlan(c *gin.Context) {
 	}
 
 	dbTx := db.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-		}
-	}()
+	defer dbTx.Rollback()
+
+	// 事务内原子抢占计划状态，防止并发重复结清产生双份结清流水
+	claimPlan := dbTx.Model(&models.InstallmentPlan{}).
+		Where("id = ? AND status NOT IN ?", plan.ID, []string{"settled", "cancelled"}).
+		Updates(map[string]any{
+			"status":     "settled",
+			"updated_at": now,
+		})
+	if claimPlan.Error != nil {
+		Error(c, http.StatusInternalServerError, "更新计划状态失败: "+claimPlan.Error.Error())
+		return
+	}
+	if claimPlan.RowsAffected == 0 {
+		Error(c, http.StatusBadRequest, "该分期计划已经结清或已取消")
+		return
+	}
 
 	// 生成结清流水
 	repayTx := models.Transaction{
@@ -1064,7 +1100,6 @@ func SettleInstallmentPlan(c *gin.Context) {
 		UpdatedAt:         now,
 	}
 	if err := dbTx.Create(&repayTx).Error; err != nil {
-		dbTx.Rollback()
 		Error(c, http.StatusInternalServerError, "创建结清流水失败: "+err.Error())
 		return
 	}
@@ -1079,7 +1114,6 @@ func SettleInstallmentPlan(c *gin.Context) {
 		it.TransactionID = &repayTx.ID
 		it.UpdatedAt = now
 		if err := dbTx.Save(it).Error; err != nil {
-			dbTx.Rollback()
 			Error(c, http.StatusInternalServerError, "更新期次状态失败: "+err.Error())
 			return
 		}
@@ -1087,11 +1121,6 @@ func SettleInstallmentPlan(c *gin.Context) {
 
 	plan.Status = "settled"
 	plan.UpdatedAt = now
-	if err := dbTx.Save(&plan).Error; err != nil {
-		dbTx.Rollback()
-		Error(c, http.StatusInternalServerError, "更新计划状态失败: "+err.Error())
-		return
-	}
 
 	if err := dbTx.Commit().Error; err != nil {
 		Error(c, http.StatusInternalServerError, "提交事务失败: "+err.Error())
@@ -1100,10 +1129,10 @@ func SettleInstallmentPlan(c *gin.Context) {
 
 	InvalidateStatsCache()
 	Success(c, gin.H{
-		"settled":        true,
-		"plan":           plan,
-		"transaction":    repayTx,
-		"settled_fee":    settleFee,
+		"settled":         true,
+		"plan":            plan,
+		"transaction":     repayTx,
+		"settled_fee":     settleFee,
 		"settled_periods": len(scheduledItems),
 	})
 }
@@ -1126,11 +1155,7 @@ func DeleteInstallmentPlan(c *gin.Context) {
 	}
 
 	dbTx := db.DB.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			dbTx.Rollback()
-		}
-	}()
+	defer dbTx.Rollback()
 
 	// 清理该计划的所有期次
 	_ = dbTx.Where("plan_id = ?", plan.ID).Delete(&models.InstallmentItem{}).Error
@@ -1269,15 +1294,25 @@ func GetUpcomingInstallmentItems(c *gin.Context) {
 		Find(&items)
 
 	planMap := make(map[uint]models.InstallmentPlan)
+	if len(items) > 0 {
+		planIDSet := make(map[uint]struct{}, len(items))
+		planIDs := make([]uint, 0, len(items))
+		for _, it := range items {
+			if _, ok := planIDSet[it.PlanID]; !ok {
+				planIDSet[it.PlanID] = struct{}{}
+				planIDs = append(planIDs, it.PlanID)
+			}
+		}
+		var plans []models.InstallmentPlan
+		db.DB.Where("id IN ?", planIDs).Find(&plans)
+		for _, p := range plans {
+			planMap[p.ID] = p
+		}
+	}
 	results := make([]UpcomingInstallmentItemResponse, 0, len(items))
 
 	for _, it := range items {
-		plan, exists := planMap[it.PlanID]
-		if !exists {
-			if err := db.DB.First(&plan, "id = ?", it.PlanID).Error; err == nil {
-				planMap[it.PlanID] = plan
-			}
-		}
+		plan := planMap[it.PlanID]
 
 		itemDue, _ := time.ParseInLocation("2006-01-02", it.DueDate, config.BeijingLocation)
 		isOverdue := itemDue.Before(todayDate)

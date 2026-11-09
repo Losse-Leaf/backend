@@ -236,9 +236,23 @@ func GetAssetsOverview(c *gin.Context) {
 	var activePlans []models.InstallmentPlan
 	db.DB.Where("status = 'active'").Find(&activePlans)
 
+	scheduledByPlanID := make(map[uint][]models.InstallmentItem, len(activePlans))
+	if len(activePlans) > 0 {
+		activePlanIDs := make([]uint, len(activePlans))
+		for i, p := range activePlans {
+			activePlanIDs[i] = p.ID
+		}
+		var allScheduled []models.InstallmentItem
+		db.DB.Where("plan_id IN ? AND status = 'scheduled'", activePlanIDs).
+			Order("plan_id ASC, seq ASC").
+			Find(&allScheduled)
+		for _, it := range allScheduled {
+			scheduledByPlanID[it.PlanID] = append(scheduledByPlanID[it.PlanID], it)
+		}
+	}
+
 	for _, plan := range activePlans {
-		var scheduledItems []models.InstallmentItem
-		db.DB.Where("plan_id = ? AND status = 'scheduled'", plan.ID).Order("seq ASC").Find(&scheduledItems)
+		scheduledItems := scheduledByPlanID[plan.ID]
 		if len(scheduledItems) == 0 {
 			continue
 		}

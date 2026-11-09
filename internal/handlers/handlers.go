@@ -2122,6 +2122,14 @@ func DeleteTransaction(c *gin.Context) {
 		// P2-3：物理删除与墓碑必须同一事务提交，避免「行没了、墓碑没写」
 		// 导致离线客户端永久保留一条幽灵账目。
 		if err := db.DB.Transaction(func(txDB *gorm.DB) error {
+			if tx.Source == "installment_purchase" && tx.InstallmentPlanID != nil {
+				if err := txDB.Unscoped().Where("plan_id = ?", *tx.InstallmentPlanID).Delete(&models.InstallmentItem{}).Error; err != nil {
+					return err
+				}
+				if err := txDB.Unscoped().Delete(&models.InstallmentPlan{}, *tx.InstallmentPlanID).Error; err != nil {
+					return err
+				}
+			}
 			if err := recordSyncTombstone(txDB, TombstoneEntityTransaction, tx.ID); err != nil {
 				return err
 			}
@@ -2143,28 +2151,44 @@ func DeleteTransaction(c *gin.Context) {
 	// 同上：删除账目后统计缓存必须失效
 	defer InvalidateStatsCache()
 
-	// 若删除的是分期还款账目，联动将对应期次撤销为 scheduled (RC-140)
-	if tx.Source == "installment_repay" && tx.InstallmentItemID != nil {
-		var item models.InstallmentItem
-		if err := db.DB.First(&item, "id = ?", *tx.InstallmentItemID).Error; err == nil {
-			item.Status = "scheduled"
-			item.PaidAt = nil
-			item.PaidAmount = 0
-			item.PayAccount = ""
-			item.TransactionID = nil
-			item.UpdatedAt = config.NowInBeijing()
-			_ = db.DB.Save(&item).Error
+	if err := db.DB.Transaction(func(txDB *gorm.DB) error {
+		// 若删除的是分期还款账目，联动将对应期次撤销为 scheduled (RC-140)
+		if tx.Source == "installment_repay" && tx.InstallmentItemID != nil {
+			var item models.InstallmentItem
+			if err := txDB.First(&item, "id = ?", *tx.InstallmentItemID).Error; err == nil {
+				item.Status = "scheduled"
+				item.PaidAt = nil
+				item.PaidAmount = 0
+				item.PayAccount = ""
+				item.TransactionID = nil
+				item.UpdatedAt = config.NowInBeijing()
+				if err := txDB.Save(&item).Error; err != nil {
+					return err
+				}
 
-			var plan models.InstallmentPlan
-			if err := db.DB.First(&plan, "id = ?", item.PlanID).Error; err == nil && plan.Status == "settled" {
-				plan.Status = "active"
-				plan.UpdatedAt = config.NowInBeijing()
-				_ = db.DB.Save(&plan).Error
+				var plan models.InstallmentPlan
+				if err := txDB.First(&plan, "id = ?", item.PlanID).Error; err == nil && plan.Status == "settled" {
+					plan.Status = "active"
+					plan.UpdatedAt = config.NowInBeijing()
+					if err := txDB.Save(&plan).Error; err != nil {
+						return err
+					}
+				}
 			}
 		}
-	}
 
-	if err := db.DB.Delete(&tx).Error; err != nil {
+		// 若删除的是分期购买初始支出账目，联动软删除其关联的分期计划与期次，避免残留悬空负债
+		if tx.Source == "installment_purchase" && tx.InstallmentPlanID != nil {
+			if err := txDB.Where("plan_id = ?", *tx.InstallmentPlanID).Delete(&models.InstallmentItem{}).Error; err != nil {
+				return err
+			}
+			if err := txDB.Delete(&models.InstallmentPlan{}, *tx.InstallmentPlanID).Error; err != nil {
+				return err
+			}
+		}
+
+		return txDB.Delete(&tx).Error
+	}); err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
@@ -2500,14 +2524,22 @@ func DeleteProject(c *gin.Context) {
 	}
 
 	if purge {
+		var keysToDelete []string
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
-			// 物理删除项目时，一并物理删除它在时间流里的伴生散页。
+			// 物理删除项目时，一并物理删除它在时间流里的伴生散页并释放独占附件。
 			// P2-3：先收集 id 再删，给每条被级联物理删除的散页补墓碑。
 			var companionIDs []uint
 			if err := tx.Unscoped().Model(&models.LifeEntry{}).
 				Where("project_id = ?", p.ID).
 				Pluck("id", &companionIDs).Error; err != nil {
 				return err
+			}
+			for _, entryID := range companionIDs {
+				keys, err := releaseEntryAttachments(tx, entryID, true)
+				if err != nil {
+					return err
+				}
+				keysToDelete = append(keysToDelete, keys...)
 			}
 			if err := tx.Unscoped().Where("project_id = ?", p.ID).Delete(&models.LifeEntry{}).Error; err != nil {
 				return err
@@ -2524,16 +2556,30 @@ func DeleteProject(c *gin.Context) {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
+		for _, key := range keysToDelete {
+			_ = storage.DeleteObject(key)
+		}
 		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		// 关键：软删除项目时一并软删除伴生散页，
-		// 否则时间流里会留下一条再也点不回项目的孤儿记录。
+		var companionIDs []uint
+		if err := tx.Unscoped().Model(&models.LifeEntry{}).
+			Where("project_id = ?", p.ID).
+			Pluck("id", &companionIDs).Error; err != nil {
+			return err
+		}
+		// 关键：软删除项目时一并软删除伴生散页并解绑附件 entry_id，
+		// 否则时间流里会留下一条再也点不回项目的孤儿记录与悬挂附件。
 		if err := deleteProjectCompanionEntries(tx, p.ID); err != nil {
 			return err
+		}
+		for _, entryID := range companionIDs {
+			if _, err := releaseEntryAttachments(tx, entryID, false); err != nil {
+				return err
+			}
 		}
 		return tx.Delete(&p).Error
 	})
@@ -2618,7 +2664,7 @@ func GetGlobalStats(c *gin.Context) {
 	}
 	var res Result
 	db.DB.Model(&models.Transaction{}).
-		Select("COALESCE(SUM(amount), 0) as total").
+		Select("COALESCE(SUM(CASE WHEN source = 'installment_repay' THEN COALESCE(fee_amount, 0) ELSE amount END), 0) as total").
 		Where("type = 'expense' AND occurred_at >= ? AND occurred_at < ?", start, end).
 		Scan(&res)
 	monthExpense = res.Total

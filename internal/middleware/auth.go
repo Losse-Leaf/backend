@@ -26,7 +26,7 @@ const SessionCookieName = "looseleaf_session"
 // sessionCookieMaxAge 会话 Cookie 有效期 (30 天)
 const sessionCookieMaxAge = 30 * 24 * 3600
 
-// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer, X-Device-Token、X-Admin-Key 请求头与 Cookie)
+// ExtractToken 提取客户端携带的设备凭证 Token (支持 Authorization: Bearer、X-Device-Token 请求头与 Cookie)
 // 安全规范：严禁通过 URL Query 参数传递 Token，防止凭据泄露至访问日志、反代日志与 Referer
 //
 // MOB-P1-69：Cookie 作为**兜底**通道，优先级排在三个请求头之后 ——
@@ -38,9 +38,6 @@ func ExtractToken(c *gin.Context) string {
 		return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 	}
 	if t := strings.TrimSpace(c.GetHeader("X-Device-Token")); t != "" {
-		return t
-	}
-	if t := strings.TrimSpace(c.GetHeader("X-Admin-Key")); t != "" {
 		return t
 	}
 	// MOB-P1-69：Cookie 兜底

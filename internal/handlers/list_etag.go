@@ -92,14 +92,6 @@ func parseAggregateTime(raw string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析时间: %s", raw)
 }
 
-// lastModified 返回 updated_at / deleted_at 中较晚的一个，用于 If-Modified-Since。
-func (a listAggregate) lastModified() time.Time {
-	if a.MaxDeleted.After(a.MaxUpdated) {
-		return a.MaxDeleted
-	}
-	return a.MaxUpdated
-}
-
 // listETag 生成与「完整查询串 + 权限角色」绑定的弱 ETag。
 //
 // 关键：必须把原始 RequestURI 的哈希纳入 ETag。
@@ -127,26 +119,13 @@ func listETag(c *gin.Context, agg listAggregate, salt string) string {
 }
 
 // negotiateListCache 写入 ETag 并在命中缓存时直接返回 304。
-//
-// 顺序固定：先 ETag，再 If-Modified-Since（兼容旧客户端）。
 // 命中时调用方必须立刻 return —— 此时尚未 Find、尚未做任何 URL 签名。
-func negotiateListCache(c *gin.Context, etag string, lastModified time.Time) bool {
+func negotiateListCache(c *gin.Context, etag string) bool {
 	c.Header("ETag", etag)
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)
 		return true
-	}
-
-	// lastModified 为零值时跳过 IMS：按角色脱敏的列表（心愿 / 足迹）不能用
-	// 时间戳做跨角色协商，否则访客缓存的响应可能在管理员登录后仍被判 304。
-	if !lastModified.IsZero() {
-		if ifModSince := c.GetHeader("If-Modified-Since"); ifModSince != "" {
-			if t, err := http.ParseTime(ifModSince); err == nil && !lastModified.After(t) {
-				c.Status(http.StatusNotModified)
-				return true
-			}
-		}
 	}
 	return false
 }

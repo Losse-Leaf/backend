@@ -772,7 +772,7 @@ func GetFootprints(c *gin.Context) {
 	if isAdmin {
 		role = "admin"
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	// BE-2：聚合与 304 协商前置，命中时不再加载足迹/相片，也不做签名。
 	agg, err := aggregateListQuery(query)
@@ -780,9 +780,8 @@ func GetFootprints(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取足迹列表失败")
 		return
 	}
-	// 按角色脱敏的列表禁用 If-Modified-Since 跨角色协商。
 	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role)) {
 		return
 	}
 
@@ -852,7 +851,7 @@ func GetFootprintByID(c *gin.Context) {
 		Error(c, http.StatusNotFound, "足迹记录不存在")
 		return
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateFootprintURLs(&f)
 	populateFootprintExpenseStats(&f, middleware.IsAdmin(c))
 	Success(c, f)
@@ -1551,7 +1550,7 @@ func GetCityMemoryDrawer(c *gin.Context) {
 		return txs
 	})
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	Success(c, gin.H{
 		"city_code": cityCode,
 		"city_name": cityName,
@@ -1748,7 +1747,7 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 		return txs
 	})
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	Success(c, gin.H{
 		"province_adcode": provAdcode,
 		"province_name":   provName,

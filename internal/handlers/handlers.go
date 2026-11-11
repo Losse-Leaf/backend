@@ -680,10 +680,21 @@ func GetLifeEntriesV1(c *gin.Context) {
 	year := c.Query("year")
 	category := c.Query("category") // 支持 4 大纯化核心形态视角 (daily, travel, project, wish, transaction, all)
 
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	pageRaw := c.DefaultQuery("page", "1")
+	page, pageErr := strconv.Atoi(pageRaw)
+	if pageErr != nil {
+		log.Printf("GetLifeEntriesV1: 非法 page 参数 %q，回退默认值: %v", pageRaw, pageErr)
+	}
+	pageSizeRaw := c.DefaultQuery("page_size", "50")
+	pageSize, pageSizeErr := strconv.Atoi(pageSizeRaw)
+	if pageSizeErr != nil {
+		log.Printf("GetLifeEntriesV1: 非法 page_size 参数 %q，回退默认值: %v", pageSizeRaw, pageSizeErr)
+	}
 	if page < 1 {
 		page = 1
+	}
+	if page > 100000 {
+		page = 100000
 	}
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
@@ -707,7 +718,7 @@ func GetLifeEntriesV1(c *gin.Context) {
 	if isAdmin {
 		role = "admin"
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	query := dbScope.Model(&models.LifeEntry{}).
 		Order("occurred_at DESC, id DESC")
@@ -759,10 +770,9 @@ func GetLifeEntriesV1(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取生活档案失败")
 		return
 	}
-	// 按角色脱敏 + 软删除会改变 total：禁用 If-Modified-Since，只走 ETag。
 	// 增量请求（since）跳过 304：响应体除了数据库行还会合成 purge 墓碑，
 	// 而 ETag 聚合只覆盖真实行，命中 304 会让墓碑永远送不出去。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role)) {
 		return
 	}
 
@@ -833,7 +843,7 @@ func GetOnThisDayEntries(c *gin.Context) {
 		}
 	}
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	matched := make([]models.LifeEntry, 0, len(matchedIDs))
 	if len(matchedIDs) > 0 {
 		db.DB.Where("id IN ?", matchedIDs).Order("occurred_at DESC, id DESC").Find(&matched)
@@ -862,7 +872,7 @@ func GetLifeEntryByID(c *gin.Context) {
 		return
 	}
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateEntryURLs(&entry)
 	if !middleware.IsAdmin(c) {
 		redactEmbeddedWishFinances(entry.Wish)
@@ -1375,7 +1385,7 @@ func CleanupUpload(c *gin.Context) {
 // GetStorageStatus 获取 R2 配置状态 (非管理员脱敏敏感桶名与节点)
 func GetStorageStatus(c *gin.Context) {
 	// 同一 URL 对访客/管理员返回不同字段，禁止任何共享缓存混用。
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	c.Header("Cache-Control", "private, no-store")
 	// BE-7：访客只需要两个标量。直接读缓存状态，绝不为了丢弃结果而遍历磁盘。
 	if !middleware.IsAdmin(c) {
@@ -1765,7 +1775,7 @@ func GetTransactions(c *gin.Context) {
 		return
 	}
 	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, "")) {
 		return
 	}
 
@@ -2337,7 +2347,7 @@ func GetProjectsV1(c *gin.Context) {
 		return
 	}
 	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, ""), agg.lastModified()) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, "")) {
 		return
 	}
 
@@ -2384,7 +2394,7 @@ func GetProjectByID(c *gin.Context) {
 	// 同时拉取关联该项目的 Life Entries
 	var entries []models.LifeEntry
 	db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC").Find(&entries)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateEntryURLsBatch(entries)
 	if !middleware.IsAdmin(c) {
 		redactEmbeddedWishFinancesBatch(entries)
@@ -2619,7 +2629,7 @@ func InvalidateStatsCache() {
 }
 
 func GetGlobalStats(c *gin.Context) {
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	isAdmin := middleware.IsAdmin(c)
 
 	now := time.Now()
@@ -2711,7 +2721,7 @@ func GetConfigV1(c *gin.Context) {
 			DefaultLocation: "",
 		}
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	if !middleware.IsAdmin(c) {
 		config.InitialLiquidBalance = 0
 	}
@@ -2838,7 +2848,7 @@ func GlobalSearch(c *gin.Context) {
 		projects = []models.Project{}
 	}
 
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	Success(c, gin.H{
 		"query":      q,
 		"entries":    entries,

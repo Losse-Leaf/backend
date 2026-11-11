@@ -187,34 +187,6 @@ func TestBE2_ETagIncludesQueryString(t *testing.T) {
 	}
 }
 
-// If-Modified-Since 仍保留在「非按角色脱敏」的列表上（这里用记账），
-// 但排在 ETag 之后，且命中时同样不 Find。
-func TestBE2_IfModifiedSinceStillWorks(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	setupTestFullDB(t)
-	if err := db.DB.Create(&models.Transaction{
-		Amount: 100, Type: "expense", Category: "餐饮", OccurredAt: time.Now().Add(-time.Hour),
-	}).Error; err != nil {
-		t.Fatalf("seed transaction: %v", err)
-	}
-
-	r := gin.New()
-	r.GET("/api/v1/transactions", GetTransactions)
-
-	counter := installSQLCounter(t)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
-	req.Header.Set("If-Modified-Since", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotModified {
-		t.Fatalf("expected 304 via If-Modified-Since, got %d", w.Code)
-	}
-	if n := counter.Load(); n > 1 {
-		t.Fatalf("If-Modified-Since 304 should use at most 1 SQL, used %d", n)
-	}
-}
-
 // 304 时不得触发任何附件签名/查询：响应体为空 + 只有 1 条聚合 SQL 已足够证明。
 // 附带验证 200 响应字段未变（total/page/page_size/entries）。
 func TestBE2_200ResponseShapeUnchanged(t *testing.T) {

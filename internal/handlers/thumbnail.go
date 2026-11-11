@@ -27,6 +27,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -289,7 +290,9 @@ func storeThumbnail(cacheKey, diskPath string, data []byte) {
 	thumbnailMemoryMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(diskPath), 0o700); err == nil {
-		_ = os.WriteFile(diskPath, data, 0o600)
+		if err := os.WriteFile(diskPath, data, 0o600); err != nil {
+			log.Printf("WARN: thumbnail disk cache write failed: key=%s path=%s err=%v", cacheKey, diskPath, err)
+		}
 	}
 }
 

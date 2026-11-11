@@ -319,7 +319,7 @@ func CreateInstallmentPlan(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "请求参数无效: "+err.Error())
 		return
 	}
-	log.Printf("CreateInstallmentPlan received: %+v, kind: %q", req, req.Kind)
+	log.Printf("CreateInstallmentPlan received: kind: %q", req.Kind)
 
 	req.Title = strings.TrimSpace(req.Title)
 	if req.Title == "" {

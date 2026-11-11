@@ -76,7 +76,7 @@ func GetCuratorProfile(c *gin.Context) {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")
 		return
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	isAdmin := middleware.IsAdmin(c)
 	populateProfileData(&profile, isAdmin)
 	Success(c, profile)

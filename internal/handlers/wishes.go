@@ -195,7 +195,7 @@ func GetWishes(c *gin.Context) {
 		role = "admin"
 	}
 	// Vary 必须在任何 304 分支之前写出，避免共享缓存把访客/管理员响应混用。
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	// BE-2：聚合与 304 协商前置；ETag 混入角色，防止跨权限缓存污染 (BE-17)。
 	agg, err := aggregateListQuery(query)
@@ -204,7 +204,7 @@ func GetWishes(c *gin.Context) {
 		return
 	}
 	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role), time.Time{}) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role)) {
 		return
 	}
 
@@ -265,7 +265,7 @@ func GetWishByID(c *gin.Context) {
 		return
 	}
 	populateWishURLs(&w)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	if !middleware.IsAdmin(c) {
 		w.ActualCost = 0
 		w.TransactionID = nil

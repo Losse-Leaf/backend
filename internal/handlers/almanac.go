@@ -232,7 +232,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	ttlBucket := time.Now().Unix() / int64(25*60)
 	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%d-%d-%s"`, year, len(entries), len(txs), maxUpdated.UnixMilli(), ttlBucket, role)
 	c.Header("ETag", etag)
-	c.Header("Vary", "Authorization, X-Device-Token, X-Admin-Key, Cookie")
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)

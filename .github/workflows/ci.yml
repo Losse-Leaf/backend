@@ -10,6 +10,8 @@ jobs:
   quality-gate:
     name: Go Test & Static Analysis Quality Gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Check out repository
@@ -31,14 +33,18 @@ jobs:
       # **展厅的取消分期一直在静默失效**。
       # 在 CI 就把它挑出来，比等到发版才发现要便宜得多。
       - name: Guard against web version drift
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PINNED=$(cat WEB_VERSION | tr -d '[:space:]')
-          LATEST=$(curl -s --connect-timeout 10 --retry 2 \
+          LATEST=$(curl -sS --fail --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             "https://api.github.com/repos/Losse-Leaf/web/releases/latest" \
             | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
           echo "钉住的展厅版本: ${PINNED} / 展厅最新版本: ${LATEST:-未知}"
           if [ -z "${LATEST}" ]; then
-            echo "::warning::取不到展厅最新版本，跳过漂移检查"
+            echo "::error::重试后仍取不到展厅最新版本，无法完成漂移检查（fail-closed）"
+            exit 1
           elif [ "${PINNED}" != "${LATEST}" ]; then
             echo "::error::展厅版本漂移：后端内嵌 ${PINNED}，展厅最新已是 ${LATEST}。请同步 WEB_VERSION。"
             exit 1

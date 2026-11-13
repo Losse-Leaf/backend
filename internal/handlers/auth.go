@@ -381,6 +381,10 @@ func GetTrustedDevices(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "获取设备列表失败: "+err.Error())
 		return
 	}
+	currentDeviceID := c.GetString("device_id")
+	for i := range devices {
+		devices[i].IsCurrent = currentDeviceID != "" && devices[i].DeviceID == currentDeviceID
+	}
 	Success(c, devices)
 }
 

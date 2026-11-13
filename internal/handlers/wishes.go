@@ -105,6 +105,7 @@ type CreateWishRequest struct {
 	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
 	ClientRequestID string `json:"client_request_id"`
+	IsPrivate       bool   `json:"is_private"`
 }
 
 // UpdateWishRequest 更新心愿请求
@@ -131,7 +132,8 @@ type UpdateWishRequest struct {
 	// 而部分客户端的心愿编辑弹窗**根本没有附件 UI**，
 	// 于是每次改个标题/预算，服务端都会把该心愿的照片 `wish_id` 置空。
 	// 跨端更刺眼：用 web 传了图，再用 mac 改个字，图片就没了。
-	ClearAttachments bool `json:"clear_attachments"`
+	ClearAttachments bool  `json:"clear_attachments"`
+	IsPrivate        *bool `json:"is_private"`
 }
 
 // ResolveWishRequest 归册仪式请求 (4种归册情景与多模块联动 RC-53)
@@ -155,6 +157,9 @@ type ResolveWishRequest struct {
 
 // GetWishes 列表查询心愿 (支持 kind, status, since, 分页与 ETag)
 func GetWishes(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "wishes") {
+		return
+	}
 	kind := c.Query("kind")
 	status := c.Query("status")
 	sinceStr := c.Query("since")
@@ -190,10 +195,10 @@ func GetWishes(c *gin.Context) {
 	}
 
 	isAdmin := middleware.IsAdmin(c)
-	role := "guest"
-	if isAdmin {
-		role = "admin"
+	if !isAdmin {
+		query = query.Where("is_private = ?", false)
 	}
+	role := PublicModuleETagSuffix(isAdmin)
 	// Vary 必须在任何 304 分支之前写出，避免共享缓存把访客/管理员响应混用。
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
@@ -255,6 +260,9 @@ func GetWishes(c *gin.Context) {
 
 // GetWishByID 单个心愿详情 (访客模式脱敏 BE-14)
 func GetWishByID(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "wishes") {
+		return
+	}
 	id, ok := parseIDParam(c)
 	if !ok {
 		return
@@ -264,9 +272,14 @@ func GetWishByID(c *gin.Context) {
 		Error(c, http.StatusNotFound, "心愿不存在")
 		return
 	}
+	isAdmin := middleware.IsAdmin(c)
+	if !isAdmin && w.IsPrivate {
+		Error(c, http.StatusNotFound, "心愿不存在")
+		return
+	}
 	populateWishURLs(&w)
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
-	if !middleware.IsAdmin(c) {
+	if !isAdmin {
 		w.ActualCost = 0
 		w.TransactionID = nil
 		w.GearID = nil
@@ -351,6 +364,7 @@ func CreateWish(c *gin.Context) {
 		Status:     "wanting",
 		TargetDate: targetDate,
 		PlantedAt:  plantedAt,
+		IsPrivate:  req.IsPrivate,
 	}
 	if clientRequestID != "" {
 		wish.ClientRequestID = &clientRequestID
@@ -512,6 +526,9 @@ func UpdateWish(c *gin.Context) {
 			return
 		}
 		wish.Status = status
+	}
+	if req.IsPrivate != nil {
+		wish.IsPrivate = *req.IsPrivate
 	}
 	// 契约 C：三个时间字段统一 hasJSONValue 语义 —— 请求携带且空串 = 清空；
 	// 缺省 / JSON null = 保持原值。原先 hasKey 只判 key 存在，客户端发 null

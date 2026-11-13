@@ -15,6 +15,10 @@ import (
 
 // GetAnnualAlmanacSummary 年度生活年鉴聚合计算接口 (五幕叙事：岁月卷首 / 山川行迹 / 心愿圆满 / 浮光掠影 / 柴米油盐)
 func GetAnnualAlmanacSummary(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "almanac") {
+		return
+	}
+	isAdmin := middleware.IsAdmin(c)
 	nowBeijing := config.NowInBeijing()
 	yearStr := c.DefaultQuery("year", fmt.Sprintf("%04d", nowBeijing.Year()))
 	year, err := strconv.Atoi(yearStr)
@@ -27,9 +31,11 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	// 1. 第一幕：岁月卷首数据 (LifeEntries 聚合)
 	var entries []models.LifeEntry
-	db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).
-		Order("occurred_at ASC").
-		Find(&entries)
+	entryQ := db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear)
+	if !isAdmin {
+		entryQ = entryQ.Where("is_private = ?", false)
+	}
+	entryQ.Order("occurred_at ASC").Find(&entries)
 
 	populateEntryURLsBatch(entries)
 
@@ -51,9 +57,11 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	// 2. 第二幕：山川行迹 (Footprints 聚合)
 	var footprints []models.Footprint
-	db.DB.Where("visited_at >= ? AND visited_at < ?", startOfYear, endOfYear).
-		Order("visited_at ASC").
-		Find(&footprints)
+	fpQ := db.DB.Where("visited_at >= ? AND visited_at < ?", startOfYear, endOfYear)
+	if !isAdmin {
+		fpQ = fpQ.Where("is_private = ?", false)
+	}
+	fpQ.Order("visited_at ASC").Find(&footprints)
 
 	populateFootprintURLsBatch(footprints)
 
@@ -73,15 +81,21 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	// 3. 第三幕：心愿圆满 (Wishes 聚合)
 	var fulfilledWishes []models.Wish
-	db.DB.Where("fulfilled_at >= ? AND fulfilled_at < ?", startOfYear, endOfYear).
-		Where("status = ?", "fulfilled").
-		Order("fulfilled_at ASC").
-		Find(&fulfilledWishes)
+	wishQ := db.DB.Where("fulfilled_at >= ? AND fulfilled_at < ?", startOfYear, endOfYear).
+		Where("status = ?", "fulfilled")
+	if !isAdmin {
+		wishQ = wishQ.Where("is_private = ?", false)
+	}
+	wishQ.Order("fulfilled_at ASC").Find(&fulfilledWishes)
 
 	populateWishURLsBatch(fulfilledWishes)
 
 	var wantingWishCount int64
-	db.DB.Model(&models.Wish{}).Where("status = ?", "wanting").Count(&wantingWishCount)
+	wantingQ := db.DB.Model(&models.Wish{}).Where("status = ?", "wanting")
+	if !isAdmin {
+		wantingQ = wantingQ.Where("is_private = ?", false)
+	}
+	wantingQ.Count(&wantingWishCount)
 
 	var totalWishBudget, totalWishActual int64
 	for _, w := range fulfilledWishes {
@@ -132,7 +146,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	}
 
 	// 5. 第五幕：柴米油盐 (Transactions 聚合：仅主理人鉴权请求查询聚合，访客模式零查询脱敏 BE-14)
-	isAdmin := middleware.IsAdmin(c)
 	var txs []models.Transaction
 	if isAdmin {
 		db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).Find(&txs)
@@ -199,10 +212,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	}
 
 	// 组装年鉴信封 (附带权限角色后缀防止跨权限 304 缓存污染 BE-17，同时纳入内容更新指纹)
-	role := "guest"
-	if isAdmin {
-		role = "admin"
-	}
+	role := PublicModuleETagSuffix(isAdmin)
 	var maxUpdated time.Time
 	for _, e := range entries {
 		if e.UpdatedAt.After(maxUpdated) {

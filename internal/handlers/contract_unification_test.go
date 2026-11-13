@@ -534,6 +534,7 @@ func TestSellGearAssetRollsBackWhenIncomeFails(t *testing.T) {
 func TestPublicDetailEndpointsRejectNonNumericID(t *testing.T) {
 	r, token := setupContractRouter(t)
 	_ = token
+	enableAllPublicModulesForTest(t)
 
 	// 注入形态（URL 编码后的 "2 OR 1=1"）：必须被入口拦截为 400
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/entries/2%20OR%201=1", nil)

@@ -15,6 +15,7 @@ import (
 func TestGetProjectsV1LimitZeroAndOffset(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	// Seed 505 projects in batch
 	projects := make([]models.Project, 505)

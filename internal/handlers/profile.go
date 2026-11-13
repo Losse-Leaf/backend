@@ -71,6 +71,9 @@ func populateProfileData(p *models.CuratorProfile, isAdmin bool) {
 
 // GetCuratorProfile 获取主理人完整档案 (全端动态获取，访客模式脱敏 EDC 财务信息 RC-53)
 func GetCuratorProfile(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "profile") {
+		return
+	}
 	var profile models.CuratorProfile
 	if err := db.DB.First(&profile).Error; err != nil {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")

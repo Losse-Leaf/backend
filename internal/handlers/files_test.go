@@ -24,6 +24,7 @@ import (
 func TestFilesHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	_ = storage.InitR2(config.R2Config{})
 
 	// 隔离测试运行期间的本地落盘到临时目录 (RC-68)

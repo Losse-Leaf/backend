@@ -416,6 +416,7 @@ type CreateFootprintRequest struct {
 	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
 	ClientRequestID string `json:"client_request_id"`
+	IsPrivate       bool   `json:"is_private"`
 }
 
 // UpdateFootprintRequest 修改足迹/旅程请求
@@ -431,7 +432,8 @@ type UpdateFootprintRequest struct {
 	AttachmentIDs []uint `json:"attachment_ids"`
 	// ClearAttachments 显式解绑该旅程全部相片（跨端统一契约 A）：
 	// true 时先解绑全部；若同时携带 attachment_ids，则再绑定新列表。
-	ClearAttachments bool `json:"clear_attachments"`
+	ClearAttachments bool  `json:"clear_attachments"`
+	IsPrivate        *bool `json:"is_private"`
 }
 
 // normalizeFootprintCity 足迹城市归一（兜底校验修复）：
@@ -575,6 +577,7 @@ func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, d
 			Note:        noteText,
 			LifeEntryID: &entry.ID,
 			WishID:      entry.WishID,
+			IsPrivate:   entry.IsPrivate,
 		}
 		if err := targetDB.Create(&fp).Error; err != nil {
 			return fmt.Errorf("创建足迹失败 entry=%d: %w", entry.ID, err)
@@ -722,6 +725,9 @@ func EnsureEntryFootprintsSynced() {
 // limit > 0 时最多返回 limit 条，并把响应包装成
 // `{footprints: [...], has_more: bool}`；未传 limit 时仍返回原来的数组。
 func GetFootprints(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "footprints") {
+		return
+	}
 	cityCode := c.Query("city_code")
 	yearStr := c.Query("year")
 	sinceStr := c.Query("since")
@@ -768,10 +774,10 @@ func GetFootprints(c *gin.Context) {
 	// 花销统计仅管理员下发，ETag 必须按角色隔离，否则访客/管理员会互相
 	// 命中对方的 304。Vary 在协商之前写出，共享缓存也不会混用。
 	isAdmin := middleware.IsAdmin(c)
-	role := "guest"
-	if isAdmin {
-		role = "admin"
+	if !isAdmin {
+		query = query.Where("is_private = ?", false)
 	}
+	role := PublicModuleETagSuffix(isAdmin)
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	// BE-2：聚合与 304 协商前置，命中时不再加载足迹/相片，也不做签名。
@@ -842,6 +848,9 @@ func GetFootprints(c *gin.Context) {
 
 // GetFootprintByID 查询单条足迹详情
 func GetFootprintByID(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "footprints") {
+		return
+	}
 	id, ok := parseIDParam(c)
 	if !ok {
 		return
@@ -851,9 +860,14 @@ func GetFootprintByID(c *gin.Context) {
 		Error(c, http.StatusNotFound, "足迹记录不存在")
 		return
 	}
+	isAdmin := middleware.IsAdmin(c)
+	if !isAdmin && f.IsPrivate {
+		Error(c, http.StatusNotFound, "足迹记录不存在")
+		return
+	}
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateFootprintURLs(&f)
-	populateFootprintExpenseStats(&f, middleware.IsAdmin(c))
+	populateFootprintExpenseStats(&f, isAdmin)
 	Success(c, f)
 }
 
@@ -1006,6 +1020,7 @@ func CreateFootprint(c *gin.Context) {
 			Note:        note,
 			LifeEntryID: lifeEntryID,
 			WishID:      req.WishID,
+			IsPrivate:   req.IsPrivate,
 		}
 		if clientRequestID != "" {
 			footprint.ClientRequestID = &clientRequestID
@@ -1139,6 +1154,9 @@ func UpdateFootprint(c *gin.Context) {
 	}
 	if req.WishID != nil {
 		footprint.WishID = req.WishID
+	}
+	if req.IsPrivate != nil {
+		footprint.IsPrivate = *req.IsPrivate
 	}
 
 	// 关键（发现 14）：足迹保存、伴生散页同步与附件重绑原本是三段独立写入，
@@ -1365,8 +1383,18 @@ type AtlasCitySummary struct {
 // GetFootprintsAtlas 获取全国足迹汇总 (按市级汇总去过的城市、次数与首次/最近日期)
 // 聚合下沉至 SQL GROUP BY，不再全表载入内存 (BE-31)
 func GetFootprintsAtlas(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "footprints") {
+		return
+	}
+	isAdmin := middleware.IsAdmin(c)
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+
 	var totalFootprints int64
-	db.DB.Model(&models.Footprint{}).Count(&totalFootprints)
+	countQ := db.DB.Model(&models.Footprint{})
+	if !isAdmin {
+		countQ = countQ.Where("is_private = ?", false)
+	}
+	countQ.Count(&totalFootprints)
 
 	type cityAggRow struct {
 		CityCode string
@@ -1376,7 +1404,11 @@ func GetFootprintsAtlas(c *gin.Context) {
 		LatestAt string
 	}
 	var rows []cityAggRow
-	db.DB.Model(&models.Footprint{}).
+	aggQ := db.DB.Model(&models.Footprint{})
+	if !isAdmin {
+		aggQ = aggQ.Where("is_private = ?", false)
+	}
+	aggQ.
 		Select("city_code, MAX(city_name) AS city_name, COUNT(*) AS visit_cnt, MIN(visited_at) AS first_at, MAX(visited_at) AS latest_at").
 		Group("city_code").
 		Order("latest_at DESC, first_at DESC, city_code ASC").
@@ -1490,6 +1522,9 @@ func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction
 
 // GetCityMemoryDrawer 城市回忆抽屉聚合接口 (RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 城市账单光谱)
 func GetCityMemoryDrawer(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "footprints") {
+		return
+	}
 	cityCode := strings.TrimSpace(c.Param("city_code"))
 	if cityCode == "" {
 		Error(c, http.StatusBadRequest, "城市代码必填")
@@ -1500,7 +1535,11 @@ func GetCityMemoryDrawer(c *gin.Context) {
 
 	// 1. 该城市的 Footprints 列表与相片
 	var footprints []models.Footprint
-	db.DB.Where("city_code = ?", cityCode).Order("visited_at DESC").Find(&footprints)
+	fpQ := db.DB.Where("city_code = ?", cityCode)
+	if !isAdmin {
+		fpQ = fpQ.Where("is_private = ?", false)
+	}
+	fpQ.Order("visited_at DESC").Find(&footprints)
 	if footprints == nil {
 		footprints = []models.Footprint{}
 	}
@@ -1516,6 +1555,9 @@ func GetCityMemoryDrawer(c *gin.Context) {
 	// 2. 关联该城市及旅程的 LifeEntries 随笔
 	var entries []models.LifeEntry
 	dbQuery := db.DB.Order("occurred_at DESC")
+	if !isAdmin {
+		dbQuery = dbQuery.Where("is_private = ?", false)
+	}
 	if len(fpIDs) > 0 && cityShort != "" {
 		dbQuery = dbQuery.Where("city_code = ? OR footprint_id IN ? OR location LIKE ?", cityCode, fpIDs, "%"+cityShort+"%")
 	} else if len(fpIDs) > 0 {
@@ -1650,6 +1692,9 @@ var ProvinceShortNameMap = map[string]string{
 
 // GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91 / RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
 func GetProvinceMemoryDrawer(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "footprints") {
+		return
+	}
 	adcode := strings.TrimSpace(c.Param("adcode"))
 	if len(adcode) < 2 {
 		Error(c, http.StatusBadRequest, "省份行政代码格式无效")
@@ -1671,7 +1716,11 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 
 	// 1. 该省的 Footprints 列表与相片
 	var footprints []models.Footprint
-	db.DB.Where("city_code LIKE ?", provPrefix+"%").Order("visited_at DESC").Find(&footprints)
+	fpQ := db.DB.Where("city_code LIKE ?", provPrefix+"%")
+	if !isAdmin {
+		fpQ = fpQ.Where("is_private = ?", false)
+	}
+	fpQ.Order("visited_at DESC").Find(&footprints)
 	if footprints == nil {
 		footprints = []models.Footprint{}
 	}
@@ -1713,6 +1762,9 @@ func GetProvinceMemoryDrawer(c *gin.Context) {
 	// 2. 关联该省及旅程的 LifeEntries 随笔
 	var entries []models.LifeEntry
 	entryQuery := db.DB.Order("occurred_at DESC")
+	if !isAdmin {
+		entryQuery = entryQuery.Where("is_private = ?", false)
+	}
 	if len(fpIDs) > 0 && provShort != "" {
 		entryQuery = entryQuery.Where("city_code LIKE ? OR footprint_id IN ? OR location LIKE ?", provPrefix+"%", fpIDs, "%"+provShort+"%")
 	} else if len(fpIDs) > 0 {

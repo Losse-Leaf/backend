@@ -167,6 +167,7 @@ func TestFootprintExpenseIgnoresAdjacentDays(t *testing.T) {
 func TestFootprintExpenseStatsEndpointShape(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	r := gin.New()
 	r.GET("/api/v1/footprints/:id", GetFootprintByID)
 

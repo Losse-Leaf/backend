@@ -29,6 +29,7 @@ func TestCalculateElapsedInstallmentMonthsUsesBeijingDate(t *testing.T) {
 func TestAssetsCreditAndDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	// 注册测试受信任设备凭证 (BE-18)
 	testMasterKey := "lldt_test_device_token_123"

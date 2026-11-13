@@ -94,6 +94,7 @@ func assertEmbeddedWishVisible(t *testing.T, entries []models.LifeEntry) {
 func TestBE14_PublicVisitorFinancialDesensitization(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	testMasterKey := "lldt_admin_secret_999"
 	seedTestAdminDevice(testMasterKey)
@@ -594,6 +595,7 @@ func TestBE16_PublicConfigDesensitization(t *testing.T) {
 func TestBE17_ETagRoleCacheIsolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	testMasterKey := "lldt_secret_be17"
 	seedTestAdminDevice(testMasterKey)

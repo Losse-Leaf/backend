@@ -51,6 +51,7 @@ func containsID(ids []int, target int) bool {
 func TestSyncCursorHeaderIsAuthoritativeAndInclusive(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	adminKey := "lldt_cursor_authoritative"
 	seedTestAdminDevice(adminKey)
 

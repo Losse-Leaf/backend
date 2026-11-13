@@ -164,32 +164,35 @@ func isRegisteredObjectKey(cleanKey string) bool {
 	if cleanKey == "avatar/user.png" {
 		return true
 	}
-	var profile models.CuratorProfile
-	if err := db.DB.Select("avatar_url").Limit(1).Find(&profile).Error; err == nil && profile.AvatarURL != "" {
-		if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || profile.AvatarURL == cleanKey {
-			return true
+	pub := GetPublicModulesMap()
+	if pub["profile"] {
+		var profile models.CuratorProfile
+		if err := db.DB.Select("avatar_url").Limit(1).Find(&profile).Error; err == nil && profile.AvatarURL != "" {
+			if storage.ExtractObjectKey(profile.AvatarURL) == cleanKey || profile.AvatarURL == cleanKey {
+				return true
+			}
 		}
 	}
 
-	// 2. 检查 attachments 附件表：必须绑定在有效、未软删除的实体上
+	// 2. 检查 attachments 附件表：必须绑定在有效、未软删除、非私密且对应模块已公开的实体上
 	var atts []models.Attachment
 	if err := db.DB.Where("object_key = ?", cleanKey).Find(&atts).Error; err == nil && len(atts) > 0 {
 		for _, att := range atts {
-			if att.EntryID != nil && *att.EntryID > 0 {
+			if pub["entries"] && att.EntryID != nil && *att.EntryID > 0 {
 				var count int64
-				if err := db.DB.Model(&models.LifeEntry{}).Where("id = ?", *att.EntryID).Count(&count).Error; err == nil && count > 0 {
+				if err := db.DB.Model(&models.LifeEntry{}).Where("id = ? AND is_private = ?", *att.EntryID, false).Count(&count).Error; err == nil && count > 0 {
 					return true
 				}
 			}
-			if att.WishID != nil && *att.WishID > 0 {
+			if pub["wishes"] && att.WishID != nil && *att.WishID > 0 {
 				var count int64
-				if err := db.DB.Model(&models.Wish{}).Where("id = ?", *att.WishID).Count(&count).Error; err == nil && count > 0 {
+				if err := db.DB.Model(&models.Wish{}).Where("id = ? AND is_private = ?", *att.WishID, false).Count(&count).Error; err == nil && count > 0 {
 					return true
 				}
 			}
-			if att.FootprintID != nil && *att.FootprintID > 0 {
+			if pub["footprints"] && att.FootprintID != nil && *att.FootprintID > 0 {
 				var count int64
-				if err := db.DB.Model(&models.Footprint{}).Where("id = ?", *att.FootprintID).Count(&count).Error; err == nil && count > 0 {
+				if err := db.DB.Model(&models.Footprint{}).Where("id = ? AND is_private = ?", *att.FootprintID, false).Count(&count).Error; err == nil && count > 0 {
 					return true
 				}
 			}

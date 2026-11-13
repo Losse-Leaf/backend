@@ -116,6 +116,7 @@ func TestPopulateFootprintExpenseStatsBatchSingleQuery(t *testing.T) {
 func TestGetFootprintsExpenseStatsPermission(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	footprints := seedFootprintsWithExpenses(t)
 
 	r := gin.New()
@@ -177,6 +178,7 @@ func TestGetFootprintsExpenseStatsPermission(t *testing.T) {
 func TestGetFootprintsLimitAndHasMore(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	footprints := seedFootprintsWithExpenses(t)
 
 	r := gin.New()

@@ -244,9 +244,25 @@ func redactEmbeddedWishFinances(w *models.Wish) {
 	w.GearID = nil
 }
 
+// redactVisitorEntry 对单条访客可见散页剥离私密关联实体并脱敏财务字段。
+func redactVisitorEntry(e *models.LifeEntry) {
+	if e == nil {
+		return
+	}
+	if e.Project != nil && e.Project.IsPrivate {
+		e.Project = nil
+		e.ProjectID = nil
+	}
+	if e.Wish != nil && e.Wish.IsPrivate {
+		e.Wish = nil
+		e.WishID = nil
+	}
+	redactEmbeddedWishFinances(e.Wish)
+}
+
 func redactEmbeddedWishFinancesBatch(entries []models.LifeEntry) {
 	for i := range entries {
-		redactEmbeddedWishFinances(entries[i].Wish)
+		redactVisitorEntry(&entries[i])
 	}
 }
 
@@ -433,6 +449,7 @@ type CreateEntryRequest struct {
 	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
 	ClientRequestID string `json:"client_request_id"`
+	IsPrivate       bool   `json:"is_private"`
 }
 
 // CreateLifeEntry 创建一条新的生活档案记录（支持主流自然下渗点亮足迹与造物伴生去重）
@@ -622,6 +639,7 @@ func CreateLifeEntry(c *gin.Context) {
 		ProjectID:   req.ProjectID,
 		WishID:      req.WishID,
 		FootprintID: req.FootprintID,
+		IsPrivate:   req.IsPrivate,
 	}
 	if clientRequestID != "" {
 		entry.ClientRequestID = &clientRequestID
@@ -676,6 +694,9 @@ func CreateLifeEntry(c *gin.Context) {
 
 // GetLifeEntriesV1 列表查询生活档案 (支持分页与类型筛选)
 func GetLifeEntriesV1(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "entries") {
+		return
+	}
 	entryType := c.Query("type")
 	year := c.Query("year")
 	category := c.Query("category") // 支持 4 大纯化核心形态视角 (daily, travel, project, wish, transaction, all)
@@ -711,17 +732,17 @@ func GetLifeEntriesV1(c *gin.Context) {
 		dbScope = db.DB.Unscoped()
 	}
 
-	// 散页内嵌心愿的实付金额按角色脱敏，ETag 必须带角色盐；
+	// 散页内嵌心愿的实付金额按角色脱敏，ETag 必须带角色与公开模块盐；
 	// Vary 在协商之前写出，避免共享缓存/浏览器角色切换后互相命中 304。
 	isAdmin := middleware.IsAdmin(c)
-	role := "guest"
-	if isAdmin {
-		role = "admin"
-	}
+	role := PublicModuleETagSuffix(isAdmin)
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 
 	query := dbScope.Model(&models.LifeEntry{}).
 		Order("occurred_at DESC, id DESC")
+	if !isAdmin {
+		query = query.Where("is_private = ?", false)
+	}
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
 	query = applySyncSince(query, &models.LifeEntry{}, sinceStr)
@@ -810,6 +831,10 @@ func GetLifeEntriesV1(c *gin.Context) {
 // GetOnThisDayEntries 查询往年今日生活档案 (GET /api/v1/entries/on-this-day)
 // 性能优化：两阶段轻量扫描，第一阶段仅投影 (id, occurred_at) 索引列定位往年同日 ID，避免全表加载大文本 Content
 func GetOnThisDayEntries(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "entries") {
+		return
+	}
+	isAdmin := middleware.IsAdmin(c)
 	now := time.Now().In(config.BeijingLocation)
 	month := int(now.Month())
 	day := now.Day()
@@ -826,9 +851,13 @@ func GetOnThisDayEntries(c *gin.Context) {
 	}
 	startOfCurrentYear := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, config.BeijingLocation)
 	var metas []idAndTime
-	if err := db.DB.Model(&models.LifeEntry{}).
+	metaQuery := db.DB.Model(&models.LifeEntry{}).
 		Select("id, occurred_at").
-		Where("occurred_at < ?", startOfCurrentYear).
+		Where("occurred_at < ?", startOfCurrentYear)
+	if !isAdmin {
+		metaQuery = metaQuery.Where("is_private = ?", false)
+	}
+	if err := metaQuery.
 		Order("occurred_at DESC, id DESC").
 		Find(&metas).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "查询往年今日记录失败")
@@ -862,6 +891,9 @@ func GetOnThisDayEntries(c *gin.Context) {
 
 // GetLifeEntryByID 获取单条生活档案详情
 func GetLifeEntryByID(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "entries") {
+		return
+	}
 	id, ok := parseIDParam(c)
 	if !ok {
 		return
@@ -872,10 +904,16 @@ func GetLifeEntryByID(c *gin.Context) {
 		return
 	}
 
+	isAdmin := middleware.IsAdmin(c)
+	if !isAdmin && entry.IsPrivate {
+		Error(c, http.StatusNotFound, "未找到该条生活记录")
+		return
+	}
+
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateEntryURLs(&entry)
-	if !middleware.IsAdmin(c) {
-		redactEmbeddedWishFinances(entry.Wish)
+	if !isAdmin {
+		redactVisitorEntry(&entry)
 	}
 
 	Success(c, entry)
@@ -899,7 +937,8 @@ type UpdateEntryRequest struct {
 	ClearAttachments bool `json:"clear_attachments"`
 	// ClearCity 显式清空城市归属（跨端统一契约 A）：优先级高于
 	// city_code / city_name / location 字段本身（携带也忽略）。
-	ClearCity bool `json:"clear_city"`
+	ClearCity bool  `json:"clear_city"`
+	IsPrivate *bool `json:"is_private"`
 }
 
 func hasJSONValue(fields map[string]json.RawMessage, key string) bool {
@@ -957,6 +996,9 @@ func UpdateLifeEntry(c *gin.Context) {
 			(entry.Title == "" || entry.Title == DeriveTitleFromContent(entry.Content, 40)) {
 			entry.Title = DeriveTitleFromContent(entry.Content, 40)
 		}
+	}
+	if req.IsPrivate != nil {
+		entry.IsPrivate = *req.IsPrivate
 	}
 	// 契约 A（修正）：clear_city 只清城市归属（city_code / city_name），不再连带清空 location ——
 	// location 归契约 C 管理：请求显式携带（空串 = 清空）即按其值写入。
@@ -2224,6 +2266,7 @@ type ProjectRequest struct {
 	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
 	ClientRequestID string `json:"client_request_id"`
+	IsPrivate       bool   `json:"is_private"`
 }
 
 func CreateProject(c *gin.Context) {
@@ -2274,6 +2317,7 @@ func CreateProject(c *gin.Context) {
 		GithubURL:   strings.TrimSpace(req.GithubURL),
 		Status:      projectStatus,
 		Order:       req.Order,
+		IsPrivate:   req.IsPrivate,
 	}
 	if clientRequestID != "" {
 		p.ClientRequestID = &clientRequestID
@@ -2312,6 +2356,12 @@ func CreateProject(c *gin.Context) {
 
 // GetProjectsV1 获取项目列表 (支持增量游标与 ETag 缓存协商 BE-05)
 func GetProjectsV1(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "projects") {
+		return
+	}
+	isAdmin := middleware.IsAdmin(c)
+	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+
 	sinceStr := c.Query("since")
 	includeDeleted := c.Query("include_deleted") == "true" || sinceStr != ""
 	if !validateSyncSince(c, sinceStr) || !allowDeletedScope(c, includeDeleted) {
@@ -2324,6 +2374,9 @@ func GetProjectsV1(c *gin.Context) {
 	}
 
 	query := dbScope.Model(&models.Project{}).Order("`order` ASC, id DESC")
+	if !isAdmin {
+		query = query.Where("is_private = ?", false)
+	}
 
 	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
 	query = applySyncSince(query, &models.Project{}, sinceStr)
@@ -2347,7 +2400,7 @@ func GetProjectsV1(c *gin.Context) {
 		return
 	}
 	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
-	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, "")) {
+	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, PublicModuleETagSuffix(isAdmin))) {
 		return
 	}
 
@@ -2381,6 +2434,9 @@ func GetProjectsV1(c *gin.Context) {
 }
 
 func GetProjectByID(c *gin.Context) {
+	if !RequirePublicModuleOrAdmin(c, "projects") {
+		return
+	}
 	id, ok := parseIDParam(c)
 	if !ok {
 		return
@@ -2391,12 +2447,22 @@ func GetProjectByID(c *gin.Context) {
 		return
 	}
 
+	isAdmin := middleware.IsAdmin(c)
+	if !isAdmin && p.IsPrivate {
+		Error(c, http.StatusNotFound, "项目不存在")
+		return
+	}
+
 	// 同时拉取关联该项目的 Life Entries
 	var entries []models.LifeEntry
-	db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC").Find(&entries)
+	entryQuery := db.DB.Where("project_id = ?", p.ID).Order("occurred_at DESC")
+	if !isAdmin {
+		entryQuery = entryQuery.Where("is_private = ?", false)
+	}
+	entryQuery.Find(&entries)
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	populateEntryURLsBatch(entries)
-	if !middleware.IsAdmin(c) {
+	if !isAdmin {
 		redactEmbeddedWishFinancesBatch(entries)
 	}
 
@@ -2415,6 +2481,7 @@ type ProjectUpdateRequest struct {
 	GithubURL   *string `json:"github_url"`
 	Status      *string `json:"status"`
 	Order       *int    `json:"order"`
+	IsPrivate   *bool   `json:"is_private"`
 }
 
 func UpdateProject(c *gin.Context) {
@@ -2471,6 +2538,9 @@ func UpdateProject(c *gin.Context) {
 	}
 	if req.Order != nil {
 		p.Order = *req.Order
+	}
+	if req.IsPrivate != nil {
+		p.IsPrivate = *req.IsPrivate
 	}
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
@@ -2631,21 +2701,46 @@ func InvalidateStatsCache() {
 func GetGlobalStats(c *gin.Context) {
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	isAdmin := middleware.IsAdmin(c)
-
 	now := time.Now()
+	nowBeijing := now.In(config.BeijingLocation)
+
+	if !isAdmin {
+		pub := GetPublicModulesMap()
+		var totalEntries int64
+		if pub["entries"] {
+			db.DB.Model(&models.LifeEntry{}).Where("is_private = ?", false).Count(&totalEntries)
+		}
+		var totalPhotos int64
+		if pub["entries"] {
+			db.DB.Model(&models.Attachment{}).
+				Joins("JOIN life_entries ON life_entries.id = attachments.entry_id").
+				Where("attachments.mime_type LIKE ? AND life_entries.deleted_at IS NULL AND life_entries.is_private = ?", "image/%", false).
+				Count(&totalPhotos)
+		}
+		var totalProjects int64
+		if pub["projects"] {
+			db.DB.Model(&models.Project{}).Where("is_private = ?", false).Count(&totalProjects)
+		}
+		Success(c, gin.H{
+			"total_entries":  totalEntries,
+			"total_photos":   totalPhotos,
+			"total_projects": totalProjects,
+			"month_expense":  0,
+			"current_year":   nowBeijing.Year(),
+			"current_month":  int(nowBeijing.Month()),
+		})
+		return
+	}
+
 	statsCacheMutex.RLock()
 	if cachedStats != nil && now.Sub(cachedStatsTime) < 30*time.Second {
 		snap := *cachedStats
 		statsCacheMutex.RUnlock()
-		expense := snap.MonthExpense
-		if !isAdmin {
-			expense = 0
-		}
 		Success(c, gin.H{
 			"total_entries":  snap.TotalEntries,
 			"total_photos":   snap.TotalPhotos,
 			"total_projects": snap.TotalProjects,
-			"month_expense":  expense,
+			"month_expense":  snap.MonthExpense,
 			"current_year":   snap.CurrentYear,
 			"current_month":  snap.CurrentMonth,
 		})
@@ -2664,7 +2759,6 @@ func GetGlobalStats(c *gin.Context) {
 	db.DB.Model(&models.Project{}).Count(&totalProjects)
 
 	// 当月支出（按北京时间月份边界计算 RC-134）
-	nowBeijing := now.In(config.BeijingLocation)
 	start := time.Date(nowBeijing.Year(), nowBeijing.Month(), 1, 0, 0, 0, 0, config.BeijingLocation)
 	end := start.AddDate(0, 1, 0)
 
@@ -2721,6 +2815,7 @@ func GetConfigV1(c *gin.Context) {
 			DefaultLocation: "",
 		}
 	}
+	config.PublicModules = ParsePublicModulesRaw(config.PublicModulesRaw)
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
 	if !middleware.IsAdmin(c) {
 		config.InitialLiquidBalance = 0
@@ -2728,36 +2823,51 @@ func GetConfigV1(c *gin.Context) {
 	Success(c, config)
 }
 
+type UpdateConfigRequest struct {
+	SiteName        *string   `json:"site_name"`
+	SiteSubtitle    *string   `json:"site_subtitle"`
+	CuratorName     *string   `json:"curator_name"`
+	DefaultLocation *string   `json:"default_location"`
+	SiteDesc        *string   `json:"site_desc"`
+	PublicModules   *[]string `json:"public_modules"`
+}
+
 func UpdateConfig(c *gin.Context) {
 	var config models.SiteConfig
 	db.DB.FirstOrCreate(&config)
 
-	var req models.SiteConfig
+	var req UpdateConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
 
-	if req.SiteName != "" {
-		config.SiteName = strings.TrimSpace(req.SiteName)
+	if req.SiteName != nil && strings.TrimSpace(*req.SiteName) != "" {
+		config.SiteName = strings.TrimSpace(*req.SiteName)
 	}
-	if req.SiteSubtitle != "" {
-		config.SiteSubtitle = strings.TrimSpace(req.SiteSubtitle)
+	if req.SiteSubtitle != nil && strings.TrimSpace(*req.SiteSubtitle) != "" {
+		config.SiteSubtitle = strings.TrimSpace(*req.SiteSubtitle)
 	}
-	if req.CuratorName != "" {
-		config.CuratorName = strings.TrimSpace(req.CuratorName)
+	if req.CuratorName != nil && strings.TrimSpace(*req.CuratorName) != "" {
+		config.CuratorName = strings.TrimSpace(*req.CuratorName)
 	}
-	if req.DefaultLocation != "" {
-		config.DefaultLocation = strings.TrimSpace(req.DefaultLocation)
+	if req.DefaultLocation != nil && strings.TrimSpace(*req.DefaultLocation) != "" {
+		config.DefaultLocation = strings.TrimSpace(*req.DefaultLocation)
 	}
-	if req.SiteDesc != "" {
-		config.SiteDesc = strings.TrimSpace(req.SiteDesc)
+	if req.SiteDesc != nil && strings.TrimSpace(*req.SiteDesc) != "" {
+		config.SiteDesc = strings.TrimSpace(*req.SiteDesc)
+	}
+	if req.PublicModules != nil {
+		config.PublicModulesRaw = MarshalPublicModulesRaw(*req.PublicModules)
 	}
 
 	if err := db.DB.Save(&config).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新站点配置失败: "+err.Error())
 		return
 	}
+	config.PublicModules = ParsePublicModulesRaw(config.PublicModulesRaw)
+	InvalidatePublicModulesCache()
+	InvalidateStatsCache()
 
 	Success(c, config)
 }
@@ -2797,55 +2907,56 @@ func GlobalSearch(c *gin.Context) {
 	}
 
 	likePat := "%" + q + "%"
-
-	var entries []models.LifeEntry
-	db.DB.Where("title LIKE ? OR content LIKE ? OR location LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat).
-		Order("occurred_at DESC, id DESC").
-		Limit(limit).
-		Find(&entries)
-	if entries == nil {
-		entries = []models.LifeEntry{}
-	}
-	populateEntryURLsBatch(entries)
-	if !middleware.IsAdmin(c) {
-		redactEmbeddedWishFinancesBatch(entries)
-	}
-
-	var footprints []models.Footprint
-	db.DB.Where("city_name LIKE ? OR title LIKE ? OR note LIKE ?", likePat, likePat, likePat).
-		Order("visited_at DESC, id DESC").
-		Limit(limit).
-		Find(&footprints)
-	if footprints == nil {
-		footprints = []models.Footprint{}
-	}
-	populateFootprintURLsBatch(footprints)
-
-	var wishes []models.Wish
-	db.DB.Where("title LIKE ? OR note LIKE ? OR spec LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat).
-		Order("created_at DESC, id DESC").
-		Limit(limit).
-		Find(&wishes)
-	if wishes == nil {
-		wishes = []models.Wish{}
-	}
-	populateWishURLsBatch(wishes)
 	isAdmin := middleware.IsAdmin(c)
-	if !isAdmin {
-		for i := range wishes {
-			wishes[i].ActualCost = 0
-			wishes[i].TransactionID = nil
-			wishes[i].GearID = nil
+	pub := GetPublicModulesMap()
+
+	entries := []models.LifeEntry{}
+	if isAdmin || pub["entries"] {
+		entryQ := db.DB.Where("title LIKE ? OR content LIKE ? OR location LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat)
+		if !isAdmin {
+			entryQ = entryQ.Where("is_private = ?", false)
+		}
+		entryQ.Order("occurred_at DESC, id DESC").Limit(limit).Find(&entries)
+		populateEntryURLsBatch(entries)
+		if !isAdmin {
+			redactEmbeddedWishFinancesBatch(entries)
 		}
 	}
 
-	var projects []models.Project
-	db.DB.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR story LIKE ? OR category LIKE ?", likePat, likePat, likePat, likePat, likePat).
-		Order("`order` ASC, id DESC").
-		Limit(limit).
-		Find(&projects)
-	if projects == nil {
-		projects = []models.Project{}
+	footprints := []models.Footprint{}
+	if isAdmin || pub["footprints"] {
+		fpQ := db.DB.Where("city_name LIKE ? OR title LIKE ? OR note LIKE ?", likePat, likePat, likePat)
+		if !isAdmin {
+			fpQ = fpQ.Where("is_private = ?", false)
+		}
+		fpQ.Order("visited_at DESC, id DESC").Limit(limit).Find(&footprints)
+		populateFootprintURLsBatch(footprints)
+	}
+
+	wishes := []models.Wish{}
+	if isAdmin || pub["wishes"] {
+		wishQ := db.DB.Where("title LIKE ? OR note LIKE ? OR spec LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat)
+		if !isAdmin {
+			wishQ = wishQ.Where("is_private = ?", false)
+		}
+		wishQ.Order("created_at DESC, id DESC").Limit(limit).Find(&wishes)
+		populateWishURLsBatch(wishes)
+		if !isAdmin {
+			for i := range wishes {
+				wishes[i].ActualCost = 0
+				wishes[i].TransactionID = nil
+				wishes[i].GearID = nil
+			}
+		}
+	}
+
+	projects := []models.Project{}
+	if isAdmin || pub["projects"] {
+		projQ := db.DB.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR story LIKE ? OR category LIKE ?", likePat, likePat, likePat, likePat, likePat)
+		if !isAdmin {
+			projQ = projQ.Where("is_private = ?", false)
+		}
+		projQ.Order("`order` ASC, id DESC").Limit(limit).Find(&projects)
 	}
 
 	c.Header("Vary", "Authorization, X-Device-Token, Cookie")

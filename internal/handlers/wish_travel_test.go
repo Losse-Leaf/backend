@@ -17,6 +17,7 @@ import (
 func TestWishAndTravelModules(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")

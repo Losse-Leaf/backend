@@ -76,6 +76,7 @@ func seedTestAdminDevice(rawToken string) {
 func TestProfileAndConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	r := gin.New()
 	r.GET("/api/v1/config", GetConfigV1)

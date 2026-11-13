@@ -20,6 +20,7 @@ import (
 func TestListAggregateIgnoresPagination(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	base := time.Date(2026, 10, 20, 10, 0, 0, 0, time.Local)
 	for i := 0; i < 3; i++ {
@@ -55,6 +56,7 @@ func TestListAggregateIgnoresPagination(t *testing.T) {
 func TestFootprintETagRoleIsolation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	adminKey := "lldt_audit_fp_etag"
 	seedTestAdminDevice(adminKey)
@@ -127,6 +129,7 @@ func TestFootprintETagRoleIsolation(t *testing.T) {
 func TestEmbeddedWishFinancialRedaction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	adminKey := "lldt_audit_embed_wish"
 	seedTestAdminDevice(adminKey)

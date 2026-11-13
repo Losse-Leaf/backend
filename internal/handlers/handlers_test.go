@@ -94,6 +94,7 @@ func TestParseFlexTime(t *testing.T) {
 func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	r := gin.New()
 	r.POST("/api/v1/entries", CreateLifeEntry)
@@ -231,6 +232,7 @@ func TestLifeEntryCRUDAndFiltering(t *testing.T) {
 func TestIncrementalSyncAndETagCaching(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	adminKey := "lldt_sync_etag_key"
 	seedTestAdminDevice(adminKey)
 
@@ -336,6 +338,7 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	adminKey := "lldt_tx_project_sync_key"
 	seedTestAdminDevice(adminKey)
 
@@ -473,6 +476,7 @@ func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 
 	r := gin.New()
 	r.POST("/api/v1/entries", CreateLifeEntry)

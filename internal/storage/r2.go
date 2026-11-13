@@ -290,6 +290,7 @@ func GetStorageStatus() map[string]interface{} {
 	return map[string]interface{}{
 		"provider":               "Cloudflare R2",
 		"configured":             configured,
+		"local_primary":          LocalPrimaryEnabled(),
 		"account_id":             cfg.AccountID,
 		"bucket":                 cfg.BucketName,
 		"public_domain":          cfg.PublicDomain,

@@ -119,6 +119,7 @@ func TestBE2_List304UsesAtMostOneSQL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
 			setupTestFullDB(t)
+			enableAllPublicModulesForTest(t)
 			tc.seed(t)
 
 			r := gin.New()
@@ -161,6 +162,7 @@ func TestBE2_List304UsesAtMostOneSQL(t *testing.T) {
 func TestBE2_ETagIncludesQueryString(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	now := time.Now().In(time.Local)
 	seedEntryForCache(t, "a", now)
 	seedEntryForCache(t, "b", now.Add(-time.Hour))
@@ -192,6 +194,7 @@ func TestBE2_ETagIncludesQueryString(t *testing.T) {
 func TestBE2_200ResponseShapeUnchanged(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
+	enableAllPublicModulesForTest(t)
 	seedEntryForCache(t, "shape", time.Now())
 
 	r := gin.New()

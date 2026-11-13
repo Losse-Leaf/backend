@@ -29,6 +29,7 @@ type LifeEntry struct {
 
 	CityCode string `gorm:"size:12;index" json:"city_code,omitempty"`
 	CityName string `gorm:"size:64" json:"city_name,omitempty"`
+	IsPrivate bool  `gorm:"default:false;index" json:"is_private"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `gorm:"index" json:"updated_at"`
@@ -66,6 +67,7 @@ type Project struct {
 	GithubURL   string `json:"github_url,omitempty"`
 	Status      string `json:"status,omitempty"`
 	Order       int    `gorm:"index" json:"order,omitempty"`
+	IsPrivate   bool   `gorm:"default:false;index" json:"is_private"`
 	// ClientRequestID 幂等创建标识（跨端统一契约 B，语义同 LifeEntry）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录。
 	ClientRequestID *string        `gorm:"size:64;uniqueIndex" json:"client_request_id,omitempty"`
@@ -198,7 +200,9 @@ type SiteConfig struct {
 	DefaultLocation      string `json:"default_location,omitempty"`
 	SiteDesc             string `json:"site_desc,omitempty"`
 	Initialized          bool   `gorm:"default:false" json:"initialized"`
-	InitialLiquidBalance int64  `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
+	InitialLiquidBalance int64    `gorm:"default:0" json:"initial_liquid_balance"` // 初始流动资金底数 (分 BE-15)
+	PublicModulesRaw     string   `gorm:"column:public_modules;type:text;default:'[]'" json:"-"`
+	PublicModules        []string `gorm:"-" json:"public_modules"`
 
 	// 对象存储动态配置 (支持通过管理后台在线配置 Cloudflare R2 / S3 兼容存储)
 	R2Disabled             bool   `gorm:"default:false" json:"-"`
@@ -245,6 +249,7 @@ type Device struct {
 	DeviceModel  string    `json:"device_model,omitempty"`                        // e.g. "iPhone17,1"
 	TokenHash    string    `gorm:"uniqueIndex;size:64;not null" json:"-"`         // SHA-256 哈希，绝不存明文
 	Status       string    `gorm:"index;default:active;size:32" json:"status"`    // active, revoked
+	IsCurrent    bool      `gorm:"-" json:"is_current"`                           // 当前请求所属设备 (Phase 2)
 	PairedAt     time.Time `json:"paired_at"`
 	LastActiveAt time.Time `gorm:"index" json:"last_active_at"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -282,6 +287,7 @@ type Wish struct {
 	// 伴生的一级散页以它作为 occurred_at，从而在时间流里落在正确的历史位置。
 	PlantedAt     *time.Time   `gorm:"index" json:"planted_at,omitempty"`
 	Status        string       `gorm:"size:32;index;index:idx_wish_status_kind_created,priority:1;index:idx_wish_status_fulfilled,priority:1;default:wanting" json:"status"` // wanting | fulfilled | relinquished | shelved
+	IsPrivate     bool         `gorm:"default:false;index" json:"is_private"`
 	FulfilledAt   *time.Time   `gorm:"index;index:idx_wish_status_fulfilled,priority:2" json:"fulfilled_at,omitempty"`
 	TransactionID *uint        `gorm:"index" json:"transaction_id,omitempty"`
 	LifeEntryID   *uint        `gorm:"index" json:"life_entry_id,omitempty"`
@@ -327,6 +333,7 @@ type Footprint struct {
 	EntriesCount     int          `gorm:"-" json:"entries_count,omitempty"`                                                                         // 该趟旅程下聚合的动态篇数
 	TotalSpent       int64        `gorm:"-" json:"total_spent,omitempty"`                                                                           // 该趟旅程下聚合的总花销(分，仅管理员下发)
 	TransactionCount int          `gorm:"-" json:"transaction_count,omitempty"`                                                                     // 该趟旅程下聚合的消费笔数(仅管理员下发)
+	IsPrivate        bool         `gorm:"default:false;index" json:"is_private"`
 	// ClientRequestID 幂等创建标识（跨端统一契约 B，语义同 LifeEntry）：
 	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录。
 	ClientRequestID *string        `gorm:"size:64;uniqueIndex" json:"client_request_id,omitempty"`

@@ -149,10 +149,9 @@ func main() {
 		v1.GET("/auth/session", handlers.GetSessionStatus)
 		v1.POST("/auth/logout", handlers.LogoutSession)
 
-		// 统一文件临时签名接口 (公开只读，供各端获取动态有效访问 URL)
-		v1.GET("/files/sign", handlers.SignFileURL)
 		// 附件缩略图：列表与详情用它（几十 KB），灯箱才用原图
 		v1.GET("/files/thumbnail", handlers.ThumbnailFile)
+		// 统一文件批量临时签名接口 (公开只读，供各端获取动态有效访问 URL)
 		v1.POST("/files/sign-batch", handlers.SignFilesBatch)
 
 		// 足迹图谱与回忆抽屉 (公开只读，RC-91)
@@ -228,7 +227,6 @@ func main() {
 			write.POST("/categories", handlers.CreateCategory)
 			write.PUT("/categories/:id", handlers.UpdateCategory)
 			write.DELETE("/categories/:id", handlers.DeleteCategory)
-			write.POST("/categories/reset", handlers.ResetCategories)
 
 			// Projects (项目与造物)
 			write.POST("/projects", handlers.CreateProject)

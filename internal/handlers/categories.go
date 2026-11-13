@@ -311,21 +311,3 @@ func DeleteCategory(c *gin.Context) {
 
 	Success(c, gin.H{"id": item.ID, "deleted": true})
 }
-
-type ResetCategoriesRequest struct {
-	Scope string `json:"scope"`
-}
-
-// ResetCategories 恢复指定或全部模块的预置默认分类项
-func ResetCategories(c *gin.Context) {
-	var req ResetCategoriesRequest
-	_ = c.ShouldBindJSON(&req)
-	scope := strings.TrimSpace(req.Scope)
-	if scope != "" && !validCategoryScopes[scope] {
-		Error(c, http.StatusBadRequest, "不支持的分类模块类型")
-		return
-	}
-
-	db.SeedDefaultCategories(db.DB, scope, true)
-	GetCategories(c)
-}

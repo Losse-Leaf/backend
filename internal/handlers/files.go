@@ -9,7 +9,6 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -200,67 +199,6 @@ func isRegisteredObjectKey(cleanKey string) bool {
 	return false
 }
 
-// SignFileURL 获取指定相对路径文件的临时签名预签名 URL (公开只读接口)
-// 鉴权策略 (BE-21)：已登录管理员可签名任意 key；未认证访客仅可为数据库已登记附件与头像换取签名，阻断签名预言机
-// Query 参数：
-//   - key / path / object_key: 相对路径 (如 avatar/user.png)
-//   - expires: 自定义过期时效 (秒，可选，默认 1800 秒 / 30 分钟)
-func SignFileURL(c *gin.Context) {
-	key := strings.TrimSpace(c.Query("key"))
-	if key == "" {
-		key = strings.TrimSpace(c.Query("path"))
-	}
-	if key == "" {
-		key = strings.TrimSpace(c.Query("object_key"))
-	}
-
-	if key == "" {
-		Error(c, http.StatusBadRequest, "缺少待签名的对象路径 (key/path/object_key)")
-		return
-	}
-
-	cleanKey := storage.ExtractObjectKey(key)
-
-	// 校验资源归属 (BE-21): 非管理员仅允许签名合法登记的资源
-	if !middleware.IsAdmin(c) && !isRegisteredObjectKey(cleanKey) {
-		Error(c, http.StatusForbidden, "该资源未在系统中登记，访客无权获取签名")
-		return
-	}
-
-	var customDuration time.Duration
-	if expStr := c.Query("expires"); expStr != "" {
-		if sec, err := strconv.Atoi(expStr); err == nil && sec > 0 && sec <= 604800 {
-			customDuration = time.Duration(sec) * time.Second
-		}
-	}
-
-	// 关键：本地磁盘为主时，签名走**本机媒体签名**，
-	// 而不是只走 R2 预签名。
-	// 否则在「R2 只是备份、真存储在 VPS 本地」的部署下，
-	// 这个公开接口会**必然失败**（GeneratePresignedGetURL 在未配置 R2 时报错），
-	// 访客换不到任何图片地址。
-	var signedURL string
-	var expiresIn int
-	if storage.ObjectExistsLocally(cleanKey) {
-		signedURL = storage.SignLocalMediaURL(cleanKey, customDuration)
-		expiresIn = int(storage.LocalMediaSignatureTTL().Seconds())
-	} else {
-		url, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
-		if err != nil {
-			Error(c, http.StatusInternalServerError, "生成临时签名 URL 失败: "+err.Error())
-			return
-		}
-		signedURL = url
-		expiresIn = exp
-	}
-
-	Success(c, gin.H{
-		"object_key": cleanKey,
-		"url":        signedURL,
-		"expires_in": expiresIn,
-	})
-}
-
 // BatchSignRequest 批量签名请求载荷
 type BatchSignRequest struct {
 	Keys      []string `json:"keys" binding:"required"`
@@ -308,12 +246,8 @@ func SignFilesBatch(c *gin.Context) {
 		}
 
 		// 关键：本地磁盘为主时，签名走**本机媒体签名**，
-		// 而不是只走 R2 预签名。
-		//
-		// 与单发接口 `SignFileURL` 保持一致 —— 那条路径本轮已修，
-		// 而批量这条**漏了**，于是「本机为主、R2 仅备份」的部署下：
-		// `GeneratePresignedGetURL` 在未配置 R2 时报错 ⇒ 回落到
-		// `GetPublicURL`（一个**没有签名**的地址）⇒ 换到的地址**根本访问不了**。
+		// 而不是只走 R2 预签名，避免「本机为主、R2 仅备份」的部署下
+		// `GeneratePresignedGetURL` 报错回落到无签名地址。
 		var signedURL string
 		var expiresIn int
 		if storage.ObjectExistsLocally(cleanKey) {

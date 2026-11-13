@@ -37,70 +37,11 @@ func TestFilesHandler(t *testing.T) {
 	r := gin.New()
 	v1 := r.Group("/api/v1")
 	{
-		v1.GET("/files/sign", SignFileURL)
 		v1.POST("/files/sign-batch", SignFilesBatch)
 		v1.POST("/files/upload", UnifiedUploadFile)
 		v1.GET("/profile", GetCuratorProfile)
 		v1.PUT("/profile", UpdateCuratorProfile)
 	}
-
-	t.Run("Sign single file with default 30m expiration", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key=avatar/user.png", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var resp Response
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-
-		dataMap, ok := resp.Data.(map[string]interface{})
-		if !ok {
-			t.Fatalf("expected data map, got %T", resp.Data)
-		}
-
-		if dataMap["object_key"] != "avatar/user.png" {
-			t.Errorf("expected object_key 'avatar/user.png', got '%v'", dataMap["object_key"])
-		}
-		if dataMap["url"] == "" {
-			t.Errorf("expected non-empty url")
-		}
-		if int(dataMap["expires_in"].(float64)) != 1800 {
-			t.Errorf("expected default 1800s expires_in, got %v", dataMap["expires_in"])
-		}
-	})
-
-	t.Run("Sign single file with custom expiration", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key=avatar/user.png&expires=600", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-
-		var resp Response
-		_ = json.Unmarshal(w.Body.Bytes(), &resp)
-		dataMap := resp.Data.(map[string]interface{})
-
-		if int(dataMap["expires_in"].(float64)) != 600 {
-			t.Errorf("expected 600s expires_in, got %v", dataMap["expires_in"])
-		}
-	})
-
-	t.Run("Sign file with missing key returns 400", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", w.Code)
-		}
-	})
 
 	t.Run("Batch sign files", func(t *testing.T) {
 		// 注册一条合法的生效附件记录 (绑定至未删除的 Entry) (BE-21)
@@ -213,63 +154,65 @@ func TestFilesHandler(t *testing.T) {
 	})
 
 	t.Run("BE-21 Public visitor signing oracle prevention", func(t *testing.T) {
-		// 1. 访客尝试对未在系统登记的游离 object_key 签名，应被 403 拦截
+		signBatchMap := func(keys []string, authHeader string) map[string]string {
+			payload := BatchSignRequest{Keys: keys}
+			body, _ := json.Marshal(payload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/files/sign-batch", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			if authHeader != "" {
+				req.Header.Set("Authorization", authHeader)
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			var resp Response
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			dataMap := resp.Data.(map[string]interface{})
+			urls := make(map[string]string)
+			if rawItems, ok := dataMap["items"].([]interface{}); ok {
+				for _, raw := range rawItems {
+					if m, ok := raw.(map[string]interface{}); ok {
+						k, _ := m["object_key"].(string)
+						u, _ := m["url"].(string)
+						urls[k] = u
+					}
+				}
+			}
+			return urls
+		}
+
+		// 1. 访客批量签名时，未登记的游离 key 应被静默过滤
 		unregisteredKey := "system/confidential_backup.sql"
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unregisteredKey, nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403 Forbidden for unregistered key, got %d: %s", w.Code, w.Body.String())
+		visitorURLs := signBatchMap([]string{"avatar/user.png", unregisteredKey}, "")
+		if visitorURLs["avatar/user.png"] == "" {
+			t.Fatalf("expected registered avatar key to be signed for visitor")
+		}
+		if visitorURLs[unregisteredKey] != "" {
+			t.Fatalf("expected unregistered key to be filtered out for visitor, got %q", visitorURLs[unregisteredKey])
 		}
 
-		// 2. 访客批量签名时，未登记的游离 key 应被静默过滤
-		batchPayload := BatchSignRequest{
-			Keys: []string{"avatar/user.png", unregisteredKey},
-		}
-		batchBody, _ := json.Marshal(batchPayload)
-		batchReq := httptest.NewRequest(http.MethodPost, "/api/v1/files/sign-batch", bytes.NewReader(batchBody))
-		batchReq.Header.Set("Content-Type", "application/json")
-		batchW := httptest.NewRecorder()
-		r.ServeHTTP(batchW, batchReq)
-
-		if batchW.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", batchW.Code)
-		}
-		var batchResp Response
-		_ = json.Unmarshal(batchW.Body.Bytes(), &batchResp)
-		batchMap := batchResp.Data.(map[string]interface{})
-		batchItems := batchMap["items"].([]interface{})
-		if len(batchItems) != 1 {
-			t.Fatalf("expected 1 item (unregistered key filtered out), got %d", len(batchItems))
-		}
-
-		// 3. 管理员授权请求对未登记 key 签名，应放行 200
+		// 2. 管理员授权请求对未登记 key 签名，应正常返回签名 URL
 		adminToken := "lldt_test_admin_signing_token_12345"
 		seedTestAdminDevice(adminToken)
 
-		adminReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unregisteredKey, nil)
-		adminReq.Header.Set("Authorization", "Bearer "+adminToken)
-		adminW := httptest.NewRecorder()
-		r.ServeHTTP(adminW, adminReq)
-
-		if adminW.Code != http.StatusOK {
-			t.Fatalf("expected 200 for authenticated admin signing, got %d: %s", adminW.Code, adminW.Body.String())
+		adminURLs := signBatchMap([]string{unregisteredKey}, "Bearer "+adminToken)
+		if adminURLs[unregisteredKey] == "" {
+			t.Fatalf("expected non-empty signed url for authenticated admin signing")
 		}
 
-		// 4. 已解绑附件 (entry_id/wish_id/footprint_id 均为 nil) 访客禁止签名 (403)
+		// 3. 已解绑附件 (entry_id/wish_id/footprint_id 均为 nil) 访客禁止签名
 		unboundKey := "entries/2026/10/09/unbound_photo.jpg"
 		db.DB.Create(&models.Attachment{
 			ObjectKey: unboundKey,
 		})
-		unboundReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+unboundKey, nil)
-		unboundW := httptest.NewRecorder()
-		r.ServeHTTP(unboundW, unboundReq)
-		if unboundW.Code != http.StatusForbidden {
-			t.Fatalf("expected 403 Forbidden for unbound attachment, got %d", unboundW.Code)
+		unboundURLs := signBatchMap([]string{unboundKey}, "")
+		if unboundURLs[unboundKey] != "" {
+			t.Fatalf("expected unbound attachment to be filtered out for visitor, got %q", unboundURLs[unboundKey])
 		}
 
-		// 5. 软删除实体的关联附件，访客禁止签名 (403)
+		// 4. 软删除实体的关联附件，访客禁止签名
 		deletedEntry := models.LifeEntry{Title: "Deleted Entry"}
 		db.DB.Create(&deletedEntry)
 		softDelKey := "entries/2026/10/09/soft_deleted_parent.jpg"
@@ -277,14 +220,11 @@ func TestFilesHandler(t *testing.T) {
 			EntryID:   &deletedEntry.ID,
 			ObjectKey: softDelKey,
 		})
-		// 软删除该 Entry
 		db.DB.Delete(&deletedEntry)
 
-		softDelReq := httptest.NewRequest(http.MethodGet, "/api/v1/files/sign?key="+softDelKey, nil)
-		softDelW := httptest.NewRecorder()
-		r.ServeHTTP(softDelW, softDelReq)
-		if softDelW.Code != http.StatusForbidden {
-			t.Fatalf("expected 403 Forbidden for attachment of soft-deleted entry, got %d", softDelW.Code)
+		softDelURLs := signBatchMap([]string{softDelKey}, "")
+		if softDelURLs[softDelKey] != "" {
+			t.Fatalf("expected attachment of soft-deleted entry to be filtered out for visitor, got %q", softDelURLs[softDelKey])
 		}
 	})
 

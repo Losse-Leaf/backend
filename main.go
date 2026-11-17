@@ -64,11 +64,16 @@ func main() {
 		reopenClaimEntry()
 	}
 
-	// 全新实例启动时生成一次性认领码，只打印到标准输出，不落库、不写配置文件。
-	// 认领码 15 分钟内有效；进程重启会重新生成。
+	// 全新实例启动时：若未启用 Vesper Auth OIDC，则生成一次性认领码打印到标准输出；
+	// 启用 OIDC 时主理人首次通过通行证登录即可在事务内自动激活创刊，无需翻找 8 位认领码。
 	var siteCfg models.SiteConfig
 	if err := db.DB.Limit(1).Find(&siteCfg).Error; err != nil {
 		log.Printf("读取系统初始化状态失败: %v", err)
+	} else if cfg.OIDC.Enabled {
+		log.Printf("Vesper Auth OIDC single sign-on enabled (issuer: %s).", cfg.OIDC.Issuer)
+		if !siteCfg.Initialized {
+			log.Println("System awaiting initial activation via Vesper Auth OIDC login.")
+		}
 	} else if !siteCfg.Initialized {
 		code, _, err := handlers.StartClaimCode()
 		if err != nil {
@@ -139,6 +144,10 @@ func main() {
 		// 系统生命周期与首台设备认领 (BE-18, BE-19)
 		v1.GET("/system/status", handlers.GetSystemStatus)
 		v1.POST("/auth/claim", handlers.ClaimDevice)
+
+		// Vesper Auth OAuth 2.0 / OIDC + PKCE 统一单点登录与跨端回调
+		v1.GET("/auth/oidc/login", handlers.OIDCLogin)
+		v1.GET("/auth/oidc/callback", handlers.OIDCCallback)
 
 		// 设备配对握手/轮询 (公开接口；需系统已完成首次认领)
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
@@ -300,9 +309,9 @@ func main() {
 	// 9. 启动每日自动定时备份任务 (北京时间 03:30)
 	backup.StartDailyBackupScheduler()
 
-	port := cfg.Port
+	listenAddr := fmt.Sprintf("%s:%s", cfg.ListenHost, cfg.Port)
 	srv := &http.Server{
-		Addr:              ":" + port,
+		Addr:              listenAddr,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       120 * time.Second, // 支持 50MB 媒体文件在有限带宽下的平稳上传
@@ -312,7 +321,7 @@ func main() {
 
 	// 启动 HTTP 服务协程
 	go func() {
-		log.Printf("Loose-Leaf Server %s starting on :%s ...", config.Version, port)
+		log.Printf("Loose-Leaf Server %s starting on %s ...", config.Version, listenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}
@@ -384,6 +393,16 @@ func reopenClaimEntry() {
 // 二次检查同样返回 503，避免请求挂在锁上直到 HTTP 超时。
 func lifecycleGuard() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// OIDC 登录跳转与外部令牌核验包含跨网 HTTP 调用，在顶层白名单中放行以避免阻塞整库恢复锁；
+		// callback 落库阶段在事务入口单独检查恢复状态并持有短读锁。
+		if p := c.Request.URL.Path; p == "/api/v1/auth/oidc/login" || p == "/api/v1/auth/oidc/callback" {
+			if backup.IsRestoring() {
+				abortRestoring(c)
+				return
+			}
+			c.Next()
+			return
+		}
 		if backup.IsRestoring() {
 			abortRestoring(c)
 			return

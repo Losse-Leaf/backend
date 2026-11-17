@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"os"
 	"strconv"
 	"strings"
@@ -18,10 +19,41 @@ type R2Config struct {
 	PresignExpireSeconds int // 临时签名 URL 有效期 (秒)，默认 1800 秒 (30 分钟)
 }
 
+type OIDCConfig struct {
+	Enabled      bool
+	Issuer       string
+	ClientID     string
+	ClientSecret string
+	RedirectURI  string
+	AllowedSubs  []string
+}
+
+// IsSubAllowed 核验 OIDC sub 是否命中主理人白名单；未配置白名单时默认放行非空 sub。
+func (o OIDCConfig) IsSubAllowed(sub string) bool {
+	sub = strings.TrimSpace(sub)
+	if sub == "" {
+		return false
+	}
+	if len(o.AllowedSubs) == 0 {
+		return true
+	}
+	matched := false
+	for _, allowed := range o.AllowedSubs {
+		if subtle.ConstantTimeCompare([]byte(sub), []byte(allowed)) == 1 {
+			matched = true
+		}
+	}
+	return matched
+}
+
 type Config struct {
-	DBPath string
-	Port   string
-	R2     R2Config
+	DBPath              string
+	ListenHost          string
+	Port                string
+	SiteURL             string
+	OIDC                OIDCConfig
+	InternalBridgeToken string
+	R2                  R2Config
 }
 
 var AppConfig Config
@@ -108,6 +140,48 @@ func LoadConfig() Config {
 		port = "8088"
 	}
 
+	listenHost := strings.TrimSpace(os.Getenv("LISTEN_HOST"))
+	if listenHost == "" {
+		listenHost = "0.0.0.0"
+	}
+
+	siteURL := strings.TrimRight(strings.TrimSpace(os.Getenv("SITE_URL")), "/")
+
+	oidcIssuer := strings.TrimRight(strings.TrimSpace(os.Getenv("OIDC_ISSUER")), "/")
+	oidcClientID := strings.TrimSpace(os.Getenv("OIDC_CLIENT_ID"))
+	oidcClientSecret := strings.TrimSpace(os.Getenv("OIDC_CLIENT_SECRET"))
+	oidcRedirectURI := strings.TrimSpace(os.Getenv("OIDC_REDIRECT_URI"))
+
+	var allowedSubs []string
+	if rawAllowed := strings.TrimSpace(os.Getenv("OIDC_ALLOWED_SUB")); rawAllowed != "" {
+		seen := make(map[string]bool)
+		for _, part := range strings.Split(rawAllowed, ",") {
+			sub := strings.TrimSpace(part)
+			if sub != "" && !seen[sub] {
+				seen[sub] = true
+				allowedSubs = append(allowedSubs, sub)
+			}
+		}
+	}
+
+	oidcEnabled := oidcIssuer != "" && oidcClientID != ""
+	if rawEnabled := strings.TrimSpace(os.Getenv("OIDC_ENABLED")); rawEnabled != "" {
+		if parsed, err := strconv.ParseBool(rawEnabled); err == nil {
+			oidcEnabled = parsed
+		}
+	}
+
+	oidcCfg := OIDCConfig{
+		Enabled:      oidcEnabled,
+		Issuer:       oidcIssuer,
+		ClientID:     oidcClientID,
+		ClientSecret: oidcClientSecret,
+		RedirectURI:  oidcRedirectURI,
+		AllowedSubs:  allowedSubs,
+	}
+
+	internalBridgeToken := strings.TrimSpace(os.Getenv("INTERNAL_BRIDGE_TOKEN"))
+
 	accountID := strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID"))
 	endpoint := strings.TrimSpace(os.Getenv("R2_ENDPOINT"))
 	if endpoint == "" && accountID != "" {
@@ -132,9 +206,13 @@ func LoadConfig() Config {
 	}
 
 	AppConfig = Config{
-		DBPath: dbPath,
-		Port:   port,
-		R2:     r2Cfg,
+		DBPath:              dbPath,
+		ListenHost:          listenHost,
+		Port:                port,
+		SiteURL:             siteURL,
+		OIDC:                oidcCfg,
+		InternalBridgeToken: internalBridgeToken,
+		R2:                  r2Cfg,
 	}
 
 	return AppConfig

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/authclaim"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -35,6 +36,12 @@ func StartClaimCode() (string, time.Time, error) {
 // 仅当 initialized=false 时可用；成功后在同一事务中创建设备记录并把
 // initialized 置为 true，随后永久关闭入口（返回 404 隐藏路由）。
 func ClaimDevice(c *gin.Context) {
+	// 启用 Vesper Auth OIDC 单点登录时关闭认领码入口，仅在纯局域网离线部署模式下保留作为兜底
+	if config.AppConfig.OIDC.Enabled {
+		claimEntryClosed(c)
+		return
+	}
+
 	var cfg models.SiteConfig
 	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "读取系统初始化状态失败")

@@ -157,6 +157,10 @@ func ResolveSmartHubURL(incomingHubURL string, c *gin.Context) (string, []Networ
 	reqURL := strings.TrimRight(strings.TrimSpace(incomingHubURL), "/")
 	if reqURL == "" {
 		reqURL = resolveHubURL(c)
+	} else if isLoopbackHost(reqURL) {
+		if siteURL := strings.TrimRight(strings.TrimSpace(config.AppConfig.SiteURL), "/"); siteURL != "" && !isLoopbackHost(siteURL) {
+			reqURL = siteURL
+		}
 	}
 
 	port := config.AppConfig.Port

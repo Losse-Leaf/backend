@@ -2,11 +2,15 @@ package middleware
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -49,6 +53,23 @@ func ExtractToken(c *gin.Context) string {
 	return ""
 }
 
+// IsSecureRequest 判断当前请求是否经由安全传输（直连 TLS 或外层反代透传 X-Forwarded-Proto: https）
+func IsSecureRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	if c.Request.TLS != nil {
+		return true
+	}
+	if proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); proto != "" {
+		first := strings.TrimSpace(strings.Split(proto, ",")[0])
+		if strings.EqualFold(first, "https") {
+			return true
+		}
+	}
+	return false
+}
+
 // SetSessionCookie 下发 HttpOnly 会话 Cookie (MOB-P1-69)
 //
 // Secure 由实际传输协议决定（直连 TLS 或反代透传 X-Forwarded-Proto）——
@@ -58,7 +79,7 @@ func SetSessionCookie(c *gin.Context, token string) {
 	if token == "" {
 		return
 	}
-	secure := c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+	secure := IsSecureRequest(c)
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    token,
@@ -72,7 +93,7 @@ func SetSessionCookie(c *gin.Context, token string) {
 
 // ClearSessionCookie 清除会话 Cookie (登出, MOB-P1-69)
 func ClearSessionCookie(c *gin.Context) {
-	secure := c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+	secure := IsSecureRequest(c)
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    "",
@@ -84,9 +105,59 @@ func ClearSessionCookie(c *gin.Context) {
 	})
 }
 
-// IsAdmin 判定当前请求是否具备主理人权限 (仅認 devices 表中 status = 'active' 的有效设备凭证 BE-18)
+// isLoopbackBridgeAuthorized 核验同机部署服务（如 BotHub）的本机回环桥接通道。
+//
+// 安全边界：
+// 1. INTERNAL_BRIDGE_TOKEN 必须显式配置且非空；
+// 2. 底层 TCP 连接 RemoteAddr 必须严格为 127.0.0.1 或 ::1；
+// 3. 请求严禁携带任何外部反向代理转发头（CF-Connecting-IP / X-Forwarded-For / X-Real-IP / Forwarded）；
+// 4. 请求头 X-Bridge-Token 必须经 subtle.ConstantTimeCompare 常数时间精确匹配。
+func isLoopbackBridgeAuthorized(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	expected := strings.TrimSpace(config.AppConfig.InternalBridgeToken)
+	if expected == "" {
+		expected = strings.TrimSpace(os.Getenv("INTERNAL_BRIDGE_TOKEN"))
+	}
+	if expected == "" {
+		return false
+	}
+
+	// 严禁携带任何外部反代透传头，防止本机 Nginx 转发公网流量误入回环快速通道
+	for _, proxyHeader := range []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP", "Forwarded"} {
+		if len(c.Request.Header.Values(proxyHeader)) > 0 {
+			return false
+		}
+	}
+
+	remoteAddr := strings.TrimSpace(c.Request.RemoteAddr)
+	if remoteAddr == "" {
+		return false
+	}
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host != "127.0.0.1" && host != "::1" {
+		return false
+	}
+
+	provided := strings.TrimSpace(c.GetHeader("X-Bridge-Token"))
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+// IsAdmin 判定当前请求是否具备主理人权限（支持受信任设备凭证与纯本机安全回环桥接）
 func IsAdmin(c *gin.Context) bool {
-	if authType, exists := c.Get("auth_type"); exists && authType == "device" {
+	if authType, exists := c.Get("auth_type"); exists && (authType == "device" || authType == "bridge") {
+		return true
+	}
+
+	if isLoopbackBridgeAuthorized(c) {
 		return true
 	}
 
@@ -105,10 +176,18 @@ func IsAdmin(c *gin.Context) bool {
 }
 
 // AdminAuthRequired 管理员写操作与私密接口鉴权中间件 (BE-18)
-// 唯一凭证源：校验 SQLite devices 表中处于 active 状态的设备子钥匙 (token_hash)
-// 未初始化时不存在任何免密旁路；首台设备只能通过公开的 /api/v1/auth/claim 认领。
+// 凭证源：校验 SQLite devices 表中处于 active 状态的设备子钥匙 (token_hash)，
+// 或经严格安全边界核验的同机 BotHub 回环桥接令牌。
 func AdminAuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if isLoopbackBridgeAuthorized(c) {
+			c.Set("auth_type", "bridge")
+			c.Set("device_id", "bridge_loopback")
+			c.Set("device_name", "BotHub Loopback Bridge")
+			c.Next()
+			return
+		}
+
 		token := ExtractToken(c)
 
 		if token != "" && db.DB != nil {

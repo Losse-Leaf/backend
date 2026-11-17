@@ -28,9 +28,11 @@ func GetSystemStatus(c *gin.Context) {
 	}
 
 	Success(c, gin.H{
-		"initialized":  cfg.Initialized,
-		"site_name":    siteName,
-		"curator_name": cfg.CuratorName,
+		"initialized":        cfg.Initialized,
+		"site_name":          siteName,
+		"curator_name":       cfg.CuratorName,
+		"oidc_enabled":       config.AppConfig.OIDC.Enabled,
+		"oidc_provider_name": "Vesper Auth",
 	})
 }
 

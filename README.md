@@ -2,7 +2,7 @@
 
 > **Living Archive API Hub · 统一数据中枢与 R2 媒体签名引擎**
 >
-> 部署状态: 海外 VPS 独立部署（单二进制内嵌分发，生产域名待定）
+> 部署状态: 海外 VPS 独立部署（生产主域 `https://leaf.starryheavens.uk`，单二进制内嵌分发，接入 `Vesper Auth` 统一单点登录）
 
 ---
 
@@ -13,7 +13,7 @@
 - **语言与框架**：Go 1.24+ / Gin Web Framework / GORM
 - **核心数据库**：SQLite3（开启 WAL 预写日志与读写并发优化）
 - **对象存储**：Cloudflare R2（S3 兼容协议，零出口流量费）与本地磁盘直存双轨支持
-- **安全鉴权**：受信任设备子钥匙配对组（`devices` 表 Bearer / `X-Device-Token`）保护写操作与私密财务数据，无需配置 `.env` 密钥环境变量；首台设备通过启动时打印的一次性认领码认领，其余设备扫配对二维码接入
+- **安全鉴权**：底层统一采用受信任设备子钥匙配对组（`devices` 表 `looseleaf_session` Cookie / Bearer / `X-Device-Token`）保护写操作与私密财务数据；上层支持接入自建 `Vesper Auth`（OAuth 2.0 / OIDC + `S256` PKCE）实现免认领码一键创刊与跨端单点登录，以及可选的本机 `INTERNAL_BRIDGE_TOKEN` 回环桥接通道（纯局域网离线环境保留启动打印 8 位一次性认领码兜底）
 
 ---
 

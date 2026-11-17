@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"loose-leaf/internal/authclaim"
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -53,7 +54,7 @@ func TestClaimDeviceLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 未初始化时状态探针只暴露 initialized / site_name / curator_name。
+	// 未初始化时状态探针只暴露 initialized / site_name / curator_name / oidc_enabled / oidc_provider_name。
 	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/system/status", nil)
 	statusW := httptest.NewRecorder()
 	r.ServeHTTP(statusW, statusReq)
@@ -66,10 +67,10 @@ func TestClaimDeviceLifecycle(t *testing.T) {
 	if err := json.Unmarshal(statusW.Body.Bytes(), &statusRes); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
-	if len(statusRes.Data) != 3 {
-		t.Fatalf("system status must expose exactly 3 fields, got %v", statusRes.Data)
+	if len(statusRes.Data) != 5 {
+		t.Fatalf("system status must expose exactly 5 fields, got %v", statusRes.Data)
 	}
-	for _, key := range []string{"initialized", "site_name", "curator_name"} {
+	for _, key := range []string{"initialized", "site_name", "curator_name", "oidc_enabled", "oidc_provider_name"} {
 		if _, ok := statusRes.Data[key]; !ok {
 			t.Fatalf("system status missing %q: %v", key, statusRes.Data)
 		}
@@ -236,5 +237,25 @@ func TestClaimEntryClosedWhenAlreadyInitialized(t *testing.T) {
 	db.DB.Model(&models.Device{}).Count(&deviceCount)
 	if deviceCount != 0 {
 		t.Fatalf("closed claim entry must not create devices, got %d", deviceCount)
+	}
+}
+
+func TestClaimEntryClosedWhenOIDCEnabled(t *testing.T) {
+	setupTestFullDB(t)
+	db.DB.Create(&models.SiteConfig{Initialized: false})
+	claimCodeManager = authclaim.NewManager()
+	prevOIDC := config.AppConfig.OIDC
+	config.AppConfig.OIDC.Enabled = true
+	t.Cleanup(func() {
+		config.AppConfig.OIDC = prevOIDC
+	})
+
+	r := setupClaimRouter()
+	code, _, err := StartClaimCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := postClaim(t, r, code); w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when OIDC_ENABLED=true, got %d: %s", w.Code, w.Body.String())
 	}
 }

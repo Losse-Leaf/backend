@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -31,14 +32,28 @@ func generateRandomHex(n int) string {
 }
 
 func resolveHubURL(c *gin.Context) string {
-	scheme := "https"
-	if c.Request.TLS == nil {
-		scheme = "http"
+	if siteURL := strings.TrimRight(strings.TrimSpace(config.AppConfig.SiteURL), "/"); siteURL != "" {
+		return siteURL
 	}
-	if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
+	scheme := "http"
+	if middleware.IsSecureRequest(c) {
+		scheme = "https"
+	} else if c != nil && c.Request != nil {
+		if proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); proto != "" {
+			first := strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
+			if first == "http" || first == "https" {
+				scheme = first
+			}
+		}
 	}
-	host := c.Request.Host
+	var host string
+	if c != nil && c.Request != nil {
+		if xfHost := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); xfHost != "" {
+			host = strings.TrimSpace(strings.Split(xfHost, ",")[0])
+		} else {
+			host = strings.TrimSpace(c.Request.Host)
+		}
+	}
 	if host == "" {
 		host = "localhost:8088"
 	}

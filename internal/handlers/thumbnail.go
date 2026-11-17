@@ -137,11 +137,6 @@ func ensureThumbnailDiskDir() string {
 	return thumbnailDiskDir
 }
 
-// readObjectBytes 读取对象原始字节：**本地优先**，本地没有才回落对象存储
-func readObjectBytes(ctx context.Context, objectKey string) ([]byte, error) {
-	return storage.ReadObject(ctx, objectKey)
-}
-
 // makeThumbnail 生成缩略图字节
 //
 // BE-6：先 DecodeConfig 做尺寸/像素上限校验，再完整 Decode。
@@ -335,7 +330,7 @@ func buildThumbnailOnce(ctx context.Context, objectKey string, width int, cacheK
 	// 其他仍在等待的 follower 不应一起收到 404。给共享任务独立的超时。
 	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
 	defer cancel()
-	raw, err := readObjectBytes(workCtx, objectKey)
+	raw, err := storage.ReadObject(workCtx, objectKey)
 	if err != nil {
 		call.status, call.err = http.StatusNotFound, fmt.Errorf("缩略图源不可用: %w", err)
 		return nil, call.status, call.err

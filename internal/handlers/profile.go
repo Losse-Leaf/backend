@@ -79,7 +79,7 @@ func GetCuratorProfile(c *gin.Context) {
 		Error(c, http.StatusNotFound, "主理人档案尚未初始化")
 		return
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 	isAdmin := middleware.IsAdmin(c)
 	populateProfileData(&profile, isAdmin)
 	Success(c, profile)
@@ -94,7 +94,6 @@ type UpdateCuratorProfileRequest struct {
 	CurrentCity string `json:"current_city"`
 	AvatarURL   string `json:"avatar_url"`
 	AvatarKey   string `json:"avatar_key"`
-	Avatar      string `json:"avatar"`
 	Motto       string `json:"motto"`
 	Manifesto   string `json:"manifesto"`
 	Email       string `json:"email"`
@@ -150,8 +149,6 @@ func UpdateCuratorProfile(c *gin.Context) {
 		avatarCandidate = strings.TrimSpace(req.AvatarKey)
 	} else if req.AvatarURL != "" {
 		avatarCandidate = strings.TrimSpace(req.AvatarURL)
-	} else if req.Avatar != "" {
-		avatarCandidate = strings.TrimSpace(req.Avatar)
 	}
 	if avatarCandidate != "" {
 		profile.AvatarURL = storage.ExtractObjectKey(avatarCandidate)

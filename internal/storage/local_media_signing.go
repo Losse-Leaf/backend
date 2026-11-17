@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,6 +151,20 @@ func SignLocalMediaURL(objectKey string, customDuration ...time.Duration) string
 	return signLocalMediaURLAt(objectKey, ttl, time.Now())
 }
 
+func verifyResourceSignature(resource, expRaw, sigRaw string) bool {
+	expRaw = strings.TrimSpace(expRaw)
+	sigRaw = strings.TrimSpace(sigRaw)
+	if expRaw == "" || sigRaw == "" {
+		return false
+	}
+	expiresAt, err := strconv.ParseInt(expRaw, 10, 64)
+	if err != nil || time.Now().Unix() > expiresAt {
+		return false
+	}
+	expected := computeMediaSignature(resource, expiresAt)
+	return hmac.Equal([]byte(expected), []byte(sigRaw))
+}
+
 // VerifyLocalMediaSignature 校验本机媒体访问请求
 //
 // 规则：
@@ -166,20 +179,7 @@ func VerifyLocalMediaSignature(objectKey string, expRaw string, sigRaw string) b
 	if objectKey == "" {
 		return false
 	}
-	expRaw = strings.TrimSpace(expRaw)
-	sigRaw = strings.TrimSpace(sigRaw)
-	if expRaw == "" || sigRaw == "" {
-		return false
-	}
-	expiresAt, err := strconv.ParseInt(expRaw, 10, 64)
-	if err != nil {
-		return false
-	}
-	if time.Now().Unix() > expiresAt {
-		return false
-	}
-	expected := computeMediaSignature(mediaResource(objectKey), expiresAt)
-	return hmac.Equal([]byte(expected), []byte(sigRaw))
+	return verifyResourceSignature(mediaResource(objectKey), expRaw, sigRaw)
 }
 
 // signLocalThumbnailURLAt 在指定时刻签发缩略图 URL（便于测试窗口对齐）
@@ -214,38 +214,14 @@ func VerifyLocalThumbnailSignature(objectKey string, width int, expRaw string, s
 	if objectKey == "" {
 		return false
 	}
-	expiresAt, err := strconv.ParseInt(strings.TrimSpace(expRaw), 10, 64)
-	if err != nil {
-		return false
-	}
-	if time.Now().Unix() > expiresAt {
-		return false
-	}
-	expected := computeMediaSignature(thumbnailResource(objectKey, width), expiresAt)
-	return hmac.Equal([]byte(expected), []byte(strings.TrimSpace(sigRaw)))
+	return verifyResourceSignature(thumbnailResource(objectKey, width), expRaw, sigRaw)
 }
 
 // LocalMediaPathFromRequest 从请求路径里取出对象键，并做穿越防护
 func LocalMediaPathFromRequest(rawPath string) (string, bool) {
-	cleaned := strings.TrimPrefix(strings.TrimSpace(rawPath), "/")
-	if cleaned == "" {
+	cleanKey, _, ok := resolveContainedLocalPath(rawPath)
+	if !ok {
 		return "", false
 	}
-	// 归一化后必须仍在 uploads 根目录内
-	base := GetLocalUploadDir()
-	if base == "" {
-		base = filepath.Join("data", "uploads")
-	}
-	absBase, err := filepath.Abs(base)
-	if err != nil {
-		return "", false
-	}
-	absTarget, err := filepath.Abs(filepath.Join(absBase, filepath.FromSlash(cleaned)))
-	if err != nil {
-		return "", false
-	}
-	if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
-		return "", false
-	}
-	return cleaned, true
+	return cleanKey, true
 }

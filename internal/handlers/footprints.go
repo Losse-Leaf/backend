@@ -5,202 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 )
-
-// footprintTripWindow 计算一次旅程足迹的起止日期窗口（含容差天数）
-func footprintTripWindow(f *models.Footprint, padDays int) (time.Time, time.Time) {
-	start := time.Date(f.VisitedAt.Year(), f.VisitedAt.Month(), f.VisitedAt.Day(), 0, 0, 0, 0, f.VisitedAt.Location()).AddDate(0, 0, -padDays)
-	endBase := f.VisitedAt
-	if f.DepartedAt != nil && !f.DepartedAt.IsZero() && f.DepartedAt.After(endBase) {
-		endBase = *f.DepartedAt
-	}
-	end := time.Date(endBase.Year(), endBase.Month(), endBase.Day(), 23, 59, 59, 0, endBase.Location()).AddDate(0, 0, padDays)
-	return start, end
-}
-
-// autoLinkTransactionFootprint 自动对齐记账记录的城市与所属旅程足迹 (方案 A + B 结合)
-func autoLinkTransactionFootprint(tx *models.Transaction) {
-	if tx == nil {
-		return
-	}
-	if tx.FootprintID != nil && *tx.FootprintID > 0 {
-		if tx.CityCode == "" {
-			var fp models.Footprint
-			if err := db.DB.First(&fp, *tx.FootprintID).Error; err == nil && fp.ID > 0 {
-				tx.CityCode = fp.CityCode
-			}
-		}
-		return
-	}
-	if fpID, ok := bestFootprintFor(tx); ok {
-		idCopy := fpID
-		tx.FootprintID = &idCopy
-	}
-}
-
-// footprintLinkPadDays 账目自动挂载到旅程时的日期容差（前后各放宽几天）
-const footprintLinkPadDays = 2
-
-// bestFootprintFor 按「同城 + 旅程窗口（± 容差）+ 取最近的一趟」的规则，
-// 找出一条账目应当归属的旅程。
-//
-// 关键：**自动挂载与启动回填必须共用这一套规则**。
-// 否则会出现「老数据按一套口径挂、新数据按另一套口径挂」的割裂 ——
-// 旅程花销于是忽高忽低，且没人说得清为什么。
-func bestFootprintFor(tx *models.Transaction) (uint, bool) {
-	return bestFootprintForDB(db.DB, tx)
-}
-
-// bestFootprintForDB 与 bestFootprintFor 同一套规则，但允许在事务连接上查询，
-// 供启动回填的「每批 500 条一个事务」复用。
-func bestFootprintForDB(database *gorm.DB, tx *models.Transaction) (uint, bool) {
-	if tx == nil || tx.CityCode == "" || database == nil {
-		return 0, false
-	}
-	occ := tx.OccurredAt
-	if occ.IsZero() {
-		occ = time.Now()
-	}
-	var cityFps []models.Footprint
-	database.Where("city_code = ?", tx.CityCode).Order("visited_at DESC").Find(&cityFps)
-	for _, cand := range cityFps {
-		wStart, wEnd := footprintTripWindow(&cand, footprintLinkPadDays)
-		if !occ.Before(wStart) && !occ.After(wEnd) {
-			return cand.ID, true
-		}
-	}
-	return 0, false
-}
-
-// linkUnlinkedTransactions 把所有「未挂载、且按自动挂载规则能找到归属」的账目补挂上去。
-//
-// 关键：模糊匹配只用来**挂载**，不用来**直接计入花销**。
-// 原先统计口径是「显式挂载 ∪ 同城 ±1 天窗口」，
-// 于是同城的无关开销（旅程前一天在本地买的东西）会被算进旅程花销。
-// 现在口径收紧成「只统计显式挂载的账目」，
-// 模糊匹配的职责回归「把该挂的挂上」—— 历史数据因此不会丢。
-//
-// 归属规则与自动挂载**完全一致**（见 bestFootprintFor）：
-// 同城 + 旅程窗口（± 容差）+ 取最近的一趟。
-//
-// - Parameter onlyCityCode: 只处理该城市的账目（空 = 全部）
-// - Returns: 本次补挂的笔数
-func linkUnlinkedTransactions(onlyCityCode string) int {
-	linked, _, err := linkUnlinkedTransactionsBatched(onlyCityCode, footprintBackfillBatchSize)
-	if err != nil {
-		log.Printf("[Footprint Backfill] 账目挂载失败: %v", err)
-	}
-	return linked
-}
-
-// linkUnlinkedTransactionsBatched 按 id 游标分批处理，每批在一个事务内写入。
-// 这样启动回填不会长时间持有单次写锁，也不会把所有未挂载账目一次性载入内存。
-func linkUnlinkedTransactionsBatched(onlyCityCode string, batchSize int) (linked int, processed int, err error) {
-	if batchSize <= 0 {
-		batchSize = footprintBackfillBatchSize
-	}
-	var lastID uint
-	for {
-		q := db.DB.Where("(footprint_id IS NULL OR footprint_id = 0) AND city_code != '' AND id > ?", lastID)
-		if onlyCityCode != "" {
-			q = q.Where("city_code = ?", onlyCityCode)
-		}
-		var txs []models.Transaction
-		if err := q.Order("id ASC").Limit(batchSize).Find(&txs).Error; err != nil {
-			return linked, processed, err
-		}
-		if len(txs) == 0 {
-			break
-		}
-		lastID = txs[len(txs)-1].ID
-		processed += len(txs)
-
-		if err := db.DB.Transaction(func(tx *gorm.DB) error {
-			affectedFPs := make(map[uint]struct{})
-			for i := range txs {
-				if txs[i].FootprintID != nil && *txs[i].FootprintID > 0 {
-					continue
-				}
-				fpID, ok := bestFootprintForDB(tx, &txs[i])
-				if !ok {
-					continue
-				}
-				res := tx.Model(&models.Transaction{}).
-					Where("id = ? AND (footprint_id IS NULL OR footprint_id = 0)", txs[i].ID).
-					Update("footprint_id", fpID)
-				if res.Error != nil {
-					return res.Error
-				}
-				if res.RowsAffected > 0 {
-					affectedFPs[fpID] = struct{}{}
-				}
-				linked += int(res.RowsAffected)
-			}
-			for fpID := range affectedFPs {
-				touchFootprintTimestamps(tx, fpID)
-			}
-			return nil
-		}); err != nil {
-			return linked, processed, err
-		}
-	}
-	return linked, processed, nil
-}
-
-// EnsureFootprintTransactionsLinked 启动时的全量回填。
-//
-// 关键：这是「统计只认显式挂载」的前提 ——
-// 口径收紧后，历史数据必须靠**挂载**才能继续计入旅程花销。
-// 分批 + 幂等：重复执行不会重复挂载，也不会长时间占用写锁。
-func EnsureFootprintTransactionsLinked() {
-	if db.DB == nil {
-		return
-	}
-	start := time.Now()
-	syncFootprintLock.Lock()
-	defer syncFootprintLock.Unlock()
-
-	linked, processed, err := linkUnlinkedTransactionsBatched("", footprintBackfillBatchSize)
-	if err != nil {
-		log.Printf("[Footprint Backfill] 账目→旅程回填失败（已处理 %d 笔，挂载 %d 笔）: %v", processed, linked, err)
-		return
-	}
-	log.Printf("[Footprint Backfill] 账目→旅程回填完成：扫描 %d 笔，挂载 %d 笔，耗时 %s",
-		processed, linked, time.Since(start).Round(time.Millisecond))
-}
-
-// touchFootprintTimestamps 在账目变动后推进所属旅程的 updated_at。
-//
-// 足迹列表的 ETag 聚合只读 footprints 表，但 total_spent 来自账目：
-// 不同步推进的话，改一笔已挂载的账目 → 足迹 ETag 不变 → 客户端 304，
-// 旅程花销永远停在旧值。
-func touchFootprintTimestamps(database *gorm.DB, ids ...uint) {
-	if database == nil {
-		return
-	}
-	now := config.NowInBeijing()
-	for _, id := range ids {
-		if id == 0 {
-			continue
-		}
-		database.Model(&models.Footprint{}).Where("id = ?", id).UpdateColumn("updated_at", now)
-	}
-}
 
 // populateFootprintURLs 通过纯逻辑外键加载足迹及该趟旅程关联的全部相片并签名转化为可访问链接，同时统计聚合动态数
 func populateFootprintURLs(f *models.Footprint) {
@@ -232,13 +50,7 @@ func populateFootprintURLs(f *models.Footprint) {
 		}
 		f.Attachments = atts
 	}
-	if f.Attachments == nil {
-		f.Attachments = []models.Attachment{}
-	}
-	for i := range f.Attachments {
-		f.Attachments[i].URL = storage.SignResourceURL(f.Attachments[i].ObjectKey)
-		f.Attachments[i].ThumbnailURL = ThumbnailURLFor(f.Attachments[i].ObjectKey, 0)
-	}
+	f.Attachments = populateAttachmentURLs(f.Attachments)
 }
 
 // populateFootprintURLsBatch 批量填充一组旅程的相片与关联动态计数 (BE-30)
@@ -314,15 +126,7 @@ func populateFootprintURLsBatch(footprints []models.Footprint) {
 	for i := range footprints {
 		f := &footprints[i]
 		f.EntriesCount = len(entrySetByFP[f.ID])
-		atts := attByFP[f.ID]
-		if atts == nil {
-			atts = []models.Attachment{}
-		}
-		for j := range atts {
-			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
-			atts[j].ThumbnailURL = ThumbnailURLFor(atts[j].ObjectKey, 0)
-		}
-		f.Attachments = atts
+		f.Attachments = populateAttachmentURLs(attByFP[f.ID])
 	}
 }
 
@@ -338,16 +142,6 @@ func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 	if f == nil || f.ID == 0 || !isAdmin {
 		return
 	}
-	// 关键：口径收紧为「**只统计显式挂载**到本旅程的账目」。
-	//
-	// 原先是「显式挂载 ∪ 同城 ±1 天窗口内的未挂载账目」——
-	// 于是**同城的无关开销**会被算进旅程花销：
-	// 旅程前一天在本地买的东西、旅程当天没出门却记的账，全都被算上，
-	// 旅程卡片上的「这趟花了多少」于是**虚高**。
-	//
-	// 模糊匹配并没有被丢掉 —— 它的职责回归「**把该挂的挂上**」：
-	// 见 linkUnlinkedTransactions 与启动时的全量回填，
-	// 历史数据因此不会凭空少算。
 	var stats struct {
 		TotalSpent       int64
 		TransactionCount int64
@@ -361,10 +155,7 @@ func populateFootprintExpenseStats(f *models.Footprint, isAdmin bool) {
 	f.TransactionCount = int(stats.TransactionCount)
 }
 
-// populateFootprintExpenseStatsBatch 用**一条 GROUP BY 聚合查询**回填一组旅程的花销统计 (仅管理员)。
-//
-// 原先列表对每条足迹各跑一次 SUM/COUNT，列表越长 SQL 越多（N+1）。
-// 这里一次性聚合后在内存里按 footprint_id 回填，SQL 条数恒为 1。
+// populateFootprintExpenseStatsBatch 用一条 GROUP BY 聚合查询回填一组旅程的花销统计 (仅管理员)。
 func populateFootprintExpenseStatsBatch(footprints []models.Footprint, isAdmin bool) {
 	if !isAdmin || len(footprints) == 0 {
 		return
@@ -404,43 +195,35 @@ func populateFootprintExpenseStatsBatch(footprints []models.Footprint, isAdmin b
 
 // CreateFootprintRequest 录入足迹/旅程请求
 type CreateFootprintRequest struct {
-	CityCode      string `json:"city_code" binding:"required"`
-	CityName      string `json:"city_name" binding:"required"`
-	Title         string `json:"title"`
-	VisitedAt     string `json:"visited_at" binding:"required"`
-	DepartedAt    string `json:"departed_at"`
-	Note          string `json:"note"`
-	LifeEntryID   *uint  `json:"life_entry_id"`
-	WishID        *uint  `json:"wish_id"`
-	AttachmentIDs []uint `json:"attachment_ids"`
-	// ClientRequestID 幂等创建标识（跨端统一契约 B）：
-	// 客户端为每次创建生成稳定 UUID；同一 id 的重复提交直接返回已有记录（HTTP 200）。
+	CityCode        string `json:"city_code" binding:"required"`
+	CityName        string `json:"city_name" binding:"required"`
+	Title           string `json:"title"`
+	VisitedAt       string `json:"visited_at" binding:"required"`
+	DepartedAt      string `json:"departed_at"`
+	Note            string `json:"note"`
+	LifeEntryID     *uint  `json:"life_entry_id"`
+	WishID          *uint  `json:"wish_id"`
+	AttachmentIDs   []uint `json:"attachment_ids"`
 	ClientRequestID string `json:"client_request_id"`
 	IsPrivate       bool   `json:"is_private"`
 }
 
 // UpdateFootprintRequest 修改足迹/旅程请求
 type UpdateFootprintRequest struct {
-	CityCode      string `json:"city_code"`
-	CityName      string `json:"city_name"`
-	Title         string `json:"title"`
-	VisitedAt     string `json:"visited_at"`
-	DepartedAt    string `json:"departed_at"`
-	Note          string `json:"note"`
-	LifeEntryID   *uint  `json:"life_entry_id"`
-	WishID        *uint  `json:"wish_id"`
-	AttachmentIDs []uint `json:"attachment_ids"`
-	// ClearAttachments 显式解绑该旅程全部相片（跨端统一契约 A）：
-	// true 时先解绑全部；若同时携带 attachment_ids，则再绑定新列表。
-	ClearAttachments bool  `json:"clear_attachments"`
-	IsPrivate        *bool `json:"is_private"`
+	CityCode         string `json:"city_code"`
+	CityName         string `json:"city_name"`
+	Title            string `json:"title"`
+	VisitedAt        string `json:"visited_at"`
+	DepartedAt       string `json:"departed_at"`
+	Note             string `json:"note"`
+	LifeEntryID      *uint  `json:"life_entry_id"`
+	WishID           *uint  `json:"wish_id"`
+	AttachmentIDs    []uint `json:"attachment_ids"`
+	ClearAttachments bool   `json:"clear_attachments"`
+	IsPrivate        *bool  `json:"is_private"`
 }
 
-// normalizeFootprintCity 足迹城市归一（兜底校验修复）：
-// 足迹 city_code 原先只 trim 不清洗，任意伪 code 落库后城市图谱按 code 分组、
-// 省份抽屉按前缀 LIKE 都会碎片化，账目自动挂载的同城匹配也永久失配。
-// 这里统一走 ResolveCityCodeAndName（非法 code 清空、纯文本反查回字典），
-// 且 code 命中国标字典时以字典全称为准 —— 客户端自带的矛盾城市名不落库。
+// normalizeFootprintCity 足迹城市归一（兜底校验修复）：统一走国标字典解析并采用字典标准全称。
 func normalizeFootprintCity(cityCode, cityName string) (string, string) {
 	code, name, _ := ResolveCityCodeAndName(cityCode, cityName, "")
 	if code != "" {
@@ -451,279 +234,7 @@ func normalizeFootprintCity(cityCode, cityName string) (string, string) {
 	return code, name
 }
 
-// expandFootprintDateRange 当新的动态发生日期超出当前旅程起止范围（跨天）时自动扩展旅程起止日期
-func expandFootprintDateRange(fp *models.Footprint, t time.Time) bool {
-	if fp == nil || t.IsZero() {
-		return false
-	}
-	changed := false
-	startDay := time.Date(fp.VisitedAt.Year(), fp.VisitedAt.Month(), fp.VisitedAt.Day(), 0, 0, 0, 0, fp.VisitedAt.Location())
-	endBase := fp.VisitedAt
-	if fp.DepartedAt != nil && !fp.DepartedAt.IsZero() && fp.DepartedAt.After(endBase) {
-		endBase = *fp.DepartedAt
-	}
-	endDay := time.Date(endBase.Year(), endBase.Month(), endBase.Day(), 0, 0, 0, 0, endBase.Location())
-	curDay := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-
-	if curDay.Before(startDay) {
-		if fp.DepartedAt == nil || fp.DepartedAt.IsZero() {
-			oldStart := fp.VisitedAt
-			fp.DepartedAt = &oldStart
-		}
-		fp.VisitedAt = t
-		changed = true
-	} else if curDay.After(endDay) {
-		dep := t
-		fp.DepartedAt = &dep
-		changed = true
-	}
-	return changed
-}
-
-// syncFootprintFromLifeEntry 主流自然下渗与旅程智能归并 (方案 A + B 结合)：
-// 1. 若 LifeEntry 已指定 FootprintID，直接挂载至该趟旅程并按需扩展起止日期；
-// 2. 若未指定，优先查找同一城市在连续日期窗口 (±7天) 内已有的旅程 Footprint 并自动归并；
-// 3. 若无相近旅程，则新建一次旅程 Footprint。
-func syncFootprintFromLifeEntry(entry *models.LifeEntry, attachmentIDs []uint, dbTx ...*gorm.DB) error {
-	if entry == nil || entry.ID == 0 {
-		return nil
-	}
-	targetDB := db.DB
-	if len(dbTx) > 0 && dbTx[0] != nil {
-		targetDB = dbTx[0]
-	}
-
-	cityCode := strings.TrimSpace(entry.CityCode)
-	if cityCode == "" || entry.Type == "reflection" || entry.Type == "wish" {
-		return nil
-	}
-
-	cityName := strings.TrimSpace(entry.CityName)
-	if cityName == "" {
-		cityName = strings.TrimSpace(entry.Location)
-	}
-	if cityName == "" {
-		cityName = cityCode
-	}
-
-	noteText := strings.TrimSpace(entry.Content)
-	if noteText == "" {
-		noteText = strings.TrimSpace(entry.Title)
-	}
-
-	visitedAt := entry.OccurredAt
-	if visitedAt.IsZero() {
-		visitedAt = time.Now()
-	}
-
-	var fp models.Footprint
-
-	// 1. 优先检查 entry.FootprintID 显式绑定的旅程 (方案 A)
-	if entry.FootprintID != nil && *entry.FootprintID > 0 {
-		_ = targetDB.Where("id = ?", *entry.FootprintID).Limit(1).Find(&fp).Error
-	}
-
-	// 2. 检查是否已有直接以该 entry 作为首条伴生的 Footprint
-	if fp.ID == 0 {
-		_ = targetDB.Where("life_entry_id = ?", entry.ID).Limit(1).Find(&fp).Error
-	}
-
-	// 3. 同城连续多日动态自动归并为一趟旅程 (方案 B: ±7 天窗口)
-	if fp.ID == 0 {
-		var cityFps []models.Footprint
-		targetDB.Where("city_code = ?", cityCode).Order("visited_at DESC").Find(&cityFps)
-		for _, cand := range cityFps {
-			wStart, wEnd := footprintTripWindow(&cand, 7)
-			if !visitedAt.Before(wStart) && !visitedAt.After(wEnd) {
-				fp = cand
-				break
-			}
-		}
-	}
-
-	if fp.ID > 0 {
-		needSave := false
-		if fp.LifeEntryID != nil && *fp.LifeEntryID == entry.ID {
-			fp.CityCode = cityCode
-			fp.CityName = cityName
-			if fp.DepartedAt == nil {
-				fp.VisitedAt = visitedAt
-			} else {
-				expandFootprintDateRange(&fp, visitedAt)
-			}
-			if noteText != "" {
-				fp.Note = noteText
-			}
-			if fp.Title == "" && strings.TrimSpace(entry.Title) != "" {
-				fp.Title = strings.TrimSpace(entry.Title)
-			}
-			needSave = true
-		} else {
-			if expandFootprintDateRange(&fp, visitedAt) {
-				needSave = true
-			}
-		}
-		if needSave {
-			if err := targetDB.Save(&fp).Error; err != nil {
-				return fmt.Errorf("更新足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
-			}
-		}
-	} else {
-		fp = models.Footprint{
-			CityCode:    cityCode,
-			CityName:    cityName,
-			Title:       strings.TrimSpace(entry.Title),
-			VisitedAt:   visitedAt,
-			Note:        noteText,
-			LifeEntryID: &entry.ID,
-			WishID:      entry.WishID,
-			IsPrivate:   entry.IsPrivate,
-		}
-		if err := targetDB.Create(&fp).Error; err != nil {
-			return fmt.Errorf("创建足迹失败 entry=%d: %w", entry.ID, err)
-		}
-	}
-
-	if fp.ID > 0 {
-		if entry.FootprintID == nil || *entry.FootprintID != fp.ID {
-			fpID := fp.ID
-			entry.FootprintID = &fpID
-			if err := targetDB.Model(&models.LifeEntry{}).Where("id = ?", entry.ID).Update("footprint_id", fp.ID).Error; err != nil {
-				return fmt.Errorf("回填散页 footprint_id 失败 entry=%d: %w", entry.ID, err)
-			}
-		}
-		if len(attachmentIDs) > 0 {
-			// 归属校验后挂载到旅程：已属于其他实体的附件跳过并留痕（本函数在
-			// 入口路径上已有 claim 校验兜底，这里防御历史数据/回填路径的异常归属）
-			if err := claimAttachments(targetDB, attachmentIDs, map[string]any{
-				"footprint_id": fp.ID,
-				"entry_id":     entry.ID,
-			}); err != nil {
-				if !errors.Is(err, errAttachmentClaimConflict) {
-					return fmt.Errorf("附件挂载足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
-				}
-				log.Printf("[Footprint Sync] 附件归属冲突，已跳过 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
-			}
-		} else {
-			// 仅为本散页自己的、且尚未挂旅程的附件补挂（发现 15 归属校验语义）
-			var entryAttIDs []uint
-			targetDB.Model(&models.Attachment{}).
-				Where("entry_id = ? AND (footprint_id IS NULL OR footprint_id = 0)", entry.ID).
-				Pluck("id", &entryAttIDs)
-			if err := claimAttachments(targetDB, entryAttIDs, map[string]any{
-				"footprint_id": fp.ID,
-				"entry_id":     entry.ID,
-			}); err != nil {
-				if !errors.Is(err, errAttachmentClaimConflict) {
-					return fmt.Errorf("附件挂载足迹失败 entry=%d footprint=%d: %w", entry.ID, fp.ID, err)
-				}
-				log.Printf("[Footprint Sync] 附件归属冲突，已跳过 entry=%d footprint=%d: %v", entry.ID, fp.ID, err)
-			}
-		}
-	}
-	return nil
-}
-
-var syncFootprintLock sync.Mutex
-
-// footprintBackfillBatchSize 启动回填每批处理条数：兼顾吞吐与 SQLite 单次写锁持有时间。
-const footprintBackfillBatchSize = 500
-
-// EnsureEntryFootprintsSynced 确保所有带 city_code 的一级记录均已自然下渗并按同城连续日期归并为旅程。
-//
-// 启动时不再同步阻塞 ListenAndServe（见 StartFootprintBackfill）。
-// 内部分批（每批 500 条）并包在事务里，避免一次长事务锁住整库；
-// 通过 id 游标推进并只处理「仍未挂载」的行，因此可重复执行且不会重复创建足迹。
-func EnsureEntryFootprintsSynced() {
-	if db.DB == nil {
-		return
-	}
-	start := time.Now()
-	syncFootprintLock.Lock()
-	defer syncFootprintLock.Unlock()
-
-	scannedEntries := 0
-	bindingFixes := 0
-	var lastEntryID uint
-	for {
-		var batch []models.LifeEntry
-		if err := db.DB.
-			Where("city_code != '' AND city_code IS NOT NULL AND type NOT IN ('reflection', 'wish')").
-			Where("(footprint_id IS NULL OR footprint_id = 0) AND id NOT IN (SELECT life_entry_id FROM footprints WHERE life_entry_id IS NOT NULL AND deleted_at IS NULL)").
-			Where("id > ?", lastEntryID).
-			Order("id ASC").
-			Limit(footprintBackfillBatchSize).
-			Find(&batch).Error; err != nil {
-			log.Printf("[Footprint Backfill] 散页→足迹查询失败（已处理 %d 条）: %v", scannedEntries, err)
-			return
-		}
-		if len(batch) == 0 {
-			break
-		}
-		batchLastID := batch[len(batch)-1].ID
-		if err := db.DB.Transaction(func(tx *gorm.DB) error {
-			for i := range batch {
-				if err := syncFootprintFromLifeEntry(&batch[i], nil, tx); err != nil {
-					log.Printf("[Footprint Backfill] 下渗失败 entry=%d: %v", batch[i].ID, err)
-				}
-			}
-			return nil
-		}); err != nil {
-			log.Printf("[Footprint Backfill] 散页→足迹批次写入失败（batch last id=%d）: %v", batchLastID, err)
-			return
-		}
-		scannedEntries += len(batch)
-		lastEntryID = batchLastID
-	}
-
-	// 将已有 LifeEntryID 绑定但 FootprintID 为空的记录补齐 FootprintID。
-	var lastFootprintID uint
-	for {
-		var unlinkedFps []models.Footprint
-		if err := db.DB.Select("id, life_entry_id").
-			Where("life_entry_id IS NOT NULL AND life_entry_id > 0").
-			Where("life_entry_id IN (SELECT id FROM life_entries WHERE (footprint_id IS NULL OR footprint_id = 0) AND deleted_at IS NULL)").
-			Where("id > ?", lastFootprintID).
-			Order("id ASC").
-			Limit(footprintBackfillBatchSize).
-			Find(&unlinkedFps).Error; err != nil {
-			log.Printf("[Footprint Backfill] 足迹反向绑定查询失败: %v", err)
-			return
-		}
-		if len(unlinkedFps) == 0 {
-			break
-		}
-		batchLastID := unlinkedFps[len(unlinkedFps)-1].ID
-		if err := db.DB.Transaction(func(tx *gorm.DB) error {
-			for _, fp := range unlinkedFps {
-				if fp.LifeEntryID == nil || *fp.LifeEntryID == 0 {
-					continue
-				}
-				res := tx.Model(&models.LifeEntry{}).
-					Where("id = ? AND (footprint_id IS NULL OR footprint_id = 0)", *fp.LifeEntryID).
-					Update("footprint_id", fp.ID)
-				if res.Error != nil {
-					return res.Error
-				}
-				bindingFixes += int(res.RowsAffected)
-			}
-			return nil
-		}); err != nil {
-			log.Printf("[Footprint Backfill] 足迹反向绑定批次写入失败（batch last id=%d）: %v", batchLastID, err)
-			return
-		}
-		lastFootprintID = batchLastID
-	}
-
-	log.Printf("[Footprint Backfill] 散页→足迹回填完成：扫描 %d 条，补齐反向绑定 %d 条，耗时 %s",
-		scannedEntries, bindingFixes, time.Since(start).Round(time.Millisecond))
-}
-
 // GetFootprints 列表查询足迹记录 (支持 city_code, year, since, limit, ETag)
-//
-// limit 是可选的，默认 0 = 返回全部（保持既有客户端行为不变）。
-// limit > 0 时最多返回 limit 条，并把响应包装成
-// `{footprints: [...], has_more: bool}`；未传 limit 时仍返回原来的数组。
 func GetFootprints(c *gin.Context) {
 	if !RequirePublicModuleOrAdmin(c, "footprints") {
 		return
@@ -736,7 +247,6 @@ func GetFootprints(c *gin.Context) {
 		return
 	}
 
-	// 可选分页：非法值或 <=0 一律视为「不限制」，避免客户端漏传时丢数据。
 	limit := 0
 	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
 		if n, err := strconv.Atoi(rawLimit); err == nil && n > 0 {
@@ -750,8 +260,6 @@ func GetFootprints(c *gin.Context) {
 	}
 
 	query := dbScope.Model(&models.Footprint{}).Order("visited_at DESC, id DESC")
-
-	// MOB-P1-36：增量游标过滤统一走 applySyncSince（边界含等号）
 	query = applySyncSince(query, &models.Footprint{}, sinceStr)
 
 	if cityCode != "" {
@@ -766,27 +274,22 @@ func GetFootprints(c *gin.Context) {
 		}
 	}
 
-	// 多取一条用于判断是否还有下一页，再截断到 limit，避免多一次 COUNT 查询。
 	if limit > 0 {
 		query = query.Limit(limit + 1)
 	}
 
-	// 花销统计仅管理员下发，ETag 必须按角色隔离，否则访客/管理员会互相
-	// 命中对方的 304。Vary 在协商之前写出，共享缓存也不会混用。
 	isAdmin := middleware.IsAdmin(c)
 	if !isAdmin {
 		query = query.Where("is_private = ?", false)
 	}
 	role := PublicModuleETagSuffix(isAdmin)
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 
-	// BE-2：聚合与 304 协商前置，命中时不再加载足迹/相片，也不做签名。
 	agg, err := aggregateListQuery(query)
 	if err != nil {
 		Error(c, http.StatusInternalServerError, "获取足迹列表失败")
 		return
 	}
-	// 增量请求（since）跳过 304：purge 墓碑不在聚合 SQL 里，命中 304 会漏删。
 	if sinceStr == "" && negotiateListCache(c, listETag(c, agg, role)) {
 		return
 	}
@@ -797,10 +300,18 @@ func GetFootprints(c *gin.Context) {
 		return
 	}
 
-	// P2-3：只在「不传 limit」的增量请求里注入 purge 墓碑。
-	// 传 limit 的调用方按 has_more 分页，墓碑会打乱 offset 语义，故不注入。
 	if limit == 0 && sinceStr != "" {
-		if err := injectFootprintTombstones(&footprints, sinceStr); err != nil {
+		if err := injectTombstones(&footprints, TombstoneEntityFootprint, sinceStr,
+			func(f models.Footprint) uint { return f.ID },
+			func(id uint, deletedAt time.Time) models.Footprint {
+				return models.Footprint{
+					ID:        id,
+					CreatedAt: deletedAt,
+					UpdatedAt: deletedAt,
+					DeletedAt: gorm.DeletedAt{Time: deletedAt, Valid: true},
+				}
+			},
+		); err != nil {
 			Error(c, http.StatusInternalServerError, "获取足迹列表失败")
 			return
 		}
@@ -818,23 +329,12 @@ func GetFootprints(c *gin.Context) {
 	}
 
 	populateFootprintURLsBatch(footprints)
-	// 一条 GROUP BY 聚合回填全部旅程的花销，替代逐条 SUM/COUNT 的 N+1。
 	populateFootprintExpenseStatsBatch(footprints, isAdmin)
 
-	// MOB-P1-36：服务端权威增量游标（保持本页语义）
-	var pageMaxUpdated time.Time
-	for _, f := range footprints {
-		if f.UpdatedAt.After(pageMaxUpdated) {
-			pageMaxUpdated = f.UpdatedAt
-		}
-		if f.DeletedAt.Valid && f.DeletedAt.Time.After(pageMaxUpdated) {
-			pageMaxUpdated = f.DeletedAt.Time
-		}
-	}
-	setSyncCursor(c, pageMaxUpdated)
+	setSyncCursor(c, computeSyncCursor(footprints, func(f models.Footprint) (time.Time, gorm.DeletedAt) {
+		return f.UpdatedAt, f.DeletedAt
+	}))
 
-	// limit 未传时保持原契约：data 仍是足迹数组。
-	// 只有显式分页（limit > 0）才切换到带 has_more 的对象结构。
 	if limit > 0 {
 		Success(c, gin.H{
 			"footprints": footprints,
@@ -865,7 +365,7 @@ func GetFootprintByID(c *gin.Context) {
 		Error(c, http.StatusNotFound, "足迹记录不存在")
 		return
 	}
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 	populateFootprintURLs(&f)
 	populateFootprintExpenseStats(&f, isAdmin)
 	Success(c, f)
@@ -879,21 +379,12 @@ func CreateFootprint(c *gin.Context) {
 		return
 	}
 
-	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
-	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
 	clientRequestID := strings.TrimSpace(req.ClientRequestID)
-	if clientRequestID != "" {
-		var existing models.Footprint
-		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
-			c.Header("X-Idempotent-Replay", "true")
-			if existing.DeletedAt.Valid {
-				Error(c, http.StatusGone, "记录已在服务端被删除")
-				return
-			}
-			populateFootprintURLs(&existing)
-			Success(c, existing)
-			return
-		}
+	if existing, deleted, ok := findIdempotentReplay[models.Footprint](clientRequestID, func(f *models.Footprint) (uint, bool) {
+		return f.ID, f.DeletedAt.Valid
+	}); ok {
+		replyIdempotentHit(c, existing, deleted, populateFootprintURLs)
+		return
 	}
 
 	visited, err := ParseFlexTime(req.VisitedAt)
@@ -914,13 +405,11 @@ func CreateFootprint(c *gin.Context) {
 
 	cityCode := strings.TrimSpace(req.CityCode)
 	cityName := strings.TrimSpace(req.CityName)
-	// 足迹城市统一过国标字典（兜底校验修复），名称与字典冲突时以字典全称为准
 	cityCode, cityName = normalizeFootprintCity(cityCode, cityName)
 	title := strings.TrimSpace(req.Title)
 	note := strings.TrimSpace(req.Note)
 	lifeEntryID := req.LifeEntryID
 
-	// 若调用方已传入关联的 LifeEntryID，检查是否已由主流下渗自动生成过对应足迹，避免重复
 	if lifeEntryID != nil && *lifeEntryID > 0 {
 		var entry models.LifeEntry
 		if err := db.DB.Limit(1).Find(&entry, *lifeEntryID).Error; err == nil && entry.ID > 0 {
@@ -962,7 +451,6 @@ func CreateFootprint(c *gin.Context) {
 			_ = db.DB.Save(&existingFP).Error
 			db.DB.Model(&models.LifeEntry{}).Where("id = ?", *lifeEntryID).Update("footprint_id", existingFP.ID)
 			if len(req.AttachmentIDs) > 0 {
-				// 归属校验后绑定：抢占其他实体的附件直接 400（发现 15）
 				if err := claimAttachments(db.DB, req.AttachmentIDs, map[string]any{
 					"footprint_id": existingFP.ID,
 					"entry_id":     *lifeEntryID,
@@ -986,7 +474,6 @@ func CreateFootprint(c *gin.Context) {
 	var footprint models.Footprint
 	err = db.DB.Transaction(func(tx *gorm.DB) error {
 		if lifeEntryID == nil || *lifeEntryID == 0 {
-			// 伴生创建机制：从足迹入口直接录入时，自动伴生创建一条一级记录 (LifeEntry) 写入主时间流 (保证事务原子性)
 			entryTitle := title
 			if entryTitle == "" {
 				entryTitle = fmt.Sprintf("行迹 · %s", cityName)
@@ -1049,19 +536,11 @@ func CreateFootprint(c *gin.Context) {
 	})
 
 	if err != nil {
-		// 并发重复提交：唯一索引兜底，回读已有记录按幂等语义返回。
-		if clientRequestID != "" {
-			var existing models.Footprint
-			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
-				c.Header("X-Idempotent-Replay", "true")
-				if existing.DeletedAt.Valid {
-					Error(c, http.StatusGone, "记录已在服务端被删除")
-					return
-				}
-				populateFootprintURLs(&existing)
-				Success(c, existing)
-				return
-			}
+		if existing, deleted, ok := findIdempotentReplay[models.Footprint](clientRequestID, func(f *models.Footprint) (uint, bool) {
+			return f.ID, f.DeletedAt.Valid
+		}); ok {
+			replyIdempotentHit(c, existing, deleted, populateFootprintURLs)
+			return
 		}
 		if errors.Is(err, errAttachmentClaimConflict) {
 			Error(c, http.StatusBadRequest, "保存足迹记录失败: "+err.Error())
@@ -1072,9 +551,6 @@ func CreateFootprint(c *gin.Context) {
 	}
 
 	db.DB.First(&footprint, footprint.ID)
-	// 关键：统计口径已收紧为「只统计显式挂载的账目」，
-	// 所以新建旅程后立刻把同城的未挂载账目补挂上去 ——
-	// 否则这些历史账目会从旅程花销里凭空消失。
 	linkUnlinkedTransactions(footprint.CityCode)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
@@ -1100,7 +576,6 @@ func UpdateFootprint(c *gin.Context) {
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
 
-	// 记录请求前的城市：只有本次请求真的改动了城市，才同步伴生散页的城市字段（见下方同步块）
 	oldCityCode := footprint.CityCode
 	oldCityName := footprint.CityName
 	if req.CityCode != "" {
@@ -1109,7 +584,6 @@ func UpdateFootprint(c *gin.Context) {
 	if req.CityName != "" {
 		footprint.CityName = strings.TrimSpace(req.CityName)
 	}
-	// 城市字段有变动时统一过国标字典（兜底校验修复，与创建同口径）
 	if req.CityCode != "" || req.CityName != "" {
 		footprint.CityCode, footprint.CityName = normalizeFootprintCity(footprint.CityCode, footprint.CityName)
 	}
@@ -1125,10 +599,6 @@ func UpdateFootprint(c *gin.Context) {
 			return
 		}
 	}
-	// 契约 C：返程日期支持**显式清空** —— 请求携带 departed_at 且为空串时置 nil
-	//（Web 编辑弹窗清空返程时发空串；null/缺省保持原值）。
-	// 非空但解析失败与 visited_at 同口径显式 400，不再静默忽略 —— 静默忽略会让
-	// 「改返程日期」的请求假装成功、旧值原样保留（第三轮 P2-2）。
 	if trimmedDeparted := strings.TrimSpace(req.DepartedAt); trimmedDeparted != "" {
 		t, err := ParseFlexTime(trimmedDeparted)
 		if err != nil || t.IsZero() {
@@ -1139,8 +609,6 @@ func UpdateFootprint(c *gin.Context) {
 	} else if hasJSONValue(rawKeys, "departed_at") {
 		footprint.DepartedAt = nil
 	}
-	// 返程早于到访的矛盾载荷（兜底校验修复）：与 CreateFootprint 同口径自动交换，
-	// 不再原样落库 —— 倒挂旅程会让展示与 expandFootprintDateRange 扩展逻辑错乱。
 	if footprint.DepartedAt != nil && !footprint.DepartedAt.IsZero() && footprint.DepartedAt.Before(footprint.VisitedAt) {
 		swappedVisited := footprint.VisitedAt
 		footprint.VisitedAt = *footprint.DepartedAt
@@ -1159,22 +627,14 @@ func UpdateFootprint(c *gin.Context) {
 		footprint.IsPrivate = *req.IsPrivate
 	}
 
-	// 关键（发现 14）：足迹保存、伴生散页同步与附件重绑原本是三段独立写入，
-	// 中途失败会留下「足迹已改、散页还是旧标题」的半套状态 —— 统一包进同一事务。
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&footprint).Error; err != nil {
 			return err
 		}
 
-		// 同步更新伴生的一级记录 (LifeEntry)
 		if footprint.LifeEntryID != nil && *footprint.LifeEntryID > 0 {
 			var entry models.LifeEntry
 			if err := tx.First(&entry, *footprint.LifeEntryID).Error; err == nil {
-				// 关键（第三轮 P2-8）：仅当本次请求确实改动了旅程城市时才同步伴生散页的
-				// 城市字段，且**不再用城市名覆盖散页的 Location** —— 用户给散页填的具体
-				// 地点（如「西湖边的小咖啡馆」）不能被任何一次足迹编辑冲掉。
-				// 原先无条件覆盖三字段，改个标题也会把自定义地点重置成城市名。
-				// 散页地点本来就是自动回填的城市名（或为空）→ 随城市改名而跟随。
 				if cityChanged {
 					entry.CityCode = footprint.CityCode
 					entry.CityName = footprint.CityName
@@ -1208,7 +668,6 @@ func UpdateFootprint(c *gin.Context) {
 				entrySet[entryID] = true
 			}
 
-			// 读取口径包含关联散页；移除照片时必须同时解除这些入口的关联。
 			query := tx.Where("footprint_id = ?", footprint.ID)
 			if len(entryIDs) > 0 {
 				query = query.Or("entry_id IN ?", entryIDs)
@@ -1280,7 +739,6 @@ func UpdateFootprint(c *gin.Context) {
 	}
 
 	db.DB.First(&footprint, footprint.ID)
-	// 同上：改完旅程（城市/日期变了）也要重新补挂一次
 	linkUnlinkedTransactions(footprint.CityCode)
 	populateFootprintURLs(&footprint)
 	InvalidateStatsCache()
@@ -1304,14 +762,8 @@ func DeleteFootprint(c *gin.Context) {
 		err := db.DB.Transaction(func(tx *gorm.DB) error {
 			tx.Model(&models.Attachment{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			tx.Model(&models.Wish{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
-			// 共享引用保护：先摘除所有条目对该旅程的引用，再删除首生条目 (BE-25)
 			tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 			if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
-				// 关键（第三轮 P2-5）：首生散页即将物理删除，仅归属它的附件必须一并
-				// 物理清理、共享附件只解绑 entry_id —— 否则 entry_id 悬挂在已删散页上，
-				// 附件成为任何界面不可见、CleanupUpload 永远拒清的永久孤儿。
-				// 必须在上方 footprint_id 解绑**之后**执行：否则「只归属本旅程+本散页」
-				// 的附件会被判为共享而漏删。媒体文件在事务提交后删除（keysToDelete）。
 				keys, err := releaseEntryAttachments(tx, *f.LifeEntryID, true)
 				if err != nil {
 					return err
@@ -1320,7 +772,6 @@ func DeleteFootprint(c *gin.Context) {
 				if err := tx.Unscoped().Where("id = ?", *f.LifeEntryID).Delete(&models.LifeEntry{}).Error; err != nil {
 					return err
 				}
-				// P2-3：首生散页被级联物理删除，补墓碑。
 				if err := recordSyncTombstone(tx, TombstoneEntityEntry, *f.LifeEntryID); err != nil {
 					return err
 				}
@@ -1342,13 +793,9 @@ func DeleteFootprint(c *gin.Context) {
 		return
 	}
 
-	// 软删除足迹并同步软删除伴生 LifeEntry (BE-05)
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		// 共享引用保护：其余条目不应指向已软删旅程 (BE-25)
 		tx.Model(&models.LifeEntry{}).Where("footprint_id = ?", f.ID).Update("footprint_id", nil)
 		if f.LifeEntryID != nil && *f.LifeEntryID > 0 {
-			// 第三轮 P2-5：首生散页进回收站后，其附件的 entry_id 一并解绑防悬挂；
-			// footprint_id 保留 —— 软删足迹在 include_deleted 视角仍能看到相片。
 			if _, err := releaseEntryAttachments(tx, *f.LifeEntryID, false); err != nil {
 				return err
 			}
@@ -1381,13 +828,12 @@ type AtlasCitySummary struct {
 }
 
 // GetFootprintsAtlas 获取全国足迹汇总 (按市级汇总去过的城市、次数与首次/最近日期)
-// 聚合下沉至 SQL GROUP BY，不再全表载入内存 (BE-31)
 func GetFootprintsAtlas(c *gin.Context) {
 	if !RequirePublicModuleOrAdmin(c, "footprints") {
 		return
 	}
 	isAdmin := middleware.IsAdmin(c)
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 
 	var totalFootprints int64
 	countQ := db.DB.Model(&models.Footprint{})
@@ -1435,383 +881,5 @@ func GetFootprintsAtlas(c *gin.Context) {
 		"total_footprints": totalFootprints,
 		"total_cities":     len(cities),
 		"cities":           cities,
-	})
-}
-
-// DrawerCategoryItem 回忆抽屉消费分类统计项
-type DrawerCategoryItem struct {
-	Name   string `json:"name"`
-	Amount int64  `json:"amount"`
-}
-
-// processDrawerFootprints 统一处理抽屉足迹相片签名、旅程花销统计并计算首访与最近到访日期
-func processDrawerFootprints(footprints []models.Footprint, isAdmin bool) (string, string, []uint) {
-	populateFootprintURLsBatch(footprints)
-	// 与列表接口一致：一条聚合查询回填全部花销统计，避免逐条 SUM/COUNT。
-	populateFootprintExpenseStatsBatch(footprints, isAdmin)
-	var firstVisit, latestVisit time.Time
-	fpIDs := make([]uint, 0, len(footprints))
-	for _, f := range footprints {
-		if f.ID > 0 {
-			fpIDs = append(fpIDs, f.ID)
-		}
-		if firstVisit.IsZero() || f.VisitedAt.Before(firstVisit) {
-			firstVisit = f.VisitedAt
-		}
-		endVisit := f.VisitedAt
-		if f.DepartedAt != nil && !f.DepartedAt.IsZero() && f.DepartedAt.After(endVisit) {
-			endVisit = *f.DepartedAt
-		}
-		if latestVisit.IsZero() || endVisit.After(latestVisit) {
-			latestVisit = endVisit
-		}
-	}
-
-	firstVisitStr, latestVisitStr := "", ""
-	if !firstVisit.IsZero() {
-		firstVisitStr = firstVisit.In(config.BeijingLocation).Format("2006-01-02")
-	}
-	if !latestVisit.IsZero() {
-		latestVisitStr = latestVisit.In(config.BeijingLocation).Format("2006-01-02")
-	}
-	return firstVisitStr, latestVisitStr, fpIDs
-}
-
-// buildDrawerLedgerSummary 统一构建回忆抽屉账单光谱 (RC-81, BE-14, RC-93: 仅管理员执行查询与聚合，访客严格脱敏)
-func buildDrawerLedgerSummary(isAdmin bool, fetchTxs func() []models.Transaction) gin.H {
-	if !isAdmin {
-		return gin.H{
-			"total_spent":       0,
-			"transaction_count": 0,
-			"categories":        []DrawerCategoryItem{},
-		}
-	}
-
-	txs := fetchTxs()
-	var totalSpent int64
-	expenseCount := 0
-	categoryBreakdown := make(map[string]int64)
-	for _, tx := range txs {
-		if tx.Type == "expense" {
-			expenseCount++
-			totalSpent += tx.Amount
-			categoryBreakdown[tx.Category] += tx.Amount
-		}
-	}
-
-	categories := make([]DrawerCategoryItem, 0, len(categoryBreakdown))
-	for name, amt := range categoryBreakdown {
-		categories = append(categories, DrawerCategoryItem{Name: name, Amount: amt})
-	}
-	sort.Slice(categories, func(i, j int) bool {
-		if categories[i].Amount != categories[j].Amount {
-			return categories[i].Amount > categories[j].Amount
-		}
-		return categories[i].Name < categories[j].Name
-	})
-
-	return gin.H{
-		"total_spent": totalSpent,
-		// 关键：计数与 total_spent **同口径**（只数支出）。
-		// 原先用 len(txs) 把**收入**也数了进去 ——
-		// 于是「4 笔消费」里混着一笔「二手回血」收入，与旁边的金额对不上。
-		"transaction_count": expenseCount,
-		"categories":        categories,
-	}
-}
-
-// GetCityMemoryDrawer 城市回忆抽屉聚合接口 (RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 城市账单光谱)
-func GetCityMemoryDrawer(c *gin.Context) {
-	if !RequirePublicModuleOrAdmin(c, "footprints") {
-		return
-	}
-	cityCode := strings.TrimSpace(c.Param("city_code"))
-	if cityCode == "" {
-		Error(c, http.StatusBadRequest, "城市代码必填")
-		return
-	}
-
-	isAdmin := middleware.IsAdmin(c)
-
-	// 1. 该城市的 Footprints 列表与相片
-	var footprints []models.Footprint
-	fpQ := db.DB.Where("city_code = ?", cityCode)
-	if !isAdmin {
-		fpQ = fpQ.Where("is_private = ?", false)
-	}
-	fpQ.Order("visited_at DESC").Find(&footprints)
-	if footprints == nil {
-		footprints = []models.Footprint{}
-	}
-
-	cityName := ""
-	if len(footprints) > 0 {
-		cityName = footprints[0].CityName
-	}
-	cityShort := strings.TrimSuffix(cityName, "市")
-
-	firstVisitStr, latestVisitStr, fpIDs := processDrawerFootprints(footprints, isAdmin)
-
-	// 2. 关联该城市及旅程的 LifeEntries 随笔
-	var entries []models.LifeEntry
-	dbQuery := db.DB.Order("occurred_at DESC")
-	if !isAdmin {
-		dbQuery = dbQuery.Where("is_private = ?", false)
-	}
-	if len(fpIDs) > 0 && cityShort != "" {
-		dbQuery = dbQuery.Where("city_code = ? OR footprint_id IN ? OR location LIKE ?", cityCode, fpIDs, "%"+cityShort+"%")
-	} else if len(fpIDs) > 0 {
-		dbQuery = dbQuery.Where("city_code = ? OR footprint_id IN ?", cityCode, fpIDs)
-	} else if cityShort != "" {
-		dbQuery = dbQuery.Where("city_code = ? OR location LIKE ?", cityCode, "%"+cityShort+"%")
-	} else {
-		dbQuery = dbQuery.Where("city_code = ?", cityCode)
-	}
-	dbQuery.Limit(50).Find(&entries)
-	if entries == nil {
-		entries = []models.LifeEntry{}
-	}
-
-	populateEntryURLsBatch(entries)
-	if !isAdmin {
-		redactEmbeddedWishFinancesBatch(entries)
-	}
-
-	// 3. 关联该城市及旅程的消费账单光谱 (仅管理员查询聚合 RC-81, BE-14)
-	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {
-		var txs []models.Transaction
-		txQuery := db.DB.Where("city_code = ?", cityCode)
-		if len(fpIDs) > 0 && cityShort != "" {
-			txQuery = db.DB.Where("city_code = ? OR footprint_id IN ? OR note LIKE ? OR title LIKE ?", cityCode, fpIDs, "%"+cityShort+"%", "%"+cityShort+"%")
-		} else if len(fpIDs) > 0 {
-			txQuery = db.DB.Where("city_code = ? OR footprint_id IN ?", cityCode, fpIDs)
-		} else if cityShort != "" {
-			txQuery = db.DB.Where("city_code = ? OR note LIKE ? OR title LIKE ?", cityCode, "%"+cityShort+"%", "%"+cityShort+"%")
-		}
-		txQuery.Find(&txs)
-		return txs
-	})
-
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
-	Success(c, gin.H{
-		"city_code": cityCode,
-		"city_name": cityName,
-		"visit_stats": gin.H{
-			"total_visits":      len(footprints),
-			"first_visited_at":  firstVisitStr,
-			"latest_visited_at": latestVisitStr,
-		},
-		"footprints":     footprints,
-		"entries":        entries,
-		"ledger_summary": ledgerSummary,
-	})
-}
-
-// ProvinceVisitedCity 省级抽屉中记录的已访问城市简要统计
-type ProvinceVisitedCity struct {
-	CityCode   string `json:"city_code"`
-	CityName   string `json:"city_name"`
-	VisitCount int    `json:"visit_count"`
-}
-
-// ProvinceAdcodeMap 中国 34 个省级行政区划标准代码到全称的映射 (GB/T 2260)
-var ProvinceAdcodeMap = map[string]string{
-	"11": "北京市",
-	"12": "天津市",
-	"13": "河北省",
-	"14": "山西省",
-	"15": "内蒙古自治区",
-	"21": "辽宁省",
-	"22": "吉林省",
-	"23": "黑龙江省",
-	"31": "上海市",
-	"32": "江苏省",
-	"33": "浙江省",
-	"34": "安徽省",
-	"35": "福建省",
-	"36": "江西省",
-	"37": "山东省",
-	"41": "河南省",
-	"42": "湖北省",
-	"43": "湖南省",
-	"44": "广东省",
-	"45": "广西壮族自治区",
-	"46": "海南省",
-	"50": "重庆市",
-	"51": "四川省",
-	"52": "贵州省",
-	"53": "云南省",
-	"54": "西藏自治区",
-	"61": "陕西省",
-	"62": "甘肃省",
-	"63": "青海省",
-	"64": "宁夏回族自治区",
-	"65": "新疆维吾尔自治区",
-	"71": "台湾省",
-	"81": "香港特别行政区",
-	"82": "澳门特别行政区",
-}
-
-// ProvinceShortNameMap 省级行政区简称/无后缀名称 (供模糊搜索与标题匹配)
-var ProvinceShortNameMap = map[string]string{
-	"11": "北京",
-	"12": "天津",
-	"13": "河北",
-	"14": "山西",
-	"15": "内蒙古",
-	"21": "辽宁",
-	"22": "吉林",
-	"23": "黑龙江",
-	"31": "上海",
-	"32": "江苏",
-	"33": "浙江",
-	"34": "安徽",
-	"35": "福建",
-	"36": "江西",
-	"37": "山东",
-	"41": "河南",
-	"42": "湖北",
-	"43": "湖南",
-	"44": "广东",
-	"45": "广西",
-	"46": "海南",
-	"50": "重庆",
-	"51": "四川",
-	"52": "贵州",
-	"53": "云南",
-	"54": "西藏",
-	"61": "陕西",
-	"62": "甘肃",
-	"63": "青海",
-	"64": "宁夏",
-	"65": "新疆",
-	"71": "台湾",
-	"81": "香港",
-	"82": "澳门",
-}
-
-// GetProvinceMemoryDrawer 省份回忆抽屉聚合接口 (RC-91 / RC-93 两级并行：履迹简志 + 菲林画廊 + 散页随笔 + 省份账单光谱)
-func GetProvinceMemoryDrawer(c *gin.Context) {
-	if !RequirePublicModuleOrAdmin(c, "footprints") {
-		return
-	}
-	adcode := strings.TrimSpace(c.Param("adcode"))
-	if len(adcode) < 2 {
-		Error(c, http.StatusBadRequest, "省份行政代码格式无效")
-		return
-	}
-
-	provPrefix := adcode[:2]
-	provAdcode := provPrefix + "0000"
-	if len(adcode) == 6 {
-		provAdcode = adcode
-	}
-
-	provName, ok := ProvinceAdcodeMap[provPrefix]
-	if !ok {
-		provName = "未知省份"
-	}
-	provShort := ProvinceShortNameMap[provPrefix]
-	isAdmin := middleware.IsAdmin(c)
-
-	// 1. 该省的 Footprints 列表与相片
-	var footprints []models.Footprint
-	fpQ := db.DB.Where("city_code LIKE ?", provPrefix+"%")
-	if !isAdmin {
-		fpQ = fpQ.Where("is_private = ?", false)
-	}
-	fpQ.Order("visited_at DESC").Find(&footprints)
-	if footprints == nil {
-		footprints = []models.Footprint{}
-	}
-
-	firstVisitStr, latestVisitStr, fpIDs := processDrawerFootprints(footprints, isAdmin)
-
-	cityMap := make(map[string]*ProvinceVisitedCity)
-	cityOrder := make([]string, 0)
-	for _, f := range footprints {
-		if f.CityCode != "" {
-			if item, exists := cityMap[f.CityCode]; exists {
-				item.VisitCount++
-			} else {
-				name := f.CityName
-				if name == "" {
-					name = f.CityCode
-				}
-				cityMap[f.CityCode] = &ProvinceVisitedCity{
-					CityCode:   f.CityCode,
-					CityName:   name,
-					VisitCount: 1,
-				}
-				cityOrder = append(cityOrder, f.CityCode)
-			}
-		}
-	}
-
-	visitedCities := make([]ProvinceVisitedCity, 0, len(cityMap))
-	for _, code := range cityOrder {
-		visitedCities = append(visitedCities, *cityMap[code])
-	}
-	sort.Slice(visitedCities, func(i, j int) bool {
-		if visitedCities[i].VisitCount != visitedCities[j].VisitCount {
-			return visitedCities[i].VisitCount > visitedCities[j].VisitCount
-		}
-		return visitedCities[i].CityCode < visitedCities[j].CityCode
-	})
-
-	// 2. 关联该省及旅程的 LifeEntries 随笔
-	var entries []models.LifeEntry
-	entryQuery := db.DB.Order("occurred_at DESC")
-	if !isAdmin {
-		entryQuery = entryQuery.Where("is_private = ?", false)
-	}
-	if len(fpIDs) > 0 && provShort != "" {
-		entryQuery = entryQuery.Where("city_code LIKE ? OR footprint_id IN ? OR location LIKE ?", provPrefix+"%", fpIDs, "%"+provShort+"%")
-	} else if len(fpIDs) > 0 {
-		entryQuery = entryQuery.Where("city_code LIKE ? OR footprint_id IN ?", provPrefix+"%", fpIDs)
-	} else if provShort != "" {
-		entryQuery = entryQuery.Where("city_code LIKE ? OR location LIKE ?", provPrefix+"%", "%"+provShort+"%")
-	} else {
-		entryQuery = entryQuery.Where("city_code LIKE ?", provPrefix+"%")
-	}
-	entryQuery.Limit(50).Find(&entries)
-	if entries == nil {
-		entries = []models.LifeEntry{}
-	}
-
-	populateEntryURLsBatch(entries)
-	if !isAdmin {
-		redactEmbeddedWishFinancesBatch(entries)
-	}
-
-	// 3. 关联该省份及旅程的消费账单光谱 (仅管理员下发 RC-81, RC-91, RC-93)
-	ledgerSummary := buildDrawerLedgerSummary(isAdmin, func() []models.Transaction {
-		var txs []models.Transaction
-		txQuery := db.DB.Where("city_code LIKE ?", provPrefix+"%")
-		if len(fpIDs) > 0 && provShort != "" {
-			txQuery = db.DB.Where("city_code LIKE ? OR footprint_id IN ? OR note LIKE ? OR title LIKE ?", provPrefix+"%", fpIDs, "%"+provShort+"%", "%"+provShort+"%")
-		} else if len(fpIDs) > 0 {
-			txQuery = db.DB.Where("city_code LIKE ? OR footprint_id IN ?", provPrefix+"%", fpIDs)
-		} else if provShort != "" {
-			txQuery = db.DB.Where("city_code LIKE ? OR note LIKE ? OR title LIKE ?", provPrefix+"%", "%"+provShort+"%", "%"+provShort+"%")
-		}
-		txQuery.Find(&txs)
-		return txs
-	})
-
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
-	Success(c, gin.H{
-		"province_adcode": provAdcode,
-		"province_name":   provName,
-		"visited_cities":  visitedCities,
-		"visit_stats": gin.H{
-			"city_count":        len(visitedCities),
-			"total_visits":      len(footprints),
-			"first_visited_at":  firstVisitStr,
-			"latest_visited_at": latestVisitStr,
-		},
-		"footprints":     footprints,
-		"entries":        entries,
-		"ledger_summary": ledgerSummary,
 	})
 }

@@ -6,7 +6,6 @@ import (
 
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
-	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -102,19 +101,20 @@ func setSyncCursor(c *gin.Context, t time.Time) {
 	c.Header(SyncCursorHeader, t.UTC().Format(time.RFC3339))
 }
 
-// entriesSyncCursor 计算生活档案响应中的「最后变动时间」最大值（含软删除时间）。
+// computeSyncCursor 计算当前页记录中的「最后变动时间」最大值（含软删除时间）。
 //
 // 与 ETag 用的 maxUpdated 分开算：不改动既有 ETag 语义（BE-05），
 // 只为增量游标提供更准确的上界 —— 软删除的时间戳必须计入，
 // 否则客户端的游标会永远停在删除之前，墓碑记录每轮增量都被重复拉回。
-func entriesSyncCursor(entries []models.LifeEntry) time.Time {
+func computeSyncCursor[T any](items []T, timestamps func(T) (time.Time, gorm.DeletedAt)) time.Time {
 	var max time.Time
-	for _, e := range entries {
-		if e.UpdatedAt.After(max) {
-			max = e.UpdatedAt
+	for _, item := range items {
+		updatedAt, deletedAt := timestamps(item)
+		if updatedAt.After(max) {
+			max = updatedAt
 		}
-		if e.DeletedAt.Valid && e.DeletedAt.Time.After(max) {
-			max = e.DeletedAt.Time
+		if deletedAt.Valid && deletedAt.Time.After(max) {
+			max = deletedAt.Time
 		}
 	}
 	return max

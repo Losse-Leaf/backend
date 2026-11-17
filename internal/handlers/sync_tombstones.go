@@ -107,117 +107,26 @@ func syncTombstonesSince(entityType, sinceStr string) ([]models.SyncTombstone, e
 	return rows, nil
 }
 
-func injectEntryTombstones(dst *[]models.LifeEntry, sinceStr string) error {
-	rows, err := syncTombstonesSince(TombstoneEntityEntry, sinceStr)
+func injectTombstones[T any](
+	dst *[]T,
+	entityType string,
+	sinceStr string,
+	getID func(T) uint,
+	makeTombstone func(id uint, deletedAt time.Time) T,
+) error {
+	rows, err := syncTombstonesSince(entityType, sinceStr)
 	if err != nil || len(rows) == 0 {
 		return err
 	}
 	existing := make(map[uint]struct{}, len(*dst))
 	for _, item := range *dst {
-		existing[item.ID] = struct{}{}
+		existing[getID(item)] = struct{}{}
 	}
 	for _, row := range rows {
 		if _, ok := existing[row.EntityID]; ok {
 			continue
 		}
-		*dst = append(*dst, models.LifeEntry{
-			ID:        row.EntityID,
-			CreatedAt: row.DeletedAt,
-			UpdatedAt: row.DeletedAt,
-			DeletedAt: gorm.DeletedAt{Time: row.DeletedAt, Valid: true},
-		})
-	}
-	return nil
-}
-
-func injectTransactionTombstones(dst *[]models.Transaction, sinceStr string) error {
-	rows, err := syncTombstonesSince(TombstoneEntityTransaction, sinceStr)
-	if err != nil || len(rows) == 0 {
-		return err
-	}
-	existing := make(map[uint]struct{}, len(*dst))
-	for _, item := range *dst {
-		existing[item.ID] = struct{}{}
-	}
-	for _, row := range rows {
-		if _, ok := existing[row.EntityID]; ok {
-			continue
-		}
-		*dst = append(*dst, models.Transaction{
-			ID:        row.EntityID,
-			CreatedAt: row.DeletedAt,
-			UpdatedAt: row.DeletedAt,
-			DeletedAt: gorm.DeletedAt{Time: row.DeletedAt, Valid: true},
-		})
-	}
-	return nil
-}
-
-func injectProjectTombstones(dst *[]models.Project, sinceStr string) error {
-	rows, err := syncTombstonesSince(TombstoneEntityProject, sinceStr)
-	if err != nil || len(rows) == 0 {
-		return err
-	}
-	existing := make(map[uint]struct{}, len(*dst))
-	for _, item := range *dst {
-		existing[item.ID] = struct{}{}
-	}
-	for _, row := range rows {
-		if _, ok := existing[row.EntityID]; ok {
-			continue
-		}
-		*dst = append(*dst, models.Project{
-			ID:        row.EntityID,
-			CreatedAt: row.DeletedAt,
-			UpdatedAt: row.DeletedAt,
-			DeletedAt: gorm.DeletedAt{Time: row.DeletedAt, Valid: true},
-		})
-	}
-	return nil
-}
-
-func injectWishTombstones(dst *[]models.Wish, sinceStr string) error {
-	rows, err := syncTombstonesSince(TombstoneEntityWish, sinceStr)
-	if err != nil || len(rows) == 0 {
-		return err
-	}
-	existing := make(map[uint]struct{}, len(*dst))
-	for _, item := range *dst {
-		existing[item.ID] = struct{}{}
-	}
-	for _, row := range rows {
-		if _, ok := existing[row.EntityID]; ok {
-			continue
-		}
-		*dst = append(*dst, models.Wish{
-			ID:        row.EntityID,
-			CreatedAt: row.DeletedAt,
-			UpdatedAt: row.DeletedAt,
-			DeletedAt: gorm.DeletedAt{Time: row.DeletedAt, Valid: true},
-		})
-	}
-	return nil
-}
-
-func injectFootprintTombstones(dst *[]models.Footprint, sinceStr string) error {
-	rows, err := syncTombstonesSince(TombstoneEntityFootprint, sinceStr)
-	if err != nil || len(rows) == 0 {
-		return err
-	}
-	existing := make(map[uint]struct{}, len(*dst))
-	for _, item := range *dst {
-		existing[item.ID] = struct{}{}
-	}
-	for _, row := range rows {
-		if _, ok := existing[row.EntityID]; ok {
-			continue
-		}
-		*dst = append(*dst, models.Footprint{
-			ID:        row.EntityID,
-			CreatedAt: row.DeletedAt,
-			UpdatedAt: row.DeletedAt,
-			DeletedAt: gorm.DeletedAt{Time: row.DeletedAt, Valid: true},
-		})
+		*dst = append(*dst, makeTombstone(row.EntityID, row.DeletedAt))
 	}
 	return nil
 }

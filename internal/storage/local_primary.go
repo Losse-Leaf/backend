@@ -61,26 +61,38 @@ type localExistsEntry struct {
 // localExistsTTL 存在性缓存有效期
 const localExistsTTL = 60 * time.Second
 
-// LocalObjectPath 返回对象键对应的本地绝对路径（不做存在性检查）
-func LocalObjectPath(objectKey string) string {
-	objectKey = strings.TrimPrefix(strings.TrimSpace(objectKey), "/")
-	if objectKey == "" {
-		return ""
+// resolveContainedLocalPath 归一化对象键并校验目标路径严格位于本地上传根目录内。
+func resolveContainedLocalPath(rawKey string) (cleanKey string, targetPath string, ok bool) {
+	cleanKey = strings.TrimPrefix(strings.TrimSpace(rawKey), "/")
+	if cleanKey == "" {
+		return "", "", false
 	}
 	base := GetLocalUploadDir()
 	if base == "" {
 		base = filepath.Join("data", "uploads")
 	}
-	target := filepath.Join(base, filepath.FromSlash(objectKey))
-	// 兜底断言：解析后的绝对路径必须仍在上传根目录内，杜绝越界访问
-	if absBase, err := filepath.Abs(base); err == nil {
-		if absTarget, err := filepath.Abs(target); err == nil {
-			if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
-				return ""
-			}
-		}
+	targetPath = filepath.Join(base, filepath.FromSlash(cleanKey))
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", "", false
 	}
-	return target
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return "", "", false
+	}
+	if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(filepath.Separator)) {
+		return "", "", false
+	}
+	return cleanKey, targetPath, true
+}
+
+// LocalObjectPath 返回对象键对应的本地路径（不做存在性检查）
+func LocalObjectPath(objectKey string) string {
+	_, targetPath, ok := resolveContainedLocalPath(objectKey)
+	if !ok {
+		return ""
+	}
+	return targetPath
 }
 
 // ObjectExistsLocally 判断对象是否已存在于本地磁盘
@@ -119,6 +131,13 @@ func InvalidateLocalObjectCache(objectKey string) {
 	}
 	localExistsMu.Lock()
 	delete(localExistsCache, objectKey)
+	localExistsMu.Unlock()
+}
+
+// InvalidateAllLocalObjectCache 清空全部本地对象存在性缓存（整库恢复后调用）
+func InvalidateAllLocalObjectCache() {
+	localExistsMu.Lock()
+	localExistsCache = map[string]localExistsEntry{}
 	localExistsMu.Unlock()
 }
 

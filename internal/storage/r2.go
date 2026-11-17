@@ -396,24 +396,7 @@ func VerifyObjectExists(objectKey string) (size int64, contentType string, err e
 // 关键：不能因为 R2 未配置就直接 return —— 本地磁盘才是主存储，
 // 否则「物理删除附件」之后原图仍留在 VPS 上，旧签名 URL 继续可读。
 func DeleteObject(objectKey string) error {
-	if objectKey == "" {
-		return nil
-	}
-	localErr := DeleteLocalObject(objectKey)
-	snap := r2ClientsSnapshot()
-	if !snap.configured || snap.client == nil {
-		return localErr
-	}
-
-	delInput := &s3.DeleteObjectInput{
-		Bucket: aws.String(snap.bucket),
-		Key:    aws.String(objectKey),
-	}
-
-	_, err := snap.client.DeleteObject(context.TODO(), delInput)
-	// 本地统计缓存一并失效：删除动作即使只影响 R2，也避免状态页继续展示旧口径。
-	InvalidateStorageStatsCache()
-	return errors.Join(localErr, err)
+	return DeleteObjectWithContext(context.Background(), objectKey)
 }
 
 // DeleteObjectWithContext 带 context 的删除（长任务/purge 提交后清理用）。
@@ -668,25 +651,22 @@ func GeneratePresignedGetURL(objectKey string, customDuration ...time.Duration) 
 	return presignedReq.URL, expiresIn, nil
 }
 
-// SignResourceURL 快捷函数：将相对路径或对象 Key 转换为有时效的临时签名可访问 URL
-// 默认时效来自系统配置 (默认 30 分钟)。若生成失败或未配置 R2，智能回退为公开地址或原值
-func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) string {
+// SignResourceWithTTL 将相对路径或对象 Key 转换为有时效的临时签名可访问 URL 及剩余秒数。
+// 在「本地磁盘为主」模式下，若对象已存在于本地磁盘，直接签发中枢 /media 签名地址，不触发 R2 预签名调用。
+func SignResourceWithTTL(resourcePathOrKey string, customDuration ...time.Duration) (string, int) {
 	resourcePathOrKey = strings.TrimSpace(resourcePathOrKey)
 	if resourcePathOrKey == "" {
-		return ""
+		return "", 0
 	}
 
-	// 本地为主：文件就在同一台机器的磁盘上 → 给中枢自己的 /media 路由。
-	// 关键收益：客户端不必绕道对象存储。实测同一张 1.5MB 的相纸，
-	// 走对象存储要 4.4 秒，走本机路由是毫秒级。
-	//
-	// 关键：给的是**带签名的** URL（与对象存储的预签名同构），
-	// 而不是一个裸路径 —— 否则 /media 就是无鉴权公开目录，
-	// 任何知道中枢地址的人都能翻阅全部照片。
 	if localPrimaryEnabled {
 		key := ExtractObjectKey(resourcePathOrKey)
 		if key != "" && ObjectExistsLocally(key) {
-			return SignLocalMediaURL(key, customDuration...)
+			ttl := LocalMediaSignatureTTL()
+			if len(customDuration) > 0 && customDuration[0] > 0 {
+				ttl = customDuration[0]
+			}
+			return SignLocalMediaURL(key, customDuration...), int(ttl.Seconds())
 		}
 	}
 
@@ -696,20 +676,31 @@ func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) 
 		!strings.Contains(resourcePathOrKey, "X-Amz-") {
 		pubDomain := r2ClientsSnapshot().publicDomain
 		if pubDomain == "" || !strings.Contains(resourcePathOrKey, pubDomain) {
-			return resourcePathOrKey
+			ttl := GetPresignExpireDuration()
+			if len(customDuration) > 0 && customDuration[0] > 0 {
+				ttl = customDuration[0]
+			}
+			return resourcePathOrKey, int(ttl.Seconds())
 		}
 	}
 
 	key := ExtractObjectKey(resourcePathOrKey)
 	if key == "" {
-		return resourcePathOrKey
+		return resourcePathOrKey, 0
 	}
 
-	url, _, err := GeneratePresignedGetURL(key, customDuration...)
+	signedURL, expiresIn, err := GeneratePresignedGetURL(key, customDuration...)
 	if err != nil {
-		return GetPublicURL(key)
+		return GetPublicURL(key), 0
 	}
-	return url
+	return signedURL, expiresIn
+}
+
+// SignResourceURL 快捷函数：将相对路径或对象 Key 转换为有时效的临时签名可访问 URL
+// 默认时效来自系统配置 (默认 30 分钟)。若生成失败或未配置 R2，智能回退为公开地址或原值
+func SignResourceURL(resourcePathOrKey string, customDuration ...time.Duration) string {
+	signedURL, _ := SignResourceWithTTL(resourcePathOrKey, customDuration...)
+	return signedURL
 }
 
 var (

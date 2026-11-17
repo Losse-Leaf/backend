@@ -324,6 +324,7 @@ func UpdateCreditChannel(c *gin.Context) {
 		return
 	}
 
+	oldName := ch.Name
 	oldRepaymentDay := ch.RepaymentDay
 	if strings.TrimSpace(req.Name) != "" {
 		ch.Name = strings.TrimSpace(req.Name)
@@ -379,6 +380,26 @@ func UpdateCreditChannel(c *gin.Context) {
 					rtx.RepaymentDay = ch.RepaymentDay
 					rtx.InstallmentRemainMonths = autoRemain
 					_ = tx.Save(&rtx).Error
+				}
+			}
+		}
+		if tx.Migrator().HasTable(&models.InstallmentPlan{}) {
+			planUpdates := map[string]any{}
+			if codeChanged {
+				planUpdates["channel_code"] = ch.Code
+			}
+			if ch.Name != oldName {
+				planUpdates["channel_name"] = ch.Name
+			}
+			if ch.RepaymentDay != oldRepaymentDay {
+				planUpdates["repay_day"] = ch.RepaymentDay
+			}
+			if len(planUpdates) > 0 {
+				planUpdates["updated_at"] = config.NowInBeijing()
+				if err := tx.Model(&models.InstallmentPlan{}).
+					Where("channel_id = ? OR channel_code = ?", ch.ID, oldCode).
+					Updates(planUpdates).Error; err != nil {
+					return err
 				}
 			}
 		}

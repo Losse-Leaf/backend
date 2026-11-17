@@ -67,7 +67,7 @@ func GenerateBackupFilename() string {
 	return fmt.Sprintf("%s%s%s", BackupFilePrefix, beijingTime.Format("20060102-150405"), BackupFileExt)
 }
 
-// CreateBackup 执行一次完整的全量原子打包，生成 .zip 归档，并上传 R2 或落盘本地（滑动窗口保留最新 7 份）
+// CreateBackup 执行一次完整的全量原子打包，生成 .zip 归档，并上传 R2 或落盘本地（滑动窗口保留最新 12 份）
 func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	backupMutex.Lock()
 	defer backupMutex.Unlock()
@@ -158,6 +158,14 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	db.DB.Find(&creditChannels)
 	counts["credit_channels"] = int64(len(creditChannels))
 
+	var installmentPlans []models.InstallmentPlan
+	db.DB.Find(&installmentPlans)
+	counts["installment_plans"] = int64(len(installmentPlans))
+
+	var installmentItems []models.InstallmentItem
+	db.DB.Find(&installmentItems)
+	counts["installment_items"] = int64(len(installmentItems))
+
 	var attachments []models.Attachment
 	db.DB.Find(&attachments)
 	counts["attachments"] = int64(len(attachments))
@@ -171,16 +179,18 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 
 	// 3. 将全量数据镜像写入 ZIP: metadata/data.json
 	fullDump := map[string]interface{}{
-		"site_config":     siteConfig,
-		"curator_profile": curatorProfile,
-		"entries":         entries,
-		"wishes":          wishes,
-		"footprints":      footprints,
-		"projects":        projects,
-		"transactions":    transactions,
-		"categories":      categories,
-		"credit_channels": creditChannels,
-		"attachments":     attachments,
+		"site_config":       siteConfig,
+		"curator_profile":   curatorProfile,
+		"entries":           entries,
+		"wishes":            wishes,
+		"footprints":        footprints,
+		"projects":          projects,
+		"transactions":      transactions,
+		"categories":        categories,
+		"credit_channels":   creditChannels,
+		"installment_plans": installmentPlans,
+		"installment_items": installmentItems,
+		"attachments":       attachments,
 	}
 	if dumpBytes, err := json.MarshalIndent(fullDump, "", "  "); err == nil {
 		_ = addBytesToZip(zipWriter, dumpBytes, "metadata/data.json")
@@ -353,7 +363,7 @@ func ListBackups(ctx context.Context) ([]BackupItem, error) {
 	return deduped, nil
 }
 
-// PruneOldBackups 轮转清理旧备份，始终保持最多保留 maxKeep (7) 份
+// PruneOldBackups 轮转清理旧备份，始终保持最多保留 maxKeep (12) 份
 func PruneOldBackups(ctx context.Context, maxKeep int) error {
 	if maxKeep <= 0 {
 		maxKeep = MaxBackupRetention

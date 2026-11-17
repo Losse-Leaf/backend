@@ -131,10 +131,6 @@ func saveProfileGearWith(dbTx *gorm.DB, profile *models.CuratorProfile, list []m
 	return dbTx.Save(profile).Error
 }
 
-func saveProfileGear(profile *models.CuratorProfile, list []models.GearItem) error {
-	return saveProfileGearWith(db.DB, profile, list)
-}
-
 // mutateProfileGearLocked 在**已持有 profileGearMu** 时用指定连接读写 EDCGear。
 //
 // 事务调用方必须先取锁再开启事务：锁序固定为 profileGearMu → DB 事务，
@@ -156,6 +152,50 @@ func mutateProfileGear(mutate func([]models.GearItem) ([]models.GearItem, error)
 	profileGearMu.Lock()
 	defer profileGearMu.Unlock()
 	return mutateProfileGearLocked(db.DB, mutate)
+}
+
+// withProfileGearTx 按固定锁序（profileGearMu -> DB 事务）原子执行器物 JSON 列与关联表的读写。
+func withProfileGearTx(fn func(tx *gorm.DB) error) error {
+	profileGearMu.Lock()
+	defer profileGearMu.Unlock()
+	return db.DB.Transaction(fn)
+}
+
+// appendGearItemTx 在调用方已持有 profileGearMu 的事务内追加一件器物，并按需创建伴生散页。
+func appendGearItemTx(tx *gorm.DB, item models.GearItem, occurredAt time.Time, isPrivate bool, createCompanion bool) (models.GearItem, error) {
+	item.ID = strings.TrimSpace(item.ID)
+	if item.ID == "" {
+		item.ID = fmt.Sprintf("gear_%s", generateRandomHex(8))
+	}
+	item.Name = strings.TrimSpace(item.Name)
+	item.Spec = strings.TrimSpace(item.Spec)
+	item.Category = strings.TrimSpace(item.Category)
+	if item.Category == "" {
+		item.Category = "数码器材"
+	}
+	if strings.TrimSpace(item.Status) == "" {
+		item.Status = "active"
+	}
+	if occurredAt.IsZero() {
+		occurredAt = config.NowInBeijing()
+	}
+	if strings.TrimSpace(item.PurchaseDate) == "" {
+		item.PurchaseDate = occurredAt.In(config.BeijingLocation).Format("2006-01-02")
+	}
+	item.Note = strings.TrimSpace(item.Note)
+
+	if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
+		return append(list, item), nil
+	}); err != nil {
+		return item, err
+	}
+
+	if createCompanion {
+		if _, err := createGearCompanionEntry(tx, item, occurredAt, isPrivate); err != nil {
+			return item, err
+		}
+	}
+	return item, nil
 }
 
 // GetAssetsOverview 资产管理大盘看板 (RC-53)
@@ -492,56 +532,38 @@ func AddGearAsset(c *gin.Context) {
 		purchaseDate = config.TodayInBeijing()
 	}
 
-	gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
 	// MOB-P1-35：省略分类时回落到默认「数码器材」
 	gearCategory := strings.TrimSpace(req.Category)
 	if gearCategory == "" {
 		gearCategory = "数码器材"
 	}
 
-	newGear := models.GearItem{
-		ID:           gearID,
-		Name:         strings.TrimSpace(req.Name),
-		Spec:         strings.TrimSpace(req.Spec),
-		Category:     gearCategory,
-		Status:       "active",
-		PriceCents:   req.PriceCents,
-		PurchaseDate: purchaseDate,
-		Note:         strings.TrimSpace(req.Note),
+	occurred, parseErr := ParseFlexTime(purchaseDate)
+	if parseErr != nil {
+		occurred = config.NowInBeijing()
 	}
 
+	var newGear models.GearItem
+
 	// 关键：三段写入（档案 EDCGear / 伴生散页 / 联动账单）必须同生共死 ——
-	// 任一失败整体回滚，消除「设备已录入但伴生散页或账单失败」的部分成功分支
-	//（中途失败后重试会产生重复设备）。
-	// 先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
-	// 与 CreateTransaction / SellGearAsset 对齐）。
-	profileGearMu.Lock()
-	defer profileGearMu.Unlock()
-
-	if err := db.DB.Transaction(func(dbTx *gorm.DB) error {
-		if err := mutateProfileGearLocked(dbTx, func(list []models.GearItem) ([]models.GearItem, error) {
-			return append(list, newGear), nil
-		}); err != nil {
+	// 任一失败整体回滚，消除「设备已录入但伴生散页或账单失败」的部分成功分支。
+	if err := withProfileGearTx(func(dbTx *gorm.DB) error {
+		createdGear, err := appendGearItemTx(dbTx, models.GearItem{
+			Name:         req.Name,
+			Spec:         req.Spec,
+			Category:     gearCategory,
+			Status:       "active",
+			PriceCents:   req.PriceCents,
+			PurchaseDate: purchaseDate,
+			Note:         req.Note,
+		}, occurred, false, true)
+		if err != nil {
 			return err
 		}
-
-		// 伴生创建机制：添置器物时在时间流落一条对应的一级散页，
-		// 使「所有二级对象都能在时间流里查到」这一约定成立。
-		gearOccurredAt, parseErr := ParseFlexTime(purchaseDate)
-		if parseErr != nil {
-			gearOccurredAt = config.NowInBeijing()
-		}
-		if _, err := createGearCompanionEntry(dbTx, newGear, gearOccurredAt); err != nil {
-			return err
-		}
+		newGear = createdGear
 
 		// 若勾选了同步生成支出账单或启用了分期购置，且金额 > 0，自动生成流水
 		if (req.CreateTransaction || req.IsInstallment) && req.PriceCents > 0 {
-			occurred, parseErr := ParseFlexTime(purchaseDate)
-			if parseErr != nil {
-				occurred = config.NowInBeijing()
-			}
-
 			linkedTx := models.Transaction{
 				Amount: req.PriceCents,
 				Type:   "expense",
@@ -772,48 +794,44 @@ func RestoreGearAsset(c *gin.Context) {
 		return
 	}
 
-	restored := false
-	err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
-		// 已经存在（可能重复提交）⇒ 幂等返回，不重复插入
-		for _, g := range list {
-			if g.ID == req.ID {
-				restored = true
-				return list, nil
+	if err := withProfileGearTx(func(tx *gorm.DB) error {
+		if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
+			// 已经存在（可能重复提交）⇒ 幂等返回，不重复插入
+			for _, g := range list {
+				if g.ID == req.ID {
+					return list, nil
+				}
 			}
+			item := models.GearItem{
+				ID:             req.ID,
+				Name:           strings.TrimSpace(req.Name),
+				Spec:           req.Spec,
+				Category:       req.Category,
+				Status:         req.Status,
+				PriceCents:     req.PriceCents,
+				PurchaseDate:   req.PurchaseDate,
+				SoldPriceCents: req.SoldPriceCents,
+				SoldDate:       req.SoldDate,
+				Note:           req.Note,
+			}
+			idx := req.Index
+			if idx < 0 || idx > len(list) {
+				idx = len(list)
+			}
+			return append(list[:idx], append([]models.GearItem{item}, list[idx:]...)...), nil
+		}); err != nil {
+			return err
 		}
-		item := models.GearItem{
-			ID:             req.ID,
-			Name:           strings.TrimSpace(req.Name),
-			Spec:           req.Spec,
-			Category:       req.Category,
-			Status:         req.Status,
-			PriceCents:     req.PriceCents,
-			PurchaseDate:   req.PurchaseDate,
-			SoldPriceCents: req.SoldPriceCents,
-			SoldDate:       req.SoldDate,
-			Note:           req.Note,
-		}
-		idx := req.Index
-		if idx < 0 || idx > len(list) {
-			idx = len(list)
-		}
-		restored = true
-		return append(list[:idx], append([]models.GearItem{item}, list[idx:]...)...), nil
-	})
-	if err != nil {
-		Error(c, http.StatusInternalServerError, "恢复设备失败: "+err.Error())
-		return
-	}
-	if !restored {
-		Error(c, http.StatusNotFound, "设备不存在")
-		return
-	}
 
-	// 连带恢复伴生散页（软删除的清掉 deleted_at）
-	if err := db.DB.Unscoped().Model(&models.LifeEntry{}).
-		Where("gear_id = ?", req.ID).
-		Update("deleted_at", nil).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "设备已恢复但伴生记录恢复失败: "+err.Error())
+		// 连带恢复伴生散页并推进 updated_at，使增量同步能感知恢复动作
+		return tx.Unscoped().Model(&models.LifeEntry{}).
+			Where("gear_id = ?", req.ID).
+			Updates(map[string]any{
+				"deleted_at": nil,
+				"updated_at": time.Now(),
+			}).Error
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, "恢复设备失败: "+err.Error())
 		return
 	}
 
@@ -828,28 +846,27 @@ func DeleteGearAsset(c *gin.Context) {
 	gearID := c.Param("id")
 
 	found := false
-	if err := mutateProfileGear(func(list []models.GearItem) ([]models.GearItem, error) {
-		for i := range list {
-			if list[i].ID == gearID {
-				found = true
-				return append(list[:i], list[i+1:]...), nil
+	if err := withProfileGearTx(func(tx *gorm.DB) error {
+		if err := mutateProfileGearLocked(tx, func(list []models.GearItem) ([]models.GearItem, error) {
+			for i := range list {
+				if list[i].ID == gearID {
+					found = true
+					return append(list[:i], list[i+1:]...), nil
+				}
 			}
+			return nil, fmt.Errorf("设备不存在")
+		}); err != nil {
+			return err
 		}
-		return nil, fmt.Errorf("设备不存在")
+
+		// 关键：删除器物时在同一事务内一并软删除它在时间流里的伴生散页，避免留下孤儿记录。
+		return deleteGearCompanionEntries(tx, gearID)
 	}); err != nil {
 		if !found {
 			Error(c, http.StatusNotFound, "设备不存在")
 		} else {
 			Error(c, http.StatusInternalServerError, "删除设备失败: "+err.Error())
 		}
-		return
-	}
-
-	// 关键：删除器物时一并软删除它在时间流里的伴生散页，避免留下孤儿记录。
-	if err := db.DB.Transaction(func(tx *gorm.DB) error {
-		return deleteGearCompanionEntries(tx, gearID)
-	}); err != nil {
-		Error(c, http.StatusInternalServerError, "设备已删除但清理伴生记录失败: "+err.Error())
 		return
 	}
 

@@ -197,9 +197,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		// 四季高光直接引用 entries 中的元素；嵌套心愿同样必须与心愿列表同口径脱敏。
 		redactEmbeddedWishFinancesBatch(entries)
 		for i := range fulfilledWishes {
-			fulfilledWishes[i].ActualCost = 0
-			fulfilledWishes[i].TransactionID = nil
-			fulfilledWishes[i].GearID = nil
+			redactEmbeddedWishFinances(&fulfilledWishes[i])
 		}
 		finSpectrum = gin.H{
 			"total_income":        0,
@@ -242,7 +240,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 	ttlBucket := time.Now().Unix() / int64(25*60)
 	etag := fmt.Sprintf(`W/"almanac-%d-%d-%d-%d-%d-%s"`, year, len(entries), len(txs), maxUpdated.UnixMilli(), ttlBucket, role)
 	c.Header("ETag", etag)
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 
 	if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 		c.Status(http.StatusNotModified)

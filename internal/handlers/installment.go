@@ -3,7 +3,6 @@ package handlers
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -295,21 +294,20 @@ type CreateInstallmentPlanRequest struct {
 	Title           string  `json:"title"`
 	Kind            string  `json:"kind"` // "asset" | "expense"
 	Principal       int64   `json:"principal"`
-	Periods         int     `json:"periods"`
-	FeeMode         string  `json:"fee_mode"` // "none" | "fixed_per_period" | "rate_per_period" | "total_fee"
-	FeeValue        int64   `json:"fee_value"`
-	FeeRate         float64 `json:"fee_rate,omitempty"` // 兼容小数费率输入，如 0.005 代表 0.50%
-	FirstDueDate    string  `json:"first_due_date"`
-	RepayDay        int     `json:"repay_day"`
-	AssetID         string  `json:"asset_id,omitempty"`
-	CreateNewGear   bool    `json:"create_new_gear,omitempty"` // 类型 A 且录入新设备时为 true
-	GearName        string  `json:"gear_name,omitempty"`
-	GearSpec        string  `json:"gear_spec,omitempty"`
-	GearCategory    string  `json:"gear_category,omitempty"`
-	CategoryID      *uint   `json:"category_id,omitempty"`   // 类型 B 分类 ID
-	CategoryName    string  `json:"category_name,omitempty"` // 类型 B 分类名称
-	PurchaseDate    string  `json:"purchase_date,omitempty"` // 购买日期 YYYY-MM-DD
-	Note            string  `json:"note,omitempty"`
+	Periods      int    `json:"periods"`
+	FeeMode      string `json:"fee_mode"` // "none" | "fixed_per_period" | "rate_per_period" | "total_fee"
+	FeeValue     int64  `json:"fee_value"`
+	FirstDueDate string `json:"first_due_date"`
+	RepayDay     int    `json:"repay_day"`
+	AssetID      string `json:"asset_id,omitempty"`
+	CreateNewGear bool  `json:"create_new_gear,omitempty"` // 类型 A 且录入新设备时为 true
+	GearName     string `json:"gear_name,omitempty"`
+	GearSpec     string `json:"gear_spec,omitempty"`
+	GearCategory string `json:"gear_category,omitempty"`
+	CategoryID   *uint  `json:"category_id,omitempty"`   // 类型 B 分类 ID
+	CategoryName string `json:"category_name,omitempty"` // 类型 B 分类名称
+	PurchaseDate string `json:"purchase_date,omitempty"` // 购买日期 YYYY-MM-DD
+	Note         string `json:"note,omitempty"`
 }
 
 // CreateInstallmentPlan 创建分期计划
@@ -319,7 +317,6 @@ func CreateInstallmentPlan(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "请求参数无效: "+err.Error())
 		return
 	}
-	log.Printf("CreateInstallmentPlan received: kind: %q", req.Kind)
 
 	req.Title = strings.TrimSpace(req.Title)
 	if req.Title == "" {
@@ -384,10 +381,6 @@ func CreateInstallmentPlan(c *gin.Context) {
 		feeMode = "none"
 	}
 	feeValue := req.FeeValue
-	if feeMode == "rate_per_period" && feeValue == 0 && req.FeeRate > 0 {
-		// 将小数费率转化为基点 bps (例如 0.005 -> 50 bps)
-		feeValue = int64(req.FeeRate*10000 + 0.5)
-	}
 
 	principalParts, feeParts, totalFee, err := SplitInstallmentPeriods(req.Principal, req.Periods, feeMode, feeValue)
 	if err != nil {
@@ -447,28 +440,20 @@ func CreateInstallmentPlan(c *gin.Context) {
 			gearName = req.Title
 		}
 		if (req.CreateNewGear || req.AssetID == "") && gearName != "" {
-			gearID := fmt.Sprintf("gear_%d", now.UnixNano())
-			gearCat := req.GearCategory
-			if gearCat == "" {
-				gearCat = "数码器材"
-			}
-			newGear := models.GearItem{
-				ID:           gearID,
+			createdGear, err := appendGearItemTx(dbTx, models.GearItem{
 				Name:         gearName,
 				Spec:         req.GearSpec,
-				Category:     gearCat,
+				Category:     req.GearCategory,
 				Status:       "active",
 				PriceCents:   req.Principal,
 				PurchaseDate: purchaseOccurredAt.Format("2006-01-02"),
-			}
-			if err := mutateProfileGearLocked(dbTx, func(list []models.GearItem) ([]models.GearItem, error) {
-				return append(list, newGear), nil
-			}); err != nil {
+			}, purchaseOccurredAt, false, false)
+			if err != nil {
 				dbTx.Rollback()
 				Error(c, http.StatusInternalServerError, "保存新装备资产失败: "+err.Error())
 				return
 			}
-			plan.AssetID = gearID
+			plan.AssetID = createdGear.ID
 		}
 	}
 
@@ -567,6 +552,48 @@ type InstallmentPlanItemSummary struct {
 	OverdueDays        int    `json:"overdue_days"`        // 最大逾期天数
 }
 
+// summarizeInstallmentPlanItems 统一核算单个分期计划的已还/待还/下期/逾期汇总（列表与详情同源）。
+func summarizeInstallmentPlanItems(plan models.InstallmentPlan, items []models.InstallmentItem, todayStr string) InstallmentPlanItemSummary {
+	summary := InstallmentPlanItemSummary{
+		InstallmentPlan: plan,
+	}
+	todayDate, _ := time.ParseInLocation("2006-01-02", todayStr, config.BeijingLocation)
+	firstScheduledFound := false
+	maxOverdueDays := 0
+
+	for _, it := range items {
+		if it.Status == "paid" {
+			summary.PaidPrincipal += it.PrincipalPart
+			summary.PaidFee += it.FeePart
+			summary.PaidTotal += it.PaidAmount
+			summary.PaidPeriods++
+		} else {
+			summary.RemainingPrincipal += it.PrincipalPart
+			summary.RemainingFee += it.FeePart
+			summary.RemainingTotal += it.PrincipalPart + it.FeePart
+
+			if !firstScheduledFound {
+				firstScheduledFound = true
+				summary.NextDueDate = it.DueDate
+				summary.NextPrincipal = it.PrincipalPart
+				summary.NextFee = it.FeePart
+				summary.NextTotal = it.PrincipalPart + it.FeePart
+			}
+
+			itemDueDate, err := time.ParseInLocation("2006-01-02", it.DueDate, config.BeijingLocation)
+			if err == nil && itemDueDate.Before(todayDate) {
+				summary.IsOverdue = true
+				days := int(todayDate.Sub(itemDueDate).Hours() / 24)
+				if days > maxOverdueDays {
+					maxOverdueDays = days
+				}
+			}
+		}
+	}
+	summary.OverdueDays = maxOverdueDays
+	return summary
+}
+
 // GetInstallmentPlans 查询分期计划列表
 func GetInstallmentPlans(c *gin.Context) {
 	status := c.Query("status")
@@ -587,7 +614,6 @@ func GetInstallmentPlans(c *gin.Context) {
 	}
 
 	todayStr := config.NowInBeijing().Format("2006-01-02")
-	todayDate, _ := time.ParseInLocation("2006-01-02", todayStr, config.BeijingLocation)
 
 	itemsByPlanID := make(map[uint][]models.InstallmentItem, len(plans))
 	if len(plans) > 0 {
@@ -604,47 +630,7 @@ func GetInstallmentPlans(c *gin.Context) {
 
 	results := make([]InstallmentPlanItemSummary, 0, len(plans))
 	for _, plan := range plans {
-		items := itemsByPlanID[plan.ID]
-
-		summary := InstallmentPlanItemSummary{
-			InstallmentPlan: plan,
-		}
-
-		firstScheduledFound := false
-		maxOverdueDays := 0
-
-		for _, it := range items {
-			if it.Status == "paid" {
-				summary.PaidPrincipal += it.PrincipalPart
-				summary.PaidFee += it.FeePart
-				summary.PaidTotal += it.PaidAmount
-				summary.PaidPeriods++
-			} else {
-				summary.RemainingPrincipal += it.PrincipalPart
-				summary.RemainingFee += it.FeePart
-				summary.RemainingTotal += (it.PrincipalPart + it.FeePart)
-
-				if !firstScheduledFound {
-					firstScheduledFound = true
-					summary.NextDueDate = it.DueDate
-					summary.NextPrincipal = it.PrincipalPart
-					summary.NextFee = it.FeePart
-					summary.NextTotal = it.PrincipalPart + it.FeePart
-				}
-
-				// 检查逾期
-				itemDueDate, err := time.ParseInLocation("2006-01-02", it.DueDate, config.BeijingLocation)
-				if err == nil && itemDueDate.Before(todayDate) {
-					summary.IsOverdue = true
-					days := int(todayDate.Sub(itemDueDate).Hours() / 24)
-					if days > maxOverdueDays {
-						maxOverdueDays = days
-					}
-				}
-			}
-		}
-		summary.OverdueDays = maxOverdueDays
-		results = append(results, summary)
+		results = append(results, summarizeInstallmentPlanItems(plan, itemsByPlanID[plan.ID], todayStr))
 	}
 
 	Success(c, results)
@@ -666,56 +652,24 @@ func GetInstallmentPlanDetail(c *gin.Context) {
 	}
 
 	todayStr := config.NowInBeijing().Format("2006-01-02")
-	todayDate, _ := time.ParseInLocation("2006-01-02", todayStr, config.BeijingLocation)
-
-	var remainingPrincipal, remainingFee, paidPrincipal, paidFee int64
-	var paidPeriods int
-	var nextDueDate string
-	var nextPrincipal, nextFee int64
-	firstScheduled := false
-	isOverdue := false
-	maxOverdueDays := 0
-
-	for _, it := range items {
-		if it.Status == "paid" {
-			paidPrincipal += it.PrincipalPart
-			paidFee += it.FeePart
-			paidPeriods++
-		} else {
-			remainingPrincipal += it.PrincipalPart
-			remainingFee += it.FeePart
-			if !firstScheduled {
-				firstScheduled = true
-				nextDueDate = it.DueDate
-				nextPrincipal = it.PrincipalPart
-				nextFee = it.FeePart
-			}
-			dueDate, err := time.ParseInLocation("2006-01-02", it.DueDate, config.BeijingLocation)
-			if err == nil && dueDate.Before(todayDate) {
-				isOverdue = true
-				days := int(todayDate.Sub(dueDate).Hours() / 24)
-				if days > maxOverdueDays {
-					maxOverdueDays = days
-				}
-			}
-		}
-	}
+	summary := summarizeInstallmentPlanItems(plan, items, todayStr)
 
 	Success(c, gin.H{
 		"plan":                plan,
 		"items":               items,
-		"remaining_principal": remainingPrincipal,
-		"remaining_fee":       remainingFee,
-		"remaining_total":     remainingPrincipal + remainingFee,
-		"paid_principal":      paidPrincipal,
-		"paid_fee":            paidFee,
-		"paid_total":          paidPrincipal + paidFee,
-		"paid_periods":        paidPeriods,
-		"next_due_date":       nextDueDate,
-		"next_principal":      nextPrincipal,
-		"next_fee":            nextFee,
-		"is_overdue":          isOverdue,
-		"overdue_days":        maxOverdueDays,
+		"remaining_principal": summary.RemainingPrincipal,
+		"remaining_fee":       summary.RemainingFee,
+		"remaining_total":     summary.RemainingTotal,
+		"paid_principal":      summary.PaidPrincipal,
+		"paid_fee":            summary.PaidFee,
+		"paid_total":          summary.PaidTotal,
+		"paid_periods":        summary.PaidPeriods,
+		"next_due_date":       summary.NextDueDate,
+		"next_principal":      summary.NextPrincipal,
+		"next_fee":            summary.NextFee,
+		"next_total":          summary.NextTotal,
+		"is_overdue":          summary.IsOverdue,
+		"overdue_days":        summary.OverdueDays,
 	})
 }
 
@@ -931,6 +885,36 @@ func PayInstallmentItem(c *gin.Context) {
 	})
 }
 
+// resetInstallmentItemOnTxDelete 在事务内将已还款分期期次重置为待还，并在所属计划已结清时恢复为 active。
+func resetInstallmentItemOnTxDelete(tx *gorm.DB, itemID uint) (models.InstallmentItem, models.InstallmentPlan, error) {
+	var item models.InstallmentItem
+	var plan models.InstallmentPlan
+	if err := tx.First(&item, "id = ?", itemID).Error; err != nil {
+		return item, plan, err
+	}
+
+	now := config.NowInBeijing()
+	item.Status = "scheduled"
+	item.PaidAt = nil
+	item.PaidAmount = 0
+	item.PayAccount = ""
+	item.TransactionID = nil
+	item.UpdatedAt = now
+	if err := tx.Save(&item).Error; err != nil {
+		return item, plan, err
+	}
+
+	if err := tx.First(&plan, "id = ?", item.PlanID).Error; err == nil && plan.Status == "settled" {
+		plan.Status = "active"
+		plan.UpdatedAt = now
+		if err := tx.Save(&plan).Error; err != nil {
+			return item, plan, err
+		}
+	}
+
+	return item, plan, nil
+}
+
 // UnpayInstallmentItem 撤销某期已还
 func UnpayInstallmentItem(c *gin.Context) {
 	id := c.Param("id")
@@ -951,36 +935,24 @@ func UnpayInstallmentItem(c *gin.Context) {
 		return
 	}
 
-	dbTx := db.DB.Begin()
-	defer dbTx.Rollback()
-
-	// 软删除关联的流水记录
-	if item.TransactionID != nil {
-		_ = dbTx.Delete(&models.Transaction{}, *item.TransactionID).Error
-	}
-
-	now := config.NowInBeijing()
-	item.Status = "scheduled"
-	item.PaidAt = nil
-	item.PaidAmount = 0
-	item.PayAccount = ""
-	item.TransactionID = nil
-	item.UpdatedAt = now
-
-	if err := dbTx.Save(&item).Error; err != nil {
-		dbTx.Rollback()
+	if err := db.DB.Transaction(func(dbTx *gorm.DB) error {
+		// 软删除关联的流水记录
+		if item.TransactionID != nil {
+			if err := dbTx.Delete(&models.Transaction{}, *item.TransactionID).Error; err != nil {
+				return err
+			}
+		}
+		updatedItem, updatedPlan, err := resetInstallmentItemOnTxDelete(dbTx, item.ID)
+		if err != nil {
+			return err
+		}
+		item = updatedItem
+		if updatedPlan.ID > 0 {
+			plan = updatedPlan
+		}
+		return nil
+	}); err != nil {
 		Error(c, http.StatusInternalServerError, "回滚期次失败: "+err.Error())
-		return
-	}
-
-	if plan.Status == "settled" {
-		plan.Status = "active"
-		plan.UpdatedAt = now
-		_ = dbTx.Save(&plan).Error
-	}
-
-	if err := dbTx.Commit().Error; err != nil {
-		Error(c, http.StatusInternalServerError, "提交事务失败: "+err.Error())
 		return
 	}
 

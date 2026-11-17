@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
@@ -311,28 +311,17 @@ func MigrateStorageMedia(c *gin.Context) {
 		if cleanKey == "" || strings.Contains(cleanKey, "..") {
 			continue
 		}
-		localPath := filepath.Join(localDir, filepath.FromSlash(cleanKey))
-		if fi, err := os.Stat(localPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		localPath := storage.LocalObjectPath(cleanKey)
+		if localPath == "" {
 			continue
 		}
-		rc, _, err := storage.GetObject(ctx, cleanKey)
-		if err != nil || rc == nil {
-			continue
+		if fi, err := os.Stat(localPath); err == nil && !fi.IsDir() {
+			if fi.Size() > 0 {
+				continue
+			}
+			_ = storage.DeleteLocalObject(cleanKey)
 		}
-		if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
-			rc.Close()
-			continue
-		}
-		// 私密内容 0600
-		out, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			rc.Close()
-			continue
-		}
-		_, copyErr := io.Copy(out, rc)
-		out.Close()
-		rc.Close()
-		if copyErr == nil {
+		if err := storage.MirrorObjectToLocal(ctx, cleanKey); err == nil {
 			downloadedToLocal++
 		}
 	}
@@ -342,4 +331,15 @@ func MigrateStorageMedia(c *gin.Context) {
 		"downloaded_to_local": downloadedToLocal,
 		"message":             fmt.Sprintf("双向媒体同步完成：已上传 %d 个文件至 R2，已拉取 %d 个文件至本地", uploadedToR2, downloadedToLocal),
 	})
+}
+
+// GetStorageStatus 获取 R2 配置状态 (非管理员脱敏敏感桶名与节点)
+func GetStorageStatus(c *gin.Context) {
+	setAuthVaryHeader(c)
+	c.Header("Cache-Control", "private, no-store")
+	if !middleware.IsAdmin(c) {
+		Success(c, storage.GetStorageStatusBasic())
+		return
+	}
+	Success(c, storage.GetStorageStatus())
 }

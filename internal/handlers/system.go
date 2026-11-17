@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +13,9 @@ import (
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
+	"loose-leaf/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
@@ -253,4 +256,83 @@ func CheckSystemUpdate(c *gin.Context) {
 	updateCheckMu.Unlock()
 
 	Success(c, result)
+}
+
+func GetConfigV1(c *gin.Context) {
+	var cfg models.SiteConfig
+	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 {
+		cfg = models.SiteConfig{
+			SiteName:        "散页 · 个人生活志",
+			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",
+			CuratorName:     "",
+			DefaultLocation: "",
+		}
+	}
+	cfg.PublicModules = ParsePublicModulesRaw(cfg.PublicModulesRaw)
+	setAuthVaryHeader(c)
+	if !middleware.IsAdmin(c) {
+		cfg.InitialLiquidBalance = 0
+	}
+	Success(c, cfg)
+}
+
+type UpdateConfigRequest struct {
+	SiteName        *string   `json:"site_name"`
+	SiteSubtitle    *string   `json:"site_subtitle"`
+	CuratorName     *string   `json:"curator_name"`
+	DefaultLocation *string   `json:"default_location"`
+	SiteDesc        *string   `json:"site_desc"`
+	PublicModules   *[]string `json:"public_modules"`
+}
+
+func UpdateConfig(c *gin.Context) {
+	var cfg models.SiteConfig
+	db.DB.FirstOrCreate(&cfg)
+
+	var req UpdateConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "请求参数无效")
+		return
+	}
+
+	if req.SiteName != nil && strings.TrimSpace(*req.SiteName) != "" {
+		cfg.SiteName = strings.TrimSpace(*req.SiteName)
+	}
+	if req.SiteSubtitle != nil && strings.TrimSpace(*req.SiteSubtitle) != "" {
+		cfg.SiteSubtitle = strings.TrimSpace(*req.SiteSubtitle)
+	}
+	if req.CuratorName != nil && strings.TrimSpace(*req.CuratorName) != "" {
+		cfg.CuratorName = strings.TrimSpace(*req.CuratorName)
+	}
+	if req.DefaultLocation != nil && strings.TrimSpace(*req.DefaultLocation) != "" {
+		cfg.DefaultLocation = strings.TrimSpace(*req.DefaultLocation)
+	}
+	if req.SiteDesc != nil && strings.TrimSpace(*req.SiteDesc) != "" {
+		cfg.SiteDesc = strings.TrimSpace(*req.SiteDesc)
+	}
+	if req.PublicModules != nil {
+		cfg.PublicModulesRaw = MarshalPublicModulesRaw(*req.PublicModules)
+	}
+
+	if err := db.DB.Save(&cfg).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "更新站点配置失败: "+err.Error())
+		return
+	}
+	cfg.PublicModules = ParsePublicModulesRaw(cfg.PublicModulesRaw)
+	InvalidatePublicModulesCache()
+	InvalidateStatsCache()
+
+	Success(c, cfg)
+}
+
+func HealthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "operational",
+		"service":    "Loose-Leaf Life Archive Core",
+		"version":    config.Version,
+		"runtime":    runtime.Version(),
+		"storage_r2": storage.IsConfigured(),
+		"time":       time.Now().Unix(),
+		"message":    fmt.Sprintf("Archive engine %s running quietly on %s", config.Version, runtime.GOARCH),
+	})
 }

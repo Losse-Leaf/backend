@@ -11,16 +11,26 @@ import (
 
 	"loose-leaf/internal/backup"
 	"loose-leaf/internal/db"
+	"loose-leaf/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
+
+// ResetAllRuntimeCaches 统一清空统计、公开模块、存储统计、预签名及本地存在性等全部进程内缓存。
+func ResetAllRuntimeCaches() {
+	InvalidateStatsCache()
+	InvalidatePublicModulesCache()
+	storage.InvalidateStorageStatsCache()
+	storage.ClearPresignCache()
+	storage.InvalidateAllLocalObjectCache()
+}
 
 // finalizeRestore 在数据库生命周期读锁内刷新恢复后的内存缓存与存储配置，
 // 避免与并发发起的第二次恢复的替换窗口交错。
 func finalizeRestore() {
 	db.LockRead()
 	defer db.UnlockRead()
-	InvalidateStatsCache()
+	ResetAllRuntimeCaches()
 	LoadStorageConfigFromDB()
 }
 
@@ -83,6 +93,38 @@ type RestoreBackupRequest struct {
 	Filename string `json:"filename"`
 }
 
+// restoreFromReaderStream 将输入流落盘至临时 ZIP 并完成整库与媒体还原。
+func restoreFromReaderStream(c *gin.Context, src io.Reader, tempPattern string, copyErrMsg string) (int64, bool) {
+	tempFile, err := os.CreateTemp("", tempPattern)
+	if err != nil {
+		Error(c, http.StatusInternalServerError, "创建临时恢复文件失败")
+		return 0, false
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+
+	copied, err := io.Copy(tempFile, src)
+	tempFile.Close()
+	if err != nil {
+		Error(c, http.StatusInternalServerError, copyErrMsg)
+		return 0, false
+	}
+
+	zipReader, err := zip.OpenReader(tempPath)
+	if err != nil {
+		Error(c, http.StatusBadRequest, fmt.Sprintf("无效的 ZIP 压缩包: %v", err))
+		return 0, false
+	}
+	defer zipReader.Close()
+
+	if err := backup.RestoreFromZipStream(&zipReader.Reader); err != nil {
+		Error(c, http.StatusInternalServerError, fmt.Sprintf("恢复备份失败: %v", err))
+		return 0, false
+	}
+	finalizeRestore()
+	return copied, true
+}
+
 // RestoreBackup 执行备份整库恢复 (POST /api/v1/system/backup/restore)
 // 支持两种模式：
 // 1. JSON 请求：提供已有的备份文件名 { "filename": "looseleaf-backup-..." }，从 R2/本地归档一键回滚
@@ -110,33 +152,10 @@ func RestoreBackup(c *gin.Context) {
 		}
 		defer srcFile.Close()
 
-		tempFile, err := os.CreateTemp("", "looseleaf-upload-restore-*.zip")
-		if err != nil {
-			Error(c, http.StatusInternalServerError, "创建临时文件失败")
+		size, ok := restoreFromReaderStream(c, srcFile, "looseleaf-upload-restore-*.zip", "读取上传内容失败")
+		if !ok {
 			return
 		}
-		tempPath := tempFile.Name()
-		defer os.Remove(tempPath)
-
-		size, err := io.Copy(tempFile, srcFile)
-		tempFile.Close()
-		if err != nil {
-			Error(c, http.StatusInternalServerError, "读取上传内容失败")
-			return
-		}
-
-		zipReader, err := zip.OpenReader(tempPath)
-		if err != nil {
-			Error(c, http.StatusBadRequest, fmt.Sprintf("无效的 ZIP 压缩包: %v", err))
-			return
-		}
-		defer zipReader.Close()
-
-		if err := backup.RestoreFromZipStream(&zipReader.Reader); err != nil {
-			Error(c, http.StatusInternalServerError, fmt.Sprintf("恢复备份失败: %v", err))
-			return
-		}
-		finalizeRestore()
 
 		Success(c, gin.H{
 			"message":  "已成功从上传的压缩包完整恢复数据库与媒体资源",
@@ -161,33 +180,9 @@ func RestoreBackup(c *gin.Context) {
 	}
 	defer reader.Close()
 
-	tempFile, err := os.CreateTemp("", "looseleaf-remote-restore-*.zip")
-	if err != nil {
-		Error(c, http.StatusInternalServerError, "创建临时恢复文件失败")
+	if _, ok := restoreFromReaderStream(c, reader, "looseleaf-remote-restore-*.zip", "拉取备份内容失败"); !ok {
 		return
 	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-
-	if _, err := io.Copy(tempFile, reader); err != nil {
-		tempFile.Close()
-		Error(c, http.StatusInternalServerError, "拉取备份内容失败")
-		return
-	}
-	tempFile.Close()
-
-	zipReader, err := zip.OpenReader(tempPath)
-	if err != nil {
-		Error(c, http.StatusBadRequest, fmt.Sprintf("无效的 ZIP 压缩包: %v", err))
-		return
-	}
-	defer zipReader.Close()
-
-	if err := backup.RestoreFromZipStream(&zipReader.Reader); err != nil {
-		Error(c, http.StatusInternalServerError, fmt.Sprintf("恢复备份失败: %v", err))
-		return
-	}
-	finalizeRestore()
 
 	Success(c, gin.H{
 		"message":  fmt.Sprintf("已成功恢复备份快照 %s", filename),

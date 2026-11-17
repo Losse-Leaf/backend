@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>散页 · 通行证授权回跳</title>
+  <style nonce="{{.CSPNonce}}">
+    :root {
+      --bg-archive: #f9f8f5;
+      --bg-subtle: #f2f0eb;
+      --ink-primary: #181716;
+      --ink-secondary: #57544e;
+      --ink-muted: #8c8880;
+      --border-subtle: rgba(24, 23, 22, 0.10);
+      --border-divider: rgba(24, 23, 22, 0.16);
+      --accent-warm: #a24f2b;
+      --accent-moss: #3f5a4a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-archive: #141312;
+        --bg-subtle: #1d1b19;
+        --ink-primary: #ede8e1;
+        --ink-secondary: #a8a399;
+        --ink-muted: #6e6a62;
+        --border-subtle: rgba(237, 232, 225, 0.10);
+        --border-divider: rgba(237, 232, 225, 0.16);
+        --accent-warm: #c85635;
+        --accent-moss: #507661;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100dvh;
+      background-color: var(--bg-archive);
+      color: var(--ink-primary);
+      font-family: "Newsreader", "Songti SC", "Source Han Serif SC", Georgia, serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      -webkit-font-smoothing: antialiased;
+    }
+    .sheet {
+      width: 100%;
+      max-width: 460px;
+      background-color: var(--bg-subtle);
+      border: 1px solid var(--border-subtle);
+      padding: 32px 28px;
+    }
+    .kicker {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      color: var(--accent-moss);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 500;
+      line-height: 1.35;
+      margin-bottom: 12px;
+      text-wrap: balance;
+    }
+    .desc {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--ink-secondary);
+      margin-bottom: 24px;
+    }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .btn-primary, .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-block-size: 44px;
+      padding: 12px 16px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 13px;
+      letter-spacing: 0.06em;
+      text-decoration: none;
+      cursor: pointer;
+      transition: opacity 0.15s ease, border-color 0.15s ease;
+    }
+    .btn-primary {
+      background-color: var(--accent-warm);
+      color: #ffffff;
+      border: 1px solid var(--accent-warm);
+    }
+    .btn-primary:hover { opacity: 0.92; }
+    .btn-secondary {
+      background-color: var(--bg-archive);
+      color: var(--ink-primary);
+      border: 1px solid var(--border-divider);
+    }
+    .btn-secondary:hover { border-color: var(--ink-primary); }
+    .btn-primary:focus-visible, .btn-secondary:focus-visible {
+      outline: 2px solid var(--accent-warm);
+      outline-offset: 2px;
+    }
+    .copy-tip {
+      min-height: 20px;
+      margin-top: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 12px;
+      color: var(--accent-moss);
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    .copy-tip[data-visible] { opacity: 1; }
+    .copy-tip[data-error] { color: var(--accent-warm); }
+    @media (prefers-reduced-motion: reduce) {
+      .btn-primary, .btn-secondary, .copy-tip { transition: none; }
+    }
+    .code-box {
+      margin-top: 16px;
+      padding: 10px 12px;
+      background-color: var(--bg-archive);
+      border: 1px solid var(--border-subtle);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--ink-muted);
+      word-break: break-all;
+      user-select: all;
+    }
+    .colophon {
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-subtle);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 11px;
+      line-height: 1.6;
+      color: var(--ink-muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <div class="kicker">Vesper Auth · 通行证核验通过</div>
+    <h1>正在唤起《散页》{{.PlatformLabel}}</h1>
+    <p class="desc">
+      主理人身份已核验完毕。系统已签发一枚 {{.ExpiresSeconds}} 秒内单次有效的配对工单，正在自动唤起本地客户端完成设备钥匙落盘。
+    </p>
+
+    <div class="actions">
+      <a id="open-app-link" class="btn-primary" href="{{.DeepLinkURL}}">打开《散页》完成授权</a>
+      <button id="copy-deeplink-btn" type="button" class="btn-secondary" command="--copy" commandfor="deeplink-code">复制一次性授权深链</button>
+    </div>
+    <p id="copy-tip" class="copy-tip" role="status" aria-live="polite"></p>
+
+    <div class="code-box"><code id="deeplink-code">{{.DeepLinkText}}</code></div>
+
+    <div class="colophon">
+      <div>中枢地址：{{.HubURL}}</div>
+      <div>若浏览器未自动弹出应用打开提示，请点击上方按钮，或复制深链回到《散页》客户端粘贴接入。</div>
+    </div>
+  </main>
+
+  <script nonce="{{.CSPNonce}}">
+    (function () {
+      var openLink = document.getElementById('open-app-link');
+      var tip = document.getElementById('copy-tip');
+      var lastMessage = '';
+      var tipTimer = null;
+
+      function legacyCopy(text) {
+        var field = document.createElement('textarea');
+        field.value = text;
+        field.setAttribute('readonly', '');
+        field.style.position = 'fixed';
+        field.style.insetBlockStart = '0';
+        field.style.opacity = '0';
+        document.body.appendChild(field);
+        field.select();
+        try {
+          return document.execCommand('copy');
+        } finally {
+          field.remove();
+        }
+      }
+
+      function report(button, ok) {
+        if (tipTimer) clearTimeout(tipTimer);
+        button.removeAttribute('data-copied');
+        button.removeAttribute('data-failed');
+        tip.removeAttribute('data-visible');
+        tip.removeAttribute('data-error');
+
+        var msg = ok ? '已复制一次性授权深链，请回到《散页》粘贴完成绑定' : '浏览器拒绝剪贴板写入，请长按或全选下方深链手动复制';
+        if (msg === lastMessage) msg += '\u00A0';
+        lastMessage = msg;
+
+        button.setAttribute(ok ? 'data-copied' : 'data-failed', '');
+        if (!ok) tip.setAttribute('data-error', '');
+        tip.textContent = msg;
+        tip.setAttribute('data-visible', '');
+
+        tipTimer = setTimeout(function () {
+          button.removeAttribute('data-copied');
+          button.removeAttribute('data-failed');
+          tip.removeAttribute('data-visible');
+          tip.removeAttribute('data-error');
+          tip.textContent = '';
+        }, 3200);
+      }
+
+      async function performCopy(button, target) {
+        if (!target) return;
+        var text = (target.innerText || target.textContent || '').trim();
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          report(button, true);
+        } catch (_err) {
+          if (legacyCopy(text)) {
+            report(button, true);
+          } else {
+            report(button, false);
+          }
+        }
+      }
+
+      if ('CommandEvent' in window) {
+        document.addEventListener('command', function (event) {
+          if (event.command && event.command.indexOf('--copy') === 0) {
+            performCopy(event.source, event.target);
+          }
+        }, true);
+      } else {
+        document.addEventListener('click', function (event) {
+          var btn = event.target && event.target.closest ? event.target.closest('button[command^="--copy"]') : null;
+          if (!btn) return;
+          var target = document.getElementById(btn.getAttribute('commandfor'));
+          performCopy(btn, target);
+        });
+      }
+
+      if (openLink) {
+        var href = openLink.getAttribute('href');
+        if (href && href.indexOf('looseleaf://pair?') === 0) {
+          window.requestAnimationFrame(function () {
+            window.location.assign(href);
+          });
+        }
+      }
+    })();
+  </script>
+</body>
+</html>

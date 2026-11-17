@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -303,7 +304,11 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if !strings.Contains(res.Data.QRPayload, "100.112.108.52:8088") || !strings.HasPrefix(res.Data.QRCodeDataURL, "data:image/png;base64,") {
+		parsedQR, parseErr := url.Parse(res.Data.QRPayload)
+		if parseErr != nil ||
+			parsedQR.Query().Get("hub") != "http://100.112.108.52:8088" ||
+			parsedQR.Query().Get("ticket") != ticketStr ||
+			!strings.HasPrefix(res.Data.QRCodeDataURL, "data:image/png;base64,") {
 			t.Fatalf("unexpected QR payload or data URL: %+v", res.Data)
 		}
 	})

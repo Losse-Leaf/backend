@@ -6,6 +6,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -117,10 +118,9 @@ func UnifiedUploadFile(c *gin.Context) {
 		return
 	}
 
-	// 访问 URL：「本地磁盘为主」策略下走中枢自己的 /media 路由（同机直读），
+	// 访问 URL：「本地磁盘为主」策略下走中枢自己的 /media 路由（同机直读，避免无谓 R2 预签名），
 	// 本地没有该对象时才回落 R2 预签名地址。
-	signedURL := storage.SignResourceURL(objectKey)
-	_, expiresIn, _ := storage.GeneratePresignedGetURL(objectKey)
+	signedURL, expiresIn := storage.SignResourceWithTTL(objectKey)
 	if signedURL == "" {
 		signedURL = storage.GetPublicURL(objectKey)
 	}
@@ -248,25 +248,8 @@ func SignFilesBatch(c *gin.Context) {
 			continue
 		}
 
-		// 关键：本地磁盘为主时，签名走**本机媒体签名**，
-		// 而不是只走 R2 预签名，避免「本机为主、R2 仅备份」的部署下
-		// `GeneratePresignedGetURL` 报错回落到无签名地址。
-		var signedURL string
-		var expiresIn int
-		if storage.ObjectExistsLocally(cleanKey) {
-			signedURL = storage.SignLocalMediaURL(cleanKey, customDuration)
-			expiresIn = int(storage.LocalMediaSignatureTTL().Seconds())
-		} else {
-			url, exp, err := storage.GeneratePresignedGetURL(cleanKey, customDuration)
-			if err != nil {
-				// 换签失败不致命：回落到公开地址，让客户端自己判断能不能用
-				signedURL = storage.GetPublicURL(cleanKey)
-				exp = 0
-			} else {
-				signedURL = url
-				expiresIn = exp
-			}
-		}
+		// 关键：统一遵循 storage.LocalPrimaryEnabled() 与本地存在性判定签发本机 /media 签名或 R2 预签名。
+		signedURL, expiresIn := storage.SignResourceWithTTL(cleanKey, customDuration)
 		results = append(results, Item{
 			ObjectKey:    cleanKey,
 			URL:          signedURL,
@@ -278,4 +261,138 @@ func SignFilesBatch(c *gin.Context) {
 	Success(c, gin.H{
 		"items": results,
 	})
+}
+
+type PresignRequest struct {
+	Filename    string `json:"filename" binding:"required"`
+	ContentType string `json:"content_type" binding:"required"`
+	Size        int64  `json:"size" binding:"required"`
+}
+
+// PresignUpload 生成 Presigned PUT URL
+func PresignUpload(c *gin.Context) {
+	var req PresignRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "缺少必要的文件信息 (filename, content_type, size)")
+		return
+	}
+
+	maxSize := int64(50 * 1024 * 1024)
+	if req.Size > maxSize {
+		Error(c, http.StatusBadRequest, "文件过大，单文件上传限制 50MB")
+		return
+	}
+
+	ct := strings.ToLower(req.ContentType)
+	if !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(ct, "video/") && ct != "application/pdf" {
+		Error(c, http.StatusBadRequest, "目前仅支持上传图片或媒体文件")
+		return
+	}
+
+	uploadID, objectKey, presignedURL, expiresIn, err := storage.GeneratePresignedPutURL(req.Filename, req.ContentType, req.Size)
+	if err != nil {
+		Error(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	Success(c, gin.H{
+		"upload_id":  uploadID,
+		"object_key": objectKey,
+		"upload_url": presignedURL,
+		"expires_in": expiresIn,
+	})
+}
+
+type CompleteUploadRequest struct {
+	UploadID         string `json:"upload_id"`
+	ObjectKey        string `json:"object_key" binding:"required"`
+	OriginalFilename string `json:"original_filename"`
+	MimeType         string `json:"mime_type"`
+	Size             int64  `json:"size"`
+	Width            int    `json:"width"`
+	Height           int    `json:"height"`
+}
+
+// CompleteUpload 确认上传完成并创建 Attachment 实体
+func CompleteUpload(c *gin.Context) {
+	var req CompleteUploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "缺少 object_key")
+		return
+	}
+
+	cleanUploadID := strings.TrimSpace(req.UploadID)
+	if cleanUploadID != "" && len(cleanUploadID) >= 8 {
+		if !strings.Contains(req.ObjectKey, cleanUploadID[:8]) {
+			Error(c, http.StatusBadRequest, "上传凭证 upload_id 与目标资源路径不匹配")
+			return
+		}
+	}
+
+	if storage.IsConfigured() {
+		realSize, realContentType, err := storage.VerifyObjectExists(req.ObjectKey)
+		if err != nil {
+			Error(c, http.StatusBadRequest, "存储端未检测到上传的文件，请重试")
+			return
+		}
+		if realSize > 0 {
+			req.Size = realSize
+		}
+		if realContentType != "" {
+			req.MimeType = realContentType
+		}
+
+		if storage.LocalPrimaryEnabled() {
+			if err := storage.MirrorObjectToLocal(c.Request.Context(), req.ObjectKey); err != nil {
+				log.Printf("[storage] 直传对象同步回本地失败（将回落 R2 读取）：key=%s err=%v", req.ObjectKey, err)
+			}
+		}
+	}
+
+	att := models.Attachment{
+		ObjectKey:        req.ObjectKey,
+		OriginalFilename: req.OriginalFilename,
+		MimeType:         req.MimeType,
+		Size:             req.Size,
+		Width:            req.Width,
+		Height:           req.Height,
+	}
+
+	if err := db.DB.Create(&att).Error; err != nil {
+		Error(c, http.StatusInternalServerError, "创建附件记录失败")
+		return
+	}
+
+	att.URL = storage.SignResourceURL(att.ObjectKey)
+	att.ThumbnailURL = ThumbnailURLFor(att.ObjectKey, 0)
+	Success(c, att)
+}
+
+type CleanupUploadRequest struct {
+	ObjectKeys []string `json:"object_keys" binding:"required"`
+}
+
+// CleanupUpload 清理未保存引用的孤立上传对象
+func CleanupUpload(c *gin.Context) {
+	var req CleanupUploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		Error(c, http.StatusBadRequest, "缺少 object_keys")
+		return
+	}
+
+	cleaned := 0
+	for _, key := range req.ObjectKeys {
+		if key != "" {
+			var att models.Attachment
+			if err := db.DB.Where(
+				"object_key = ? AND entry_id IS NULL AND wish_id IS NULL AND footprint_id IS NULL", key,
+			).First(&att).Error; err == nil {
+				_ = storage.DeleteObject(key)
+				db.DB.Delete(&att)
+				cleaned++
+			}
+		}
+	}
+
+	Success(c, gin.H{"cleaned_count": cleaned})
 }

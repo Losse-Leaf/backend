@@ -99,22 +99,7 @@ func ClaimDevice(c *gin.Context) {
 	if platform == "" {
 		platform = "web"
 	}
-	deviceName := strings.TrimSpace(req.DeviceName)
-	if deviceName == "" {
-		deviceName = "Web 浏览器 · 首次认领"
-	}
-
-	rawDeviceToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
-	device := models.Device{
-		DeviceID:     fmt.Sprintf("dev_%s_%s_%s", platform, now.Format("20060102"), generateRandomHex(2)),
-		Name:         deviceName,
-		Platform:     platform,
-		DeviceModel:  strings.TrimSpace(req.DeviceModel),
-		TokenHash:    middleware.HashToken(rawDeviceToken),
-		Status:       "active",
-		PairedAt:     now,
-		LastActiveAt: now,
-	}
+	device, rawDeviceToken := mintTrustedDevice(platform, "Web 浏览器 · 首次认领", req.DeviceName, req.DeviceModel, now)
 
 	// 条件更新 initialized=false -> true，防止并发双认领；
 	// 设备创建与状态翻转在同一事务里，任一失败都整体回滚。

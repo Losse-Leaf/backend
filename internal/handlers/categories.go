@@ -220,7 +220,15 @@ func UpdateCategory(c *gin.Context) {
 func cascadeRenameCategoryRecords(tx *gorm.DB, scope, oldName, newName string) error {
 	switch scope {
 	case "expense":
-		return tx.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", oldName).Update("category", newName).Error
+		if err := tx.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", oldName).Update("category", newName).Error; err != nil {
+			return err
+		}
+		if tx.Migrator().HasTable(&models.InstallmentPlan{}) {
+			if err := tx.Model(&models.InstallmentPlan{}).Where("category_name = ?", oldName).Update("category_name", newName).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	case "income":
 		return tx.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName).Error
 	case "payment":
@@ -255,6 +263,11 @@ func countCategoryRecordsInUse(scope, name string) int64 {
 	switch scope {
 	case "expense":
 		db.DB.Model(&models.Transaction{}).Where("type = 'expense' AND category = ?", name).Count(&total)
+		if db.DB.Migrator().HasTable(&models.InstallmentPlan{}) {
+			var planCount int64
+			db.DB.Model(&models.InstallmentPlan{}).Where("category_name = ?", name).Count(&planCount)
+			total += planCount
+		}
 	case "income":
 		db.DB.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", name).Count(&total)
 	case "payment":

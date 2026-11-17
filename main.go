@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -266,7 +265,7 @@ func main() {
 			// 主理人系统版本更新检查 (需管理员鉴权，访客零感知)
 			write.GET("/system/update-check", handlers.CheckSystemUpdate)
 
-			// 自动与手动全量备份 (ZIP 格式，最多保留 7 份)
+			// 自动与手动全量备份 (ZIP 格式，最多保留 12 份)
 			write.POST("/system/backup/now", handlers.CreateBackupNow)
 			write.GET("/system/backup/list", handlers.GetBackupList)
 			write.GET("/system/backup/download/:filename", handlers.DownloadBackup)
@@ -285,28 +284,13 @@ func main() {
 	r.GET("/api/health", handlers.HealthCheck)
 	r.GET("/health", handlers.HealthCheck)
 
-	// 7. 本地媒体静态托管
-	//
-	// 关键：目录必须与 `storage.GetLocalUploadDir()` **完全一致**且是绝对路径。
-	// 「本地磁盘为主」策略下，附件 URL 会直接指向本路由（/media/<object_key>），
-	// 客户端由此同机直读，不必绕道对象存储。
-	// 早先这里写的是相对路径 `data/uploads`，与进程工作目录耦合，
-	// 一旦以 systemd / 容器方式启动，静态路由与实际写入目录就会错位。
-	uploadsDir, err := filepath.Abs(storage.GetLocalUploadDir())
-	if err != nil {
-		uploadsDir = filepath.Join("data", "uploads")
-	}
-	_ = os.MkdirAll(uploadsDir, 0700)
-	// 关键：媒体路由**带签名校验**（原先是无鉴权的静态托管 ——
-	// 任何知道中枢地址的人都能翻阅全部照片）。
-	// 放行条件：URL 自带有效签名，或携带有效的设备令牌 / 会话 Cookie。
-	// ServeLocalMedia 会查库鉴权，因此同样受数据库生命周期准入保护。
+	// 7. 本地媒体托管（带签名校验或有效设备会话鉴权，受数据库生命周期准入保护）
 	r.GET("/media/*filepath", lifecycleGuard(), handlers.ServeLocalMedia)
 
 	// 8. 前端静态文件托管（支持 //go:embed 单二进制内嵌与本地磁盘双模，docs/ecosystem.md §10.4）
 	setupFrontendStaticServing(r)
 
-	// 9. 启动每日自动定时备份任务 (北京时间 03:30)
+	// 9. 启动每 6 小时自动定时备份任务
 	backup.StartDailyBackupScheduler()
 
 	listenAddr := fmt.Sprintf("%s:%s", cfg.ListenHost, cfg.Port)

@@ -1,18 +1,14 @@
 package handlers
 
 import (
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"image/color"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
@@ -21,44 +17,6 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 	"gorm.io/gorm"
 )
-
-// generateRandomHex 生成 n 字节随机十六进制串
-func generateRandomHex(n int) string {
-	bytes := make([]byte, n)
-	if _, err := rand.Read(bytes); err != nil {
-		return fmt.Sprintf("%x", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(bytes)
-}
-
-func resolveHubURL(c *gin.Context) string {
-	if siteURL := strings.TrimRight(strings.TrimSpace(config.AppConfig.SiteURL), "/"); siteURL != "" {
-		return siteURL
-	}
-	scheme := "http"
-	if middleware.IsSecureRequest(c) {
-		scheme = "https"
-	} else if c != nil && c.Request != nil {
-		if proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); proto != "" {
-			first := strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
-			if first == "http" || first == "https" {
-				scheme = first
-			}
-		}
-	}
-	var host string
-	if c != nil && c.Request != nil {
-		if xfHost := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); xfHost != "" {
-			host = strings.TrimSpace(strings.Split(xfHost, ",")[0])
-		} else {
-			host = strings.TrimSpace(c.Request.Host)
-		}
-	}
-	if host == "" {
-		host = "localhost:8088"
-	}
-	return fmt.Sprintf("%s://%s", scheme, host)
-}
 
 // generateQRCodeDataURL 生成散页纸墨风 base64 PNG Data URL 二维码 (RG-02, BE-20)
 // 前景墨色: 深暖墨黑 #181716 (R:24, G:23, B:22)
@@ -82,8 +40,7 @@ func generateQRCodeDataURL(content string) string {
 // ==========================================
 
 type InitPairingRequest struct {
-	HubURL     string `json:"hub_url"`
-	DeviceHint string `json:"device_hint"`
+	HubURL string `json:"hub_url"`
 }
 
 // InitPairing 签发 5 分钟有效期的配对工单（智能避开 localhost 回环，优先选用 Tailscale / 局域网 Wi-Fi IP）
@@ -93,30 +50,20 @@ func InitPairing(c *gin.Context) {
 
 	smartHubURL, candidates := ResolveSmartHubURL(req.HubURL, c)
 
-	ticketStr := fmt.Sprintf("pair_tk_%s", generateRandomHex(6))
 	expiresIn := 300 // 5 分钟
-	expiresAt := time.Now().Add(time.Duration(expiresIn) * time.Second)
-
-	ticket := models.PairTicket{
-		Ticket:    ticketStr,
-		PinCode:   "",
-		HubURL:    smartHubURL,
-		ExpiresAt: expiresAt,
-		Used:      false,
-	}
-
-	if err := db.DB.Create(&ticket).Error; err != nil {
+	ticket, err := issuePairTicket(db.DB, smartHubURL, time.Duration(expiresIn)*time.Second)
+	if err != nil {
 		Error(c, http.StatusInternalServerError, "生成配对工单失败: "+err.Error())
 		return
 	}
 
-	qrPayload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", smartHubURL, ticketStr)
+	qrPayload := buildPairDeepLink(smartHubURL, ticket.Ticket)
 	qrDataURL := generateQRCodeDataURL(qrPayload)
 
 	Success(c, gin.H{
-		"ticket":             ticketStr,
+		"ticket":             ticket.Ticket,
 		"hub_url":            smartHubURL,
-		"expires_at":         expiresAt.Format(time.RFC3339),
+		"expires_at":         ticket.ExpiresAt.Format(time.RFC3339),
 		"expires_in_seconds": expiresIn,
 		"qr_payload":         qrPayload,
 		"qr_code_data_url":   qrDataURL,
@@ -133,7 +80,7 @@ func RenderPairQRCode(c *gin.Context) {
 		return
 	}
 
-	payload := fmt.Sprintf("looseleaf://pair?hub=%s&ticket=%s", hubURL, ticket)
+	payload := buildPairDeepLink(hubURL, ticket)
 	dataURL := generateQRCodeDataURL(payload)
 
 	Success(c, gin.H{
@@ -167,8 +114,27 @@ var pairLimiter = &ipAttemptTracker{
 func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window time.Duration) bool {
 	l.Lock()
 	defer l.Unlock()
+	if maxAttempts <= 0 {
+		return false
+	}
 	now := time.Now()
 	cutoff := now.Add(-window)
+	// 容量超过阈值时顺带清扫所有 IP 的过期记录，避免大量一次性 IP 导致 map 无界增长 (BE-33)
+	if len(l.attempts) > 256 {
+		for k, ts := range l.attempts {
+			kept := ts[:0]
+			for _, t := range ts {
+				if t.After(cutoff) {
+					kept = append(kept, t)
+				}
+			}
+			if len(kept) == 0 {
+				delete(l.attempts, k)
+			} else {
+				l.attempts[k] = kept
+			}
+		}
+	}
 	times := l.attempts[ip]
 	valid := times[:0]
 	for _, t := range times {
@@ -176,21 +142,11 @@ func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window tim
 			valid = append(valid, t)
 		}
 	}
-	// 窗口内已无有效尝试时回收该 IP 的键，避免 map 随不同 IP 无界增长 (BE-33)
-	if len(valid) == 0 {
-		delete(l.attempts, ip)
-		if len(valid) >= maxAttempts {
-			return false
-		}
-		l.attempts[ip] = append(valid, now)
-		return true
-	}
 	if len(valid) >= maxAttempts {
 		l.attempts[ip] = valid
 		return false
 	}
-	valid = append(valid, now)
-	l.attempts[ip] = valid
+	l.attempts[ip] = append(valid, now)
 	return true
 }
 
@@ -243,30 +199,7 @@ func ConfirmPairing(c *gin.Context) {
 		return
 	}
 
-	platform := strings.ToLower(strings.TrimSpace(req.Platform))
-	if platform == "" {
-		platform = "device"
-	}
-	dateTag := now.Format("20060102")
-	deviceID := fmt.Sprintf("dev_%s_%s_%s", platform, dateTag, generateRandomHex(2))
-	rawDeviceToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
-	tokenHash := middleware.HashToken(rawDeviceToken)
-
-	deviceName := strings.TrimSpace(req.DeviceName)
-	if deviceName == "" {
-		deviceName = fmt.Sprintf("受信任的 %s 设备", strings.ToUpper(platform))
-	}
-
-	device := models.Device{
-		DeviceID:     deviceID,
-		Name:         deviceName,
-		Platform:     platform,
-		DeviceModel:  strings.TrimSpace(req.DeviceModel),
-		TokenHash:    tokenHash,
-		Status:       "active",
-		PairedAt:     now,
-		LastActiveAt: now,
-	}
+	device, rawDeviceToken := mintTrustedDevice(req.Platform, "", req.DeviceName, req.DeviceModel, now)
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		// 事务内**条件核销**：UPDATE pair_tickets SET used=1, ... WHERE ticket=? AND used=0。

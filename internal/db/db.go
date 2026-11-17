@@ -125,7 +125,7 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	// 必须存在、还款日单源化。幂等确保行存在；还款日取现存 custom 账目的众数（历史口径）。
 	EnsureCustomInstallmentChannel(database)
 	// 「好物购置」为心愿归册自动账单的生成分类（wishes.go ResolveWish），
-	// 存量库 targeted 补种（SeedDefaultCategories 的 force=false 只补空 scope），
+	// 存量库 targeted 补种（SeedDefaultCategories 只补空 scope），
 	// 否则分类字典收口后历史心愿账目在编辑时会被 400。
 	var goodBuyCount int64
 	database.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", "expense", "好物购置").Count(&goodBuyCount)
@@ -195,44 +195,27 @@ var DefaultCategoriesMap = map[string][]string{
 	"project": {"开源项目", "独立开发", "硬件改造", "设计作品", "写作出版"},
 }
 
-// SeedDefaultCategories 为空态或指定 scope 补充预置分类字典
-func SeedDefaultCategories(database *gorm.DB, targetScope string, forceRestore bool) {
+// SeedDefaultCategories 为空态 scope 补充预置分类字典
+func SeedDefaultCategories(database *gorm.DB) {
 	scopes := []string{"expense", "income", "gear", "payment", "project"}
 	for _, sc := range scopes {
-		if targetScope != "" && targetScope != sc {
+		var cnt int64
+		database.Model(&models.CategoryOption{}).Where("scope = ?", sc).Count(&cnt)
+		if cnt > 0 {
 			continue
 		}
 		defaults := DefaultCategoriesMap[sc]
-		if !forceRestore {
-			var cnt int64
-			database.Model(&models.CategoryOption{}).Where("scope = ?", sc).Count(&cnt)
-			if cnt > 0 {
-				continue
-			}
-			batch := make([]models.CategoryOption, 0, len(defaults))
-			for idx, name := range defaults {
-				batch = append(batch, models.CategoryOption{
-					Scope:     sc,
-					Name:      name,
-					SortOrder: (idx + 1) * 10,
-					IsBuiltin: true,
-				})
-			}
-			if len(batch) > 0 {
-				database.Create(&batch)
-			}
-			continue
-		}
+		batch := make([]models.CategoryOption, 0, len(defaults))
 		for idx, name := range defaults {
-			var existing models.CategoryOption
-			if err := database.Where("scope = ? AND name = ?", sc, name).Limit(1).Find(&existing).Error; err == nil && existing.ID == 0 {
-				database.Create(&models.CategoryOption{
-					Scope:     sc,
-					Name:      name,
-					SortOrder: (idx + 1) * 10,
-					IsBuiltin: true,
-				})
-			}
+			batch = append(batch, models.CategoryOption{
+				Scope:     sc,
+				Name:      name,
+				SortOrder: (idx + 1) * 10,
+				IsBuiltin: true,
+			})
+		}
+		if len(batch) > 0 {
+			database.Create(&batch)
 		}
 	}
 }
@@ -299,7 +282,7 @@ func seedData(database *gorm.DB) {
 	}
 
 	// 4. 初始化五大模块的默认分类字典
-	SeedDefaultCategories(database, "", false)
+	SeedDefaultCategories(database)
 
 	log.Println("Database schema and core configurations ready.")
 }

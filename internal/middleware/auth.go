@@ -151,13 +151,24 @@ func isLoopbackBridgeAuthorized(c *gin.Context) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
-// IsAdmin 判定当前请求是否具备主理人权限（支持受信任设备凭证与纯本机安全回环桥接）
-func IsAdmin(c *gin.Context) bool {
-	if authType, exists := c.Get("auth_type"); exists && (authType == "device" || authType == "bridge") {
-		return true
+// authenticateRequest 统一鉴权判定（支持本机安全回环桥接与受信任设备子钥匙）。
+// 当 applyContext 为 true 时，同步写入 Gin 上下文并按 60 秒节流刷新设备最后活跃时间。
+func authenticateRequest(c *gin.Context, applyContext bool) bool {
+	if c == nil {
+		return false
+	}
+	if !applyContext {
+		if authType, exists := c.Get("auth_type"); exists && (authType == "device" || authType == "bridge") {
+			return true
+		}
 	}
 
 	if isLoopbackBridgeAuthorized(c) {
+		if applyContext {
+			c.Set("auth_type", "bridge")
+			c.Set("device_id", "bridge_loopback")
+			c.Set("device_name", "BotHub Loopback Bridge")
+		}
 		return true
 	}
 
@@ -167,12 +178,30 @@ func IsAdmin(c *gin.Context) bool {
 	}
 
 	tHash := HashToken(token)
-	var count int64
-	if err := db.DB.Model(&models.Device{}).Where("token_hash = ? AND status = 'active'", tHash).Count(&count).Error; err == nil && count > 0 {
-		return true
+	var device models.Device
+	if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).Limit(1).Find(&device).Error; err != nil || device.ID == 0 {
+		return false
 	}
 
-	return false
+	if applyContext {
+		// 最近活跃时间在请求内同步更新（60 秒节流 BE-03）。
+		// 不能放进 goroutine：它可能活过整库恢复，把旧设备写进新库，
+		// 或是撞上正在关闭的连接池。
+		now := time.Now()
+		if now.Sub(device.LastActiveAt) > time.Minute {
+			_ = db.DB.Model(&models.Device{}).Where("id = ?", device.ID).Update("last_active_at", now).Error
+		}
+
+		c.Set("auth_type", "device")
+		c.Set("device_id", device.DeviceID)
+		c.Set("device_name", device.Name)
+	}
+	return true
+}
+
+// IsAdmin 判定当前请求是否具备主理人权限（支持受信任设备凭证与纯本机安全回环桥接）
+func IsAdmin(c *gin.Context) bool {
+	return authenticateRequest(c, false)
 }
 
 // AdminAuthRequired 管理员写操作与私密接口鉴权中间件 (BE-18)
@@ -180,34 +209,9 @@ func IsAdmin(c *gin.Context) bool {
 // 或经严格安全边界核验的同机 BotHub 回环桥接令牌。
 func AdminAuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if isLoopbackBridgeAuthorized(c) {
-			c.Set("auth_type", "bridge")
-			c.Set("device_id", "bridge_loopback")
-			c.Set("device_name", "BotHub Loopback Bridge")
+		if authenticateRequest(c, true) {
 			c.Next()
 			return
-		}
-
-		token := ExtractToken(c)
-
-		if token != "" && db.DB != nil {
-			tHash := HashToken(token)
-			var device models.Device
-			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).Limit(1).Find(&device).Error; err == nil && device.ID > 0 {
-				// 最近活跃时间在请求内同步更新（60 秒节流 BE-03）。
-				// 不能放进 goroutine：它可能活过整库恢复，把旧设备写进新库，
-				// 或是撞上正在关闭的连接池。
-				now := time.Now()
-				if now.Sub(device.LastActiveAt) > time.Minute {
-					_ = db.DB.Model(&models.Device{}).Where("id = ?", device.ID).Update("last_active_at", now).Error
-				}
-
-				c.Set("auth_type", "device")
-				c.Set("device_id", device.DeviceID)
-				c.Set("device_name", device.Name)
-				c.Next()
-				return
-			}
 		}
 
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{

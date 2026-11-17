@@ -45,13 +45,7 @@ func populateWishURLs(w *models.Wish) {
 		db.DB.Where("wish_id = ?", w.ID).Order("id ASC").Find(&atts)
 		w.Attachments = atts
 	}
-	if w.Attachments == nil {
-		w.Attachments = []models.Attachment{}
-	}
-	for i := range w.Attachments {
-		w.Attachments[i].URL = storage.SignResourceURL(w.Attachments[i].ObjectKey)
-		w.Attachments[i].ThumbnailURL = ThumbnailURLFor(w.Attachments[i].ObjectKey, 0)
-	}
+	w.Attachments = populateAttachmentURLs(w.Attachments)
 }
 
 // populateWishURLsBatch 批量填充一组心愿的参考图 (BE-30)
@@ -76,15 +70,7 @@ func populateWishURLsBatch(wishes []models.Wish) {
 		}
 	}
 	for i := range wishes {
-		atts := attMap[wishes[i].ID]
-		if atts == nil {
-			atts = []models.Attachment{}
-		}
-		for j := range atts {
-			atts[j].URL = storage.SignResourceURL(atts[j].ObjectKey)
-			atts[j].ThumbnailURL = ThumbnailURLFor(atts[j].ObjectKey, 0)
-		}
-		wishes[i].Attachments = atts
+		wishes[i].Attachments = populateAttachmentURLs(attMap[wishes[i].ID])
 	}
 }
 
@@ -200,7 +186,7 @@ func GetWishes(c *gin.Context) {
 	}
 	role := PublicModuleETagSuffix(isAdmin)
 	// Vary 必须在任何 304 分支之前写出，避免共享缓存把访客/管理员响应混用。
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 
 	// BE-2：聚合与 304 协商前置；ETag 混入角色，防止跨权限缓存污染 (BE-17)。
 	agg, err := aggregateListQuery(query)
@@ -222,33 +208,33 @@ func GetWishes(c *gin.Context) {
 
 	// P2-3：只在增量第一页注入 purge 墓碑。
 	if page == 1 && sinceStr != "" {
-		if err := injectWishTombstones(&wishes, sinceStr); err != nil {
+		if err := injectTombstones(&wishes, TombstoneEntityWish, sinceStr,
+			func(w models.Wish) uint { return w.ID },
+			func(id uint, deletedAt time.Time) models.Wish {
+				return models.Wish{
+					ID:        id,
+					CreatedAt: deletedAt,
+					UpdatedAt: deletedAt,
+					DeletedAt: gorm.DeletedAt{Time: deletedAt, Valid: true},
+				}
+			},
+		); err != nil {
 			Error(c, http.StatusInternalServerError, "获取心愿列表失败")
 			return
 		}
 	}
 
 	populateWishURLsBatch(wishes)
-	for i := range wishes {
-		// 访客模式财务隐私严格脱敏 (BE-14)
-		if !isAdmin {
-			wishes[i].ActualCost = 0
-			wishes[i].TransactionID = nil
-			wishes[i].GearID = nil
+	if !isAdmin {
+		for i := range wishes {
+			redactEmbeddedWishFinances(&wishes[i])
 		}
 	}
 
 	// MOB-P1-36：服务端权威增量游标（保持本页语义）
-	var pageMaxUpdated time.Time
-	for _, w := range wishes {
-		if w.UpdatedAt.After(pageMaxUpdated) {
-			pageMaxUpdated = w.UpdatedAt
-		}
-		if w.DeletedAt.Valid && w.DeletedAt.Time.After(pageMaxUpdated) {
-			pageMaxUpdated = w.DeletedAt.Time
-		}
-	}
-	setSyncCursor(c, pageMaxUpdated)
+	setSyncCursor(c, computeSyncCursor(wishes, func(w models.Wish) (time.Time, gorm.DeletedAt) {
+		return w.UpdatedAt, w.DeletedAt
+	}))
 
 	Success(c, gin.H{
 		"total":     agg.Total,
@@ -278,11 +264,9 @@ func GetWishByID(c *gin.Context) {
 		return
 	}
 	populateWishURLs(&w)
-	c.Header("Vary", "Authorization, X-Device-Token, Cookie")
+	setAuthVaryHeader(c)
 	if !isAdmin {
-		w.ActualCost = 0
-		w.TransactionID = nil
-		w.GearID = nil
+		redactEmbeddedWishFinances(&w)
 	}
 	Success(c, w)
 }
@@ -298,18 +282,11 @@ func CreateWish(c *gin.Context) {
 	// 契约 B：幂等创建。同一 client_request_id 的重复提交（重试/重放）直接返回已有记录，
 	// 不重复落库；并发窗口由 client_request_id 唯一索引兜底（插入冲突后回读返回）。
 	clientRequestID := strings.TrimSpace(req.ClientRequestID)
-	if clientRequestID != "" {
-		var existing models.Wish
-		if err := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
-			c.Header("X-Idempotent-Replay", "true")
-			if existing.DeletedAt.Valid {
-				Error(c, http.StatusGone, "记录已在服务端被删除")
-				return
-			}
-			populateWishURLs(&existing)
-			Success(c, existing)
-			return
-		}
+	if existing, deleted, ok := findIdempotentReplay[models.Wish](clientRequestID, func(w *models.Wish) (uint, bool) {
+		return w.ID, w.DeletedAt.Valid
+	}); ok {
+		replyIdempotentHit(c, existing, deleted, populateWishURLs)
+		return
 	}
 
 	var targetDate *time.Time
@@ -375,19 +352,10 @@ func CreateWish(c *gin.Context) {
 			return err
 		}
 
-		entryContent := wish.Note
-		if entryContent == "" {
-			if wish.Spec != "" {
-				entryContent = fmt.Sprintf("许下心愿「%s」（%s）。", wish.Title, wish.Spec)
-			} else {
-				entryContent = fmt.Sprintf("许下心愿「%s」，期待日后圆满归册。", wish.Title)
-			}
-		}
-
 		companionEntry := models.LifeEntry{
 			Type:    "wish",
-			Title:   "许下心愿 · " + wish.Title,
-			Content: entryContent,
+			Title:   companionWishPlantedTitlePrefix + wish.Title,
+			Content: buildWishCompanionContent(wish),
 			// 关键：伴生散页落在**实际许下的时刻**，补档的心愿才会出现在时间流的正确位置
 			OccurredAt: plantedMoment,
 			Location:   wish.CityName,
@@ -417,18 +385,11 @@ func CreateWish(c *gin.Context) {
 	})
 	if err != nil {
 		// 并发重复提交：唯一索引兜底，回读已有记录按幂等语义返回。
-		if clientRequestID != "" {
-			var existing models.Wish
-			if e2 := db.DB.Unscoped().Where("client_request_id = ?", clientRequestID).Limit(1).Find(&existing).Error; e2 == nil && existing.ID > 0 {
-				c.Header("X-Idempotent-Replay", "true")
-				if existing.DeletedAt.Valid {
-					Error(c, http.StatusGone, "记录已在服务端被删除")
-					return
-				}
-				populateWishURLs(&existing)
-				Success(c, existing)
-				return
-			}
+		if existing, deleted, ok := findIdempotentReplay[models.Wish](clientRequestID, func(w *models.Wish) (uint, bool) {
+			return w.ID, w.DeletedAt.Valid
+		}); ok {
+			replyIdempotentHit(c, existing, deleted, populateWishURLs)
+			return
 		}
 		if errors.Is(err, errAttachmentClaimConflict) {
 			Error(c, http.StatusBadRequest, "创建心愿失败: "+err.Error())
@@ -586,7 +547,7 @@ func UpdateWish(c *gin.Context) {
 			}
 			companionEntry := models.LifeEntry{
 				Type:       entryType,
-				Title:      "心愿达成 · " + wish.Title,
+				Title:      companionWishFulfilledTitlePrefix + wish.Title,
 				Content:    entryContent,
 				OccurredAt: fulfilledTime,
 				Location:   wish.CityName,
@@ -857,11 +818,7 @@ func ResolveWish(c *gin.Context) {
 			if gearName == "" {
 				gearName = wish.Title
 			}
-			gearID := fmt.Sprintf("gear_%s", generateRandomHex(8))
-			wish.GearID = &gearID
-
-			newGear := models.GearItem{
-				ID:           gearID,
+			createdGear, err := appendGearItemTx(tx, models.GearItem{
 				Name:         gearName,
 				Spec:         wish.Spec,
 				Category:     "数码器材",
@@ -869,17 +826,12 @@ func ResolveWish(c *gin.Context) {
 				PriceCents:   req.ActualCost,
 				PurchaseDate: fulfilledAt.In(config.BeijingLocation).Format("2006-01-02"),
 				Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
+			}, fulfilledAt, wish.IsPrivate, false)
+			if err != nil {
+				return err
 			}
-
-			// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)：调用方已在事务外持有
-			// profileGearMu（见函数开头），写入仍在当前事务内保持原子。
-			var profile models.CuratorProfile
-			if err := tx.First(&profile).Error; err == nil {
-				list := append(loadProfileGear(&profile), newGear)
-				if err := saveProfileGearWith(tx, &profile, list); err != nil {
-					return err
-				}
-			}
+			gearID := createdGear.ID
+			wish.GearID = &gearID
 		}
 
 		if createdTx != nil && req.IsInstallment {
@@ -918,7 +870,7 @@ func ResolveWish(c *gin.Context) {
 			}
 			entry := models.LifeEntry{
 				Type:       entryType,
-				Title:      "心愿达成 · " + actualTitle,
+				Title:      companionWishFulfilledTitlePrefix + actualTitle,
 				Content:    content,
 				OccurredAt: fulfilledAt,
 				Location:   wish.CityName,
@@ -1026,7 +978,7 @@ func DeleteWish(c *gin.Context) {
 
 		// 删除心愿时**一并软删除**它在时间流里的伴生散页。
 		// 原先只是把 wish_id 置空，导致时间流里留下一条再也点不回心愿的孤儿记录。
-		if err := tx.Where("wish_id = ?", w.ID).Delete(&models.LifeEntry{}).Error; err != nil {
+		if err := deleteWishCompanionEntries(tx, w.ID); err != nil {
 			return err
 		}
 

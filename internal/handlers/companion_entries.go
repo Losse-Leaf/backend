@@ -38,7 +38,7 @@ func buildWishCompanionContent(wish models.Wish) string {
 	if spec := strings.TrimSpace(wish.Spec); spec != "" {
 		return fmt.Sprintf("许下心愿「%s」（%s）。", wish.Title, spec)
 	}
-	return fmt.Sprintf("许下心愿「%s」，期待日后圆满归航。", wish.Title)
+	return fmt.Sprintf("许下心愿「%s」，期待日后圆满归册。", wish.Title)
 }
 
 // syncWishCompanionEntry 同步「许下心愿」那条伴生散页的标题 / 正文 / 地点。
@@ -122,7 +122,7 @@ func buildGearCompanionContent(gear models.GearItem) string {
 }
 
 // createGearCompanionEntry 添置器物时伴生创建一条一级散页
-func createGearCompanionEntry(tx *gorm.DB, gear models.GearItem, occurredAt time.Time) (models.LifeEntry, error) {
+func createGearCompanionEntry(tx *gorm.DB, gear models.GearItem, occurredAt time.Time, isPrivate bool) (models.LifeEntry, error) {
 	gearID := gear.ID
 	companionEntry := models.LifeEntry{
 		Type:       "life",
@@ -130,24 +130,12 @@ func createGearCompanionEntry(tx *gorm.DB, gear models.GearItem, occurredAt time
 		Content:    buildGearCompanionContent(gear),
 		OccurredAt: occurredAt,
 		GearID:     &gearID,
+		IsPrivate:  isPrivate,
 	}
 	if err := tx.Create(&companionEntry).Error; err != nil {
 		return companionEntry, err
 	}
 	return companionEntry, nil
-}
-
-// syncGearCompanionEntry 同步器物伴生散页（标题 / 正文）
-func syncGearCompanionEntry(tx *gorm.DB, gear models.GearItem, oldName string) error {
-	oldCompanionTitle := companionGearTitlePrefix + oldName
-	newCompanionTitle := companionGearTitlePrefix + gear.Name
-	return tx.Model(&models.LifeEntry{}).
-		Where("gear_id = ? AND title = ?", gear.ID, oldCompanionTitle).
-		Updates(map[string]any{
-			"title":      newCompanionTitle,
-			"content":    buildGearCompanionContent(gear),
-			"updated_at": time.Now(),
-		}).Error
 }
 
 // deleteGearCompanionEntries 删除器物的伴生散页（软删除）

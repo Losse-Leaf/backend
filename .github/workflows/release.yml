@@ -117,3 +117,46 @@ jobs:
             见附件 `checksums.txt`。
           draft: false
           prerelease: false
+
+  deploy:
+    name: Deploy to RackNerd VPS
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: vps-deploy-looseleaf
+      cancel-in-progress: false
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Check Deploy Credentials
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.VPS_SSH_KEY }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy Official Release Binary to RackNerd VPS
+        if: steps.check-secrets.outputs.skip == 'false'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST || '198.84.85.196' }}
+          username: ${{ secrets.VPS_USER || 'root' }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            set -e
+            TAG="${{ github.ref_name }}"
+            mkdir -p /tmp/looseleaf-ci && cd /tmp/looseleaf-ci
+            curl -fsSL -o looseleaf-linux-amd64 "https://github.com/Losse-Leaf/backend/releases/download/${TAG}/looseleaf-linux-amd64"
+            curl -fsSL -o checksums.txt "https://github.com/Losse-Leaf/backend/releases/download/${TAG}/checksums.txt"
+            grep 'looseleaf-linux-amd64' checksums.txt | sha256sum -c -
+            chmod +x looseleaf-linux-amd64
+            systemctl stop looseleaf || true
+            mv looseleaf-linux-amd64 /opt/looseleaf/looseleaf-server
+            rm -rf /tmp/looseleaf-ci
+            systemctl start looseleaf
+            sleep 2
+            systemctl is-active --quiet looseleaf
+            curl -fsS http://127.0.0.1:8088/api/v1/system/status >/dev/null
+            echo "Loose-Leaf ${TAG} deployed and verified!"

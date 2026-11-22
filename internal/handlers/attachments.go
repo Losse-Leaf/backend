@@ -24,24 +24,21 @@ func populateAttachmentURLs(atts []models.Attachment) []models.Attachment {
 }
 
 // errAttachmentClaimConflict 附件跨实体抢占（发现 15）：
-// 待绑定附件已归属其他实体（entry / wish / footprint），拒绝绑定。
+// 待绑定附件已归属其他实体（entry / wish），拒绝绑定。
 var errAttachmentClaimConflict = errors.New("附件已绑定到其他实体")
 
 func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
 	if len(ids) == 0 || dbTx == nil {
 		return nil
 	}
-	allowedTargets := make(map[string]any, len(targets)+2)
+	allowedTargets := make(map[string]any, len(targets)+1)
 	for key, value := range targets {
 		allowedTargets[key] = value
 	}
 	if entryID, ok := targets["entry_id"].(uint); ok && entryID > 0 {
 		var entry models.LifeEntry
-		if err := dbTx.Select("id", "footprint_id", "wish_id").First(&entry, entryID).Error; err != nil {
+		if err := dbTx.Select("id", "wish_id").First(&entry, entryID).Error; err != nil {
 			return err
-		}
-		if _, explicit := targets["footprint_id"]; !explicit && entry.FootprintID != nil {
-			allowedTargets["footprint_id"] = *entry.FootprintID
 		}
 		if _, explicit := targets["wish_id"]; !explicit && entry.WishID != nil {
 			allowedTargets["wish_id"] = *entry.WishID
@@ -63,9 +60,6 @@ func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
 		bindingTargets := allowedTargets
 		if att.EntryID != nil && targets["entry_id"] == *att.EntryID {
 			bindingTargets = maps.Clone(allowedTargets)
-			if _, explicit := targets["footprint_id"]; !explicit && att.FootprintID != nil {
-				bindingTargets["footprint_id"] = *att.FootprintID
-			}
 			if _, explicit := targets["wish_id"]; !explicit && att.WishID != nil {
 				bindingTargets["wish_id"] = *att.WishID
 			}
@@ -77,13 +71,12 @@ func claimAttachments(dbTx *gorm.DB, ids []uint, targets map[string]any) error {
 	return dbTx.Model(&models.Attachment{}).Where("id IN ?", ids).Updates(targets).Error
 }
 
-// assertAttachmentBindable 单个附件的归属校验：三个归属列各自为 NULL，
+// assertAttachmentBindable 单个附件的归属校验：两个归属列各自为 NULL，
 // 或恰好等于本次要写入的目标值，否则视为抢占冲突。
 func assertAttachmentBindable(att models.Attachment, targets map[string]any) error {
 	ownerNames := map[string]string{
-		"entry_id":     "生活散页",
-		"wish_id":      "心愿",
-		"footprint_id": "旅程",
+		"entry_id": "生活散页",
+		"wish_id":  "心愿",
 	}
 	check := func(col string, cur *uint) error {
 		if want, has := targets[col]; has {
@@ -101,10 +94,7 @@ func assertAttachmentBindable(att models.Attachment, targets map[string]any) err
 	if err := check("entry_id", att.EntryID); err != nil {
 		return err
 	}
-	if err := check("wish_id", att.WishID); err != nil {
-		return err
-	}
-	return check("footprint_id", att.FootprintID)
+	return check("wish_id", att.WishID)
 }
 
 // releaseEntryAttachments 删除散页（物理 purge 或软删）时处理其附件归属，防止悬挂引用。
@@ -115,7 +105,7 @@ func releaseEntryAttachments(dbTx *gorm.DB, entryID uint, purge bool) (keysToDel
 	}
 	for i := range atts {
 		att := atts[i]
-		if purge && att.WishID == nil && att.FootprintID == nil {
+		if purge && att.WishID == nil {
 			if att.ObjectKey != "" {
 				keysToDelete = append(keysToDelete, att.ObjectKey)
 			}

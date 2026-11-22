@@ -14,54 +14,41 @@ import (
 var validCategoryScopes = map[string]bool{
 	"expense": true,
 	"income":  true,
-	"gear":    true,
 	"payment": true,
-	"project": true,
 }
 
 // transactionCategoryAllowed 账目分类字典收口（表单契约修复）：
-// category 必须真实存在于有效字典，杜绝「income+餐饮」这类自由文本错挂
-// 让分类视角与改名级联（cascadeRenameCategoryRecords）永久漂移。
-//
-// 有效字典的口径与 GetCategories 的兜底完全一致：
-//   - expense 账单按 **expense ∪ gear 并集** —— 器物联动（AddGearAsset 的自动账单）
-//     直接把 gear scope 的分类写进账单 Category，四端从设备表单带出的分类属 gear scope；
-//   - income 账单按 income scope（器物转卖回血固定用 income 内建的「二手回血」）；
-//   - 某 scope 在库里没有行时，回落 DefaultCategoriesMap 的内建默认列表
-//     （GetCategories 对空 scope 的既有兜底口径）。
+// category 必须真实存在于有效字典，杜绝「income+餐饮」这类自由文本错挂。
 func transactionCategoryAllowed(txType, category string) bool {
 	name := strings.TrimSpace(category)
 	if name == "" {
 		return false
 	}
-	scopes := []string{"expense", "gear"}
+	scope := "expense"
 	if txType == "income" {
-		scopes = []string{"income"}
+		scope = "income"
 	}
-	for _, scope := range scopes {
-		var rowCount int64
-		db.DB.Model(&models.CategoryOption{}).Where("scope = ?", scope).Count(&rowCount)
-		if rowCount == 0 {
-			for _, def := range db.DefaultCategoriesMap[scope] {
-				if def == name {
-					return true
-				}
+	var rowCount int64
+	db.DB.Model(&models.CategoryOption{}).Where("scope = ?", scope).Count(&rowCount)
+	if rowCount == 0 {
+		for _, def := range db.DefaultCategoriesMap[scope] {
+			if def == name {
+				return true
 			}
-			continue
 		}
-		var hit int64
-		db.DB.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", scope, name).Count(&hit)
-		if hit > 0 {
-			return true
-		}
+		return false
 	}
-	return false
+	var hit int64
+	db.DB.Model(&models.CategoryOption{}).Where("scope = ? AND name = ?", scope, name).Count(&hit)
+	return hit > 0
 }
 
 // GetCategories 获取分类字典列表 (支持 ?scope= 过滤，同时返回列表和按 scope 分组的字典)
 func GetCategories(c *gin.Context) {
 	scope := strings.TrimSpace(c.Query("scope"))
-	query := db.DB.Model(&models.CategoryOption{}).Order("scope ASC, sort_order ASC, id ASC")
+	query := db.DB.Model(&models.CategoryOption{}).
+		Where("scope IN ?", []string{"expense", "income", "payment"}).
+		Order("scope ASC, sort_order ASC, id ASC")
 	if scope != "" {
 		query = query.Where("scope = ?", scope)
 	}
@@ -75,9 +62,7 @@ func GetCategories(c *gin.Context) {
 	grouped := map[string][]string{
 		"expense": {},
 		"income":  {},
-		"gear":    {},
 		"payment": {},
-		"project": {},
 	}
 	for _, it := range items {
 		grouped[it.Scope] = append(grouped[it.Scope], it.Name)
@@ -193,14 +178,6 @@ func UpdateCategory(c *gin.Context) {
 	if req.RenameRecords != nil {
 		shouldRename = *req.RenameRecords
 	}
-	// gear 分类的级联重命名要读-改-写档案的 EDCGear JSON 列：
-	// 先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
-	// 与 CreateTransaction / SellGearAsset 对齐），避免「事务内取锁」
-	// 与其它器物写操作互等 SQLite 唯一写者名额的锁序反转死锁。
-	if item.Scope == "gear" {
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
-	}
 	if err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -233,26 +210,6 @@ func cascadeRenameCategoryRecords(tx *gorm.DB, scope, oldName, newName string) e
 		return tx.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName).Error
 	case "payment":
 		return tx.Model(&models.Transaction{}).Where("payment_method = ?", oldName).Update("payment_method", newName).Error
-	case "project":
-		return tx.Model(&models.Project{}).Where("category = ?", oldName).Update("category", newName).Error
-	case "gear":
-		// EDCGear 同行 JSON 列读-改-写须串行化 (BE-34)：调用方（UpdateCategory）
-		// 已在事务外持有 profileGearMu（锁序 profileGearMu → DB）。
-		var profile models.CuratorProfile
-		if err := tx.First(&profile).Error; err != nil {
-			return err
-		}
-		list := loadProfileGear(&profile)
-		changed := false
-		for i := range list {
-			if list[i].Category == oldName {
-				list[i].Category = newName
-				changed = true
-			}
-		}
-		if changed {
-			return saveProfileGearWith(tx, &profile, list)
-		}
 	}
 	return nil
 }
@@ -272,19 +229,6 @@ func countCategoryRecordsInUse(scope, name string) int64 {
 		db.DB.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", name).Count(&total)
 	case "payment":
 		db.DB.Model(&models.Transaction{}).Where("payment_method = ?", name).Count(&total)
-	case "project":
-		db.DB.Model(&models.Project{}).Where("category = ?", name).Count(&total)
-	case "gear":
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
-		var profile models.CuratorProfile
-		if err := db.DB.First(&profile).Error; err == nil {
-			for _, g := range loadProfileGear(&profile) {
-				if g.Category == name {
-					total++
-				}
-			}
-		}
 	}
 	return total
 }

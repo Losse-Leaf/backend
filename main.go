@@ -132,8 +132,6 @@ func main() {
 		v1.GET("/entries/:id", handlers.GetLifeEntryByID)
 		v1.GET("/search", handlers.GlobalSearch)
 		v1.GET("/storage/status", handlers.GetStorageStatus)
-		v1.GET("/projects", handlers.GetProjectsV1)
-		v1.GET("/projects/:id", handlers.GetProjectByID)
 		v1.GET("/stats", handlers.GetGlobalStats)
 
 		// 站点与主理人身份中枢 (全端动态获取，严禁前端硬编码)
@@ -162,14 +160,7 @@ func main() {
 		// 统一文件批量临时签名接口 (公开只读，供各端获取动态有效访问 URL)
 		v1.POST("/files/sign-batch", handlers.SignFilesBatch)
 
-		// 足迹图谱与回忆抽屉 (公开只读，RC-91)
-		v1.GET("/footprints", handlers.GetFootprints)
-		v1.GET("/footprints/atlas", handlers.GetFootprintsAtlas)
-		v1.GET("/footprints/provinces/:adcode/drawer", handlers.GetProvinceMemoryDrawer)
-		v1.GET("/footprints/cities/:city_code/drawer", handlers.GetCityMemoryDrawer)
-		v1.GET("/footprints/:id", handlers.GetFootprintByID)
-
-		// 三维心愿单 (公开只读)
+		// 心愿单 (公开只读)
 		v1.GET("/wishes", handlers.GetWishes)
 		v1.GET("/wishes/:id", handlers.GetWishByID)
 
@@ -203,15 +194,6 @@ func main() {
 			write.PUT("/transactions/:id", handlers.UpdateTransaction)
 			write.DELETE("/transactions/:id", handlers.DeleteTransaction)
 
-			// 资产管理中枢与设备全生命周期 (RC-53, BE-15)
-			write.GET("/assets/overview", handlers.GetAssetsOverview)
-			write.PUT("/assets/liquid-balance", handlers.SetInitialLiquidBalance)
-			write.POST("/assets/gear", handlers.AddGearAsset)
-			write.POST("/assets/gear/:id/sell", handlers.SellGearAsset)
-			write.DELETE("/assets/gear/:id", handlers.DeleteGearAsset)
-			// 恢复被删除的随身设备（⌘Z 撤销用）：连同伴生散页一起恢复
-			write.POST("/assets/gear/restore", handlers.RestoreGearAsset)
-
 			// 信贷分期渠道配置与独立还款日 (RC-53)
 			write.GET("/credit-channels", handlers.GetCreditChannels)
 			write.POST("/credit-channels", handlers.CreateCreditChannel)
@@ -231,22 +213,12 @@ func main() {
 			write.POST("/installment-items/:id/unpay", handlers.UnpayInstallmentItem)
 			write.POST("/installment-plans/:id/settle", handlers.SettleInstallmentPlan)
 
-			// 用户自定义分类字典管理 (支出/收入/资产/支付方式/造物分类)
+			// 用户自定义分类字典管理 (支出/收入/支付方式)
 			write.POST("/categories", handlers.CreateCategory)
 			write.PUT("/categories/:id", handlers.UpdateCategory)
 			write.DELETE("/categories/:id", handlers.DeleteCategory)
 
-			// Projects (项目与造物)
-			write.POST("/projects", handlers.CreateProject)
-			write.PUT("/projects/:id", handlers.UpdateProject)
-			write.DELETE("/projects/:id", handlers.DeleteProject)
-
-			// Footprints (旅游足迹打卡)
-			write.POST("/footprints", handlers.CreateFootprint)
-			write.PUT("/footprints/:id", handlers.UpdateFootprint)
-			write.DELETE("/footprints/:id", handlers.DeleteFootprint)
-
-			// Wishes (三维心愿单与归册联动)
+			// Wishes (心愿单与记账联动)
 			write.POST("/wishes", handlers.CreateWish)
 			write.PUT("/wishes/:id", handlers.UpdateWish)
 			write.POST("/wishes/:id/resolve", handlers.ResolveWish)
@@ -310,9 +282,6 @@ func main() {
 			log.Fatalf("Server failed to start: %v", err)
 		}
 	}()
-
-	// BE-5：HTTP 已开始监听后再后台回填历史散页/账目（分批 + 幂等 + sync.Once）。
-	handlers.StartFootprintBackfill()
 
 	// 8. 优雅停机 (Graceful Shutdown)
 	quit := make(chan os.Signal, 1)

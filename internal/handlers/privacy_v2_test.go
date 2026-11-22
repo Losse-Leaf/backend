@@ -33,15 +33,11 @@ func TestPrivacyV2_DefaultAllPrivateAndModuleToggles(t *testing.T) {
 	InvalidatePublicModulesCache()
 	t.Cleanup(InvalidatePublicModulesCache)
 
-	// 创建 1 条公开散页、1 条私密散页、1 个公开造物、1 个私密造物
+	// 创建 1 条公开散页、1 条私密散页、1 个公开心愿、1 个私密心愿
 	db.DB.Create(&models.LifeEntry{Type: "life", Title: "Public Entry", Content: "hello public", OccurredAt: time.Now(), IsPrivate: false})
 	db.DB.Create(&models.LifeEntry{Type: "life", Title: "Secret Entry", Content: "hello secret", OccurredAt: time.Now(), IsPrivate: true})
-	db.DB.Create(&models.Project{Title: "Public Project", Description: "open", Status: "进行中", IsPrivate: false})
-	db.DB.Create(&models.Project{Title: "Secret Project", Description: "hidden", Status: "进行中", IsPrivate: true})
 	db.DB.Create(&models.Wish{Title: "Public Wish", Kind: "item", Status: "wanting", IsPrivate: false})
 	db.DB.Create(&models.Wish{Title: "Secret Wish", Kind: "item", Status: "wanting", IsPrivate: true})
-	db.DB.Create(&models.Footprint{CityCode: "330100", CityName: "杭州市", Title: "Public Trip", VisitedAt: time.Now(), IsPrivate: false})
-	db.DB.Create(&models.Footprint{CityCode: "110100", CityName: "北京市", Title: "Secret Trip", VisitedAt: time.Now(), IsPrivate: true})
 	db.DB.Create(&models.CuratorProfile{Name: "主理人", Title: "档案官"})
 
 	adminToken := "lldt_privacy_token_1"
@@ -71,13 +67,8 @@ func TestPrivacyV2_DefaultAllPrivateAndModuleToggles(t *testing.T) {
 		v1.GET("/config", GetConfigV1)
 		v1.GET("/entries", GetLifeEntriesV1)
 		v1.GET("/entries/:id", GetLifeEntryByID)
-		v1.GET("/projects", GetProjectsV1)
-		v1.GET("/projects/:id", GetProjectByID)
 		v1.GET("/wishes", GetWishes)
 		v1.GET("/wishes/:id", GetWishByID)
-		v1.GET("/footprints", GetFootprints)
-		v1.GET("/footprints/atlas", GetFootprintsAtlas)
-		v1.GET("/footprints/:id", GetFootprintByID)
 		v1.GET("/profile", GetCuratorProfile)
 		v1.GET("/almanac/summary", GetAnnualAlmanacSummary)
 		v1.GET("/stats", GetGlobalStats)
@@ -93,10 +84,7 @@ func TestPrivacyV2_DefaultAllPrivateAndModuleToggles(t *testing.T) {
 	// 1. 默认全站私有：所有展厅接口对未登录访客返回 403
 	for _, path := range []string{
 		"/api/v1/entries",
-		"/api/v1/projects",
 		"/api/v1/wishes",
-		"/api/v1/footprints",
-		"/api/v1/footprints/atlas",
 		"/api/v1/profile",
 		"/api/v1/almanac/summary",
 	} {
@@ -115,12 +103,11 @@ func TestPrivacyV2_DefaultAllPrivateAndModuleToggles(t *testing.T) {
 	}
 	var statsBody struct {
 		Data struct {
-			TotalEntries  int `json:"total_entries"`
-			TotalProjects int `json:"total_projects"`
+			TotalEntries int `json:"total_entries"`
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(wStats.Body.Bytes(), &statsBody)
-	if statsBody.Data.TotalEntries != 0 || statsBody.Data.TotalProjects != 0 {
+	if statsBody.Data.TotalEntries != 0 {
 		t.Fatalf("expected 0 public stats when modules disabled, got %+v", statsBody.Data)
 	}
 
@@ -128,16 +115,16 @@ func TestPrivacyV2_DefaultAllPrivateAndModuleToggles(t *testing.T) {
 	r.ServeHTTP(wSearch, httptest.NewRequest(http.MethodGet, "/api/v1/search?q=Public", nil))
 	var searchBody struct {
 		Data struct {
-			Entries  []models.LifeEntry `json:"entries"`
-			Projects []models.Project   `json:"projects"`
+			Entries []models.LifeEntry `json:"entries"`
+			Wishes  []models.Wish      `json:"wishes"`
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(wSearch.Body.Bytes(), &searchBody)
-	if len(searchBody.Data.Entries) != 0 || len(searchBody.Data.Projects) != 0 {
+	if len(searchBody.Data.Entries) != 0 || len(searchBody.Data.Wishes) != 0 {
 		t.Fatalf("expected empty search results when modules disabled, got %+v", searchBody.Data)
 	}
 
-	// 2. 通过 PUT /config 开启 entries 与 projects 公开（故意带一个非法模块名验证白名单过滤）
+	// 2. 通过 PUT /config 开启 entries 公开（故意带非法模块名验证白名单过滤）
 	cfgPayload := []byte(`{"public_modules":["entries","projects","transactions","invalid"]}`)
 	reqCfg := httptest.NewRequest(http.MethodPut, "/api/v1/config", bytes.NewReader(cfgPayload))
 	reqCfg.Header.Set("Content-Type", "application/json")

@@ -88,7 +88,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	err = database.AutoMigrate(
 		&models.LifeEntry{},
 		&models.Attachment{},
-		&models.Project{},
 		&models.Transaction{},
 		&models.CreditChannel{},
 		&models.InstallmentPlan{},
@@ -99,7 +98,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		&models.PairTicket{},
 		&models.CuratorProfile{},
 		&models.Wish{},
-		&models.Footprint{},
 		&models.SyncTombstone{},
 	)
 	if err != nil {
@@ -108,21 +106,13 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 
 	DB = database
 	_ = database.Exec("DROP INDEX IF EXISTS idx_pair_tickets_pin_code;").Error
-	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_att_refs ON attachments(entry_id, wish_id, footprint_id);").Error
+	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_att_refs ON attachments(entry_id, wish_id);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_tx_type_occurred ON transactions(type, occurred_at DESC);").Error
 	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_wish_status_kind_created ON wishes(status, kind, created_at DESC);").Error
-	_ = database.Exec("CREATE INDEX IF NOT EXISTS idx_fp_city_visited ON footprints(city_code, visited_at DESC);").Error
-	// 器物伴生散页曾使用契约外的 type="gear"，任何分类视角都看不到它。
-	// 统一归入 life（gear_id 仍保留器物关联），并推进 updated_at，
-	// 否则已缓存旧 type 的客户端走增量同步永远收不到这次修正。
+	// 历史器物伴生散页曾使用契约外的 type="gear"，统一归入 life 并推进 updated_at。
 	_ = database.Exec("UPDATE life_entries SET type = 'life', updated_at = ? WHERE type = 'gear'", config.NowInBeijing()).Error
-	// 项目状态一次性归一到中文四态（表单契约兜底修复）：历史英文四态与 mac 旧值
-	// 「持续维护」统一映射，并推进 updated_at 让增量同步把修正推给各端；
-	// 归一后后端 status 白名单收紧为中文四态，未知值直接 400。
-	NormalizeProjectStatuses(database)
 	// Web 端「信用卡 / 自定义分期」历史上直接发 installment_channel_code='custom'
-	//（无渠道行，资产大盘为其现造伪渠道）。升级为真实渠道行后 custom 与普通渠道同规则：
-	// 必须存在、还款日单源化。幂等确保行存在；还款日取现存 custom 账目的众数（历史口径）。
+	// 升级为真实渠道行后 custom 与普通渠道同规则：必须存在、还款日单源化。
 	EnsureCustomInstallmentChannel(database)
 	// 「好物购置」为心愿归册自动账单的生成分类（wishes.go ResolveWish），
 	// 存量库 targeted 补种（SeedDefaultCategories 只补空 scope），
@@ -140,16 +130,6 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 	}
 	seedData(database)
 	return database, nil
-}
-
-// NormalizeProjectStatuses 项目状态一次性归一到中文四态（幂等启动迁移）。
-// 映射：Active/WIP→进行中、Maintained/持续维护→维护中、Archived→已搁置。
-// 归一只改 projects.status，伴生散页标题里的历史状态文本（「状态演进 (Active)」）属历史记录不改写。
-func NormalizeProjectStatuses(database *gorm.DB) {
-	now := config.NowInBeijing()
-	_ = database.Exec("UPDATE projects SET status = '进行中', updated_at = ? WHERE status IN ('Active','WIP')", now).Error
-	_ = database.Exec("UPDATE projects SET status = '维护中', updated_at = ? WHERE status IN ('Maintained','持续维护')", now).Error
-	_ = database.Exec("UPDATE projects SET status = '已搁置', updated_at = ? WHERE status = 'Archived'", now).Error
 }
 
 // EnsureCustomInstallmentChannel 幂等确保 code='custom' 的真实渠道行存在（幂等启动迁移）。
@@ -182,7 +162,7 @@ func EnsureCustomInstallmentChannel(database *gorm.DB) {
 	})
 }
 
-// DefaultCategoriesMap 系统预置的五大分类字典默认值
+// DefaultCategoriesMap 系统预置的三大分类字典默认值
 //
 // 注：「好物购置」由心愿归册自动账单写入（wishes.go ResolveWish），虽非表单选项
 // 但属于系统生成的合法 expense 分类 —— 收口后必须真实存在，否则历史心愿账目在
@@ -190,14 +170,12 @@ func EnsureCustomInstallmentChannel(database *gorm.DB) {
 var DefaultCategoriesMap = map[string][]string{
 	"expense": {"餐饮", "交通", "购物", "数码器材", "娱乐", "学习", "住房", "医疗", "旅行度假", "好物购置", "利息手续费", "其他"},
 	"income":  {"工资收入", "二手回血", "稿酬设计", "投资理财", "礼金红包", "退款报销", "其他收入"},
-	"gear":    {"数码器材", "影像与暗房", "工作台与算力", "手冲咖啡工坊", "夜骑巡航", "纸笔与日常", "生活好物"},
 	"payment": {"微信支付", "支付宝", "银行卡", "现金", "其他"},
-	"project": {"开源项目", "独立开发", "硬件改造", "设计作品", "写作出版"},
 }
 
 // SeedDefaultCategories 为空态 scope 补充预置分类字典
 func SeedDefaultCategories(database *gorm.DB) {
-	scopes := []string{"expense", "income", "gear", "payment", "project"}
+	scopes := []string{"expense", "income", "payment"}
 	for _, sc := range scopes {
 		var cnt int64
 		database.Model(&models.CategoryOption{}).Where("scope = ?", sc).Count(&cnt)
@@ -228,10 +206,10 @@ func seedData(database *gorm.DB) {
 	if cfgCount == 0 {
 		config := models.SiteConfig{
 			SiteName:        "散页 · 个人生活志",
-			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",
+			SiteSubtitle:    "日常 · 记账 · 心愿",
 			CuratorName:     "",
 			DefaultLocation: "",
-			SiteDesc:        "记录日常、打理资产、兑现心愿、丈量山河、实践造物。",
+			SiteDesc:        "记录日常片段，打理收支账本与心愿清单。",
 			Initialized:     false,
 		}
 		database.Create(&config)
@@ -251,7 +229,6 @@ func seedData(database *gorm.DB) {
 			Motto:       "",
 			Manifesto:   "",
 			SocialLinks: `{}`,
-			EDCGear:     `[]`,
 		}
 		database.Create(&profile)
 	}

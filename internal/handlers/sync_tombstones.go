@@ -23,9 +23,7 @@ import (
 const (
 	TombstoneEntityEntry       = "entry"
 	TombstoneEntityTransaction = "transaction"
-	TombstoneEntityProject     = "project"
 	TombstoneEntityWish        = "wish"
-	TombstoneEntityFootprint   = "footprint"
 )
 
 // lastTombstoneNano 保证同一进程内写出的墓碑时间严格递增。

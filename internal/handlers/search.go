@@ -16,11 +16,9 @@ func GlobalSearch(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
 		Success(c, gin.H{
-			"query":      "",
-			"entries":    []models.LifeEntry{},
-			"footprints": []models.Footprint{},
-			"wishes":     []models.Wish{},
-			"projects":   []models.Project{},
+			"query":   "",
+			"entries": []models.LifeEntry{},
+			"wishes":  []models.Wish{},
 		})
 		return
 	}
@@ -39,7 +37,7 @@ func GlobalSearch(c *gin.Context) {
 
 	entries := []models.LifeEntry{}
 	if isAdmin || pub["entries"] {
-		entryQ := db.DB.Where("title LIKE ? OR content LIKE ? OR location LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat)
+		entryQ := db.DB.Where("title LIKE ? OR content LIKE ? OR location LIKE ?", likePat, likePat, likePat)
 		if !isAdmin {
 			entryQ = entryQ.Where("is_private = ?", false)
 		}
@@ -50,19 +48,9 @@ func GlobalSearch(c *gin.Context) {
 		}
 	}
 
-	footprints := []models.Footprint{}
-	if isAdmin || pub["footprints"] {
-		fpQ := db.DB.Where("city_name LIKE ? OR title LIKE ? OR note LIKE ?", likePat, likePat, likePat)
-		if !isAdmin {
-			fpQ = fpQ.Where("is_private = ?", false)
-		}
-		fpQ.Order("visited_at DESC, id DESC").Limit(limit).Find(&footprints)
-		populateFootprintURLsBatch(footprints)
-	}
-
 	wishes := []models.Wish{}
 	if isAdmin || pub["wishes"] {
-		wishQ := db.DB.Where("title LIKE ? OR note LIKE ? OR spec LIKE ? OR city_name LIKE ?", likePat, likePat, likePat, likePat)
+		wishQ := db.DB.Where("title LIKE ? OR note LIKE ? OR spec LIKE ?", likePat, likePat, likePat)
 		if !isAdmin {
 			wishQ = wishQ.Where("is_private = ?", false)
 		}
@@ -75,21 +63,10 @@ func GlobalSearch(c *gin.Context) {
 		}
 	}
 
-	projects := []models.Project{}
-	if isAdmin || pub["projects"] {
-		projQ := db.DB.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR story LIKE ? OR category LIKE ?", likePat, likePat, likePat, likePat, likePat)
-		if !isAdmin {
-			projQ = projQ.Where("is_private = ?", false)
-		}
-		projQ.Order("`order` ASC, id DESC").Limit(limit).Find(&projects)
-	}
-
 	setAuthVaryHeader(c)
 	Success(c, gin.H{
-		"query":      q,
-		"entries":    entries,
-		"footprints": footprints,
-		"wishes":     wishes,
-		"projects":   projects,
+		"query":   q,
+		"entries": entries,
+		"wishes":  wishes,
 	})
 }

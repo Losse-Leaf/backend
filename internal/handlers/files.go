@@ -190,12 +190,6 @@ func isRegisteredObjectKey(cleanKey string) bool {
 					return true
 				}
 			}
-			if pub["footprints"] && att.FootprintID != nil && *att.FootprintID > 0 {
-				var count int64
-				if err := db.DB.Model(&models.Footprint{}).Where("id = ? AND is_private = ?", *att.FootprintID, false).Count(&count).Error; err == nil && count > 0 {
-					return true
-				}
-			}
 		}
 	}
 
@@ -385,7 +379,7 @@ func CleanupUpload(c *gin.Context) {
 		if key != "" {
 			var att models.Attachment
 			if err := db.DB.Where(
-				"object_key = ? AND entry_id IS NULL AND wish_id IS NULL AND footprint_id IS NULL", key,
+				"object_key = ? AND entry_id IS NULL AND wish_id IS NULL", key,
 			).First(&att).Error; err == nil {
 				_ = storage.DeleteObject(key)
 				db.DB.Delete(&att)

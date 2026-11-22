@@ -55,31 +55,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		lastDateStr = entries[len(entries)-1].OccurredAt.In(beijing).Format("2006-01-02")
 	}
 
-	// 2. 第二幕：山川行迹 (Footprints 聚合)
-	var footprints []models.Footprint
-	fpQ := db.DB.Where("visited_at >= ? AND visited_at < ?", startOfYear, endOfYear)
-	if !isAdmin {
-		fpQ = fpQ.Where("is_private = ?", false)
-	}
-	fpQ.Order("visited_at ASC").Find(&footprints)
-
-	populateFootprintURLsBatch(footprints)
-
-	yearCityMap := make(map[string]string)
-	for _, f := range footprints {
-		yearCityMap[f.CityCode] = f.CityName
-	}
-
-	type citySummary struct {
-		CityCode string `json:"city_code"`
-		CityName string `json:"city_name"`
-	}
-	citiesVisited := make([]citySummary, 0, len(yearCityMap))
-	for code, name := range yearCityMap {
-		citiesVisited = append(citiesVisited, citySummary{CityCode: code, CityName: name})
-	}
-
-	// 3. 第三幕：心愿圆满 (Wishes 聚合)
+	// 2. 第二幕：心愿圆满 (Wishes 聚合)
 	var fulfilledWishes []models.Wish
 	wishQ := db.DB.Where("fulfilled_at >= ? AND fulfilled_at < ?", startOfYear, endOfYear).
 		Where("status = ?", "fulfilled")
@@ -103,7 +79,7 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		totalWishActual += w.ActualCost
 	}
 
-	// 4. 第四幕：浮光掠影 (四季高光与菲林相片)
+	// 3. 第三幕：浮光掠影 (四季高光与菲林相片)
 	var springHighlight, summerHighlight, autumnHighlight, winterHighlight *models.LifeEntry
 	filmGallery := make([]models.Attachment, 0)
 
@@ -138,14 +114,11 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		filmGallery = filmGallery[len(filmGallery)-24:]
 	}
 
-	if footprints == nil {
-		footprints = make([]models.Footprint, 0)
-	}
 	if fulfilledWishes == nil {
 		fulfilledWishes = make([]models.Wish, 0)
 	}
 
-	// 5. 第五幕：柴米油盐 (Transactions 聚合：仅主理人鉴权请求查询聚合，访客模式零查询脱敏 BE-14)
+	// 4. 第四幕：柴米油盐 (Transactions 聚合：仅主理人鉴权请求查询聚合，访客模式零查询脱敏 BE-14)
 	var txs []models.Transaction
 	if isAdmin {
 		db.DB.Where("occurred_at >= ? AND occurred_at < ?", startOfYear, endOfYear).Find(&txs)
@@ -217,11 +190,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			maxUpdated = e.UpdatedAt
 		}
 	}
-	for _, f := range footprints {
-		if f.UpdatedAt.After(maxUpdated) {
-			maxUpdated = f.UpdatedAt
-		}
-	}
 	for _, w := range fulfilledWishes {
 		if w.UpdatedAt.After(maxUpdated) {
 			maxUpdated = w.UpdatedAt
@@ -247,11 +215,6 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 		return
 	}
 
-	atlasPayload := gin.H{
-		"total_cities": len(citiesVisited),
-		"cities":       citiesVisited,
-		"footprints":   footprints,
-	}
 	wishesPayload := gin.H{
 		"wishes":          fulfilledWishes,
 		"fulfilled_count": len(fulfilledWishes),
@@ -276,10 +239,8 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 			"first_date":       firstDateStr,
 			"last_date":        lastDateStr,
 			"wishes_fulfilled": len(fulfilledWishes),
-			"cities_visited":   len(citiesVisited),
 			"tx_count":         txCount,
 		},
-		"atlas":      atlasPayload,
 		"wishes":     wishesPayload,
 		"highlights": highlightsPayload,
 		"finances":   finSpectrum,

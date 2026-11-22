@@ -13,12 +13,11 @@ import (
 )
 
 type statsSnapshot struct {
-	TotalEntries  int64
-	TotalPhotos   int64
-	TotalProjects int64
-	MonthExpense  int64
-	CurrentYear   int
-	CurrentMonth  int
+	TotalEntries int64
+	TotalPhotos  int64
+	MonthExpense int64
+	CurrentYear  int
+	CurrentMonth int
 }
 
 var (
@@ -54,17 +53,12 @@ func GetGlobalStats(c *gin.Context) {
 				Where("attachments.mime_type LIKE ? AND life_entries.deleted_at IS NULL AND life_entries.is_private = ?", "image/%", false).
 				Count(&totalPhotos)
 		}
-		var totalProjects int64
-		if pub["projects"] {
-			db.DB.Model(&models.Project{}).Where("is_private = ?", false).Count(&totalProjects)
-		}
 		Success(c, gin.H{
-			"total_entries":  totalEntries,
-			"total_photos":   totalPhotos,
-			"total_projects": totalProjects,
-			"month_expense":  0,
-			"current_year":   nowBeijing.Year(),
-			"current_month":  int(nowBeijing.Month()),
+			"total_entries": totalEntries,
+			"total_photos":  totalPhotos,
+			"month_expense": 0,
+			"current_year":  nowBeijing.Year(),
+			"current_month": int(nowBeijing.Month()),
 		})
 		return
 	}
@@ -74,12 +68,11 @@ func GetGlobalStats(c *gin.Context) {
 		snap := *cachedStats
 		statsCacheMutex.RUnlock()
 		Success(c, gin.H{
-			"total_entries":  snap.TotalEntries,
-			"total_photos":   snap.TotalPhotos,
-			"total_projects": snap.TotalProjects,
-			"month_expense":  snap.MonthExpense,
-			"current_year":   snap.CurrentYear,
-			"current_month":  snap.CurrentMonth,
+			"total_entries": snap.TotalEntries,
+			"total_photos":  snap.TotalPhotos,
+			"month_expense": snap.MonthExpense,
+			"current_year":  snap.CurrentYear,
+			"current_month": snap.CurrentMonth,
 		})
 		return
 	}
@@ -90,9 +83,6 @@ func GetGlobalStats(c *gin.Context) {
 
 	var totalPhotos int64
 	db.DB.Model(&models.Attachment{}).Where("mime_type LIKE ?", "image/%").Count(&totalPhotos)
-
-	var totalProjects int64
-	db.DB.Model(&models.Project{}).Count(&totalProjects)
 
 	start := time.Date(nowBeijing.Year(), nowBeijing.Month(), 1, 0, 0, 0, 0, config.BeijingLocation)
 	end := start.AddDate(0, 1, 0)
@@ -106,12 +96,11 @@ func GetGlobalStats(c *gin.Context) {
 		Scan(&res)
 
 	snap := statsSnapshot{
-		TotalEntries:  totalEntries,
-		TotalPhotos:   totalPhotos,
-		TotalProjects: totalProjects,
-		MonthExpense:  res.Total,
-		CurrentYear:   nowBeijing.Year(),
-		CurrentMonth:  int(nowBeijing.Month()),
+		TotalEntries: totalEntries,
+		TotalPhotos:  totalPhotos,
+		MonthExpense: res.Total,
+		CurrentYear:  nowBeijing.Year(),
+		CurrentMonth: int(nowBeijing.Month()),
 	}
 
 	statsCacheMutex.Lock()
@@ -120,11 +109,10 @@ func GetGlobalStats(c *gin.Context) {
 	statsCacheMutex.Unlock()
 
 	Success(c, gin.H{
-		"total_entries":  snap.TotalEntries,
-		"total_photos":   snap.TotalPhotos,
-		"total_projects": snap.TotalProjects,
-		"month_expense":  snap.MonthExpense,
-		"current_year":   snap.CurrentYear,
-		"current_month":  snap.CurrentMonth,
+		"total_entries": snap.TotalEntries,
+		"total_photos":  snap.TotalPhotos,
+		"month_expense": snap.MonthExpense,
+		"current_year":  snap.CurrentYear,
+		"current_month": snap.CurrentMonth,
 	})
 }

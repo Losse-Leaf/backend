@@ -28,11 +28,9 @@ func InvalidatePublicModulesCache() {
 }
 
 // AllowedPublicModules 定义允许主理人在展厅开放的模块白名单（contracts/contract.json）。
-// 账本、资产、信贷渠道、分期计划、分类字典、设备管理、存储灾备、可见性配置永不开放。
+// 账本、信贷渠道、分期计划、分类字典、设备管理、存储灾备、可见性配置永不开放。
 var AllowedPublicModules = []string{
 	"entries",
-	"projects",
-	"footprints",
 	"wishes",
 	"profile",
 	"almanac",

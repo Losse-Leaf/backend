@@ -3,10 +3,8 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,12 +15,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 跨端统一契约（A/B/C）与发现 12/15 的回归测试。
+// 跨端统一契约（A/B/C）与发现 15 的回归测试。
 //
 // 契约 B：client_request_id 幂等创建 —— 同一 id 重复提交返回已有记录，不重复落库。
-// 契约 A：clear_city / clear_attachments 显式清空语义。
+// 契约 A：clear_attachments 显式清空语义。
 // 发现 15：attachment_ids 抢占其他实体的附件 → 400。
-// 发现 12：已转售设备重复转售 → 400。
 
 func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	t.Helper()
@@ -30,8 +27,8 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	setupTestDB(t)
 	if err := db.DB.AutoMigrate(
 		&models.LifeEntry{}, &models.Transaction{}, &models.Attachment{},
-		&models.Footprint{}, &models.Wish{}, &models.Device{}, &models.CuratorProfile{},
-		&models.Project{}, &models.CreditChannel{}, &models.InstallmentPlan{}, &models.InstallmentItem{},
+		&models.Wish{}, &models.Device{}, &models.CuratorProfile{},
+		&models.CreditChannel{}, &models.InstallmentPlan{}, &models.InstallmentItem{},
 		&models.SyncTombstone{},
 	); err != nil {
 		t.Fatalf("迁移表失败: %v", err)
@@ -60,13 +57,6 @@ func setupContractRouter(t *testing.T) (*gin.Engine, string) {
 	r.POST("/api/v1/wishes/:id/resolve", middleware.AdminAuthRequired(), ResolveWish)
 	r.POST("/api/v1/transactions", middleware.AdminAuthRequired(), CreateTransaction)
 	r.PUT("/api/v1/transactions/:id", middleware.AdminAuthRequired(), UpdateTransaction)
-	r.GET("/api/v1/footprints/:id", GetFootprintByID)
-	r.POST("/api/v1/footprints", middleware.AdminAuthRequired(), CreateFootprint)
-	r.PUT("/api/v1/footprints/:id", middleware.AdminAuthRequired(), UpdateFootprint)
-	r.POST("/api/v1/projects", middleware.AdminAuthRequired(), CreateProject)
-	r.PUT("/api/v1/projects/:id", middleware.AdminAuthRequired(), UpdateProject)
-	r.POST("/api/v1/assets/gear", middleware.AdminAuthRequired(), AddGearAsset)
-	r.POST("/api/v1/assets/gear/:id/sell", middleware.AdminAuthRequired(), SellGearAsset)
 	return r, token
 }
 
@@ -141,52 +131,14 @@ func TestCreateTransactionIdempotentByClientRequestID(t *testing.T) {
 	}
 }
 
-// ── 契约 B：同一 client_request_id 重复创建造物 → 返回同一条记录
-func TestCreateProjectIdempotentByClientRequestID(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	body := map[string]any{
-		"title": "幂等造物", "client_request_id": "crid-project-0001",
-	}
-	w1 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
-	if w1.Code != http.StatusOK {
-		t.Fatalf("首次创建造物失败: %d %s", w1.Code, w1.Body.String())
-	}
-	var first struct {
-		Data models.Project `json:"data"`
-	}
-	_ = json.Unmarshal(w1.Body.Bytes(), &first)
-
-	w2 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("重复提交应幂等返回 200: %d %s", w2.Code, w2.Body.String())
-	}
-	var second struct {
-		Data models.Project `json:"data"`
-	}
-	_ = json.Unmarshal(w2.Body.Bytes(), &second)
-
-	if first.Data.ID != second.Data.ID {
-		t.Fatalf("同一 client_request_id 应返回同一条造物: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
-	}
-	if w2.Header().Get("X-Idempotent-Replay") != "true" {
-		t.Fatalf("重复创建应带 X-Idempotent-Replay: true 响应头")
-	}
-	var count int64
-	db.DB.Model(&models.Project{}).Where("client_request_id = ?", "crid-project-0001").Count(&count)
-	if count != 1 {
-		t.Fatalf("幂等创建造物不得重复落库: 实际 %d 条", count)
-	}
-}
-
 // OPT-08: 软删除记录幂等重放时返回 410 Gone，并带 X-Idempotent-Replay 响应头
 func TestOPT08_SoftDeletedRecordIdempotentReplayReturns410(t *testing.T) {
 	r, token := setupContractRouter(t)
 
 	body := map[string]any{
-		"title": "即将被删的造物", "client_request_id": "crid-opt08-deleted-proj",
+		"title": "即将被删的心愿", "client_request_id": "crid-opt08-deleted-wish",
 	}
-	w1 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	w1 := doJSON(r, http.MethodPost, "/api/v1/wishes", token, body)
 	if w1.Code != http.StatusOK {
 		t.Fatalf("创建失败: %d", w1.Code)
 	}
@@ -195,17 +147,17 @@ func TestOPT08_SoftDeletedRecordIdempotentReplayReturns410(t *testing.T) {
 	}
 
 	var created struct {
-		Data models.Project `json:"data"`
+		Data models.Wish `json:"data"`
 	}
 	_ = json.Unmarshal(w1.Body.Bytes(), &created)
 
-	// 软删除该造物
-	if err := db.DB.Delete(&models.Project{}, created.Data.ID).Error; err != nil {
+	// 软删除该心愿
+	if err := db.DB.Delete(&models.Wish{}, created.Data.ID).Error; err != nil {
 		t.Fatalf("软删除失败: %v", err)
 	}
 
 	// 再次重放同一 client_request_id
-	w2 := doJSON(r, http.MethodPost, "/api/v1/projects", token, body)
+	w2 := doJSON(r, http.MethodPost, "/api/v1/wishes", token, body)
 	if w2.Code != http.StatusGone {
 		t.Fatalf("软删记录幂等重放应返回 410 Gone, 实际得到: %d %s", w2.Code, w2.Body.String())
 	}
@@ -251,97 +203,6 @@ func TestCreateWishIdempotentByClientRequestID(t *testing.T) {
 	db.DB.Model(&models.LifeEntry{}).Where("wish_id = ?", first.Data.ID).Count(&entryCount)
 	if entryCount != 1 {
 		t.Fatalf("幂等许愿不得重复创建伴生散页: 实际 %d 条", entryCount)
-	}
-}
-
-// ── 契约 B：同一 client_request_id 重复创建足迹 → 返回同一条记录
-func TestCreateFootprintIdempotentByClientRequestID(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	body := map[string]any{
-		"city_code": "330100", "city_name": "杭州市",
-		"visited_at":        "2026-11-01T10:00:00+08:00",
-		"client_request_id": "crid-footprint-0001",
-	}
-	w1 := doJSON(r, http.MethodPost, "/api/v1/footprints", token, body)
-	if w1.Code != http.StatusOK {
-		t.Fatalf("首次创建足迹失败: %d %s", w1.Code, w1.Body.String())
-	}
-	var first struct {
-		Data models.Footprint `json:"data"`
-	}
-	_ = json.Unmarshal(w1.Body.Bytes(), &first)
-
-	w2 := doJSON(r, http.MethodPost, "/api/v1/footprints", token, body)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("重复提交应幂等返回 200: %d %s", w2.Code, w2.Body.String())
-	}
-	var second struct {
-		Data models.Footprint `json:"data"`
-	}
-	_ = json.Unmarshal(w2.Body.Bytes(), &second)
-
-	if first.Data.ID != second.Data.ID {
-		t.Fatalf("同一 client_request_id 应返回同一条足迹: 首次=%d, 重试=%d", first.Data.ID, second.Data.ID)
-	}
-	var count int64
-	db.DB.Model(&models.Footprint{}).Where("client_request_id = ?", "crid-footprint-0001").Count(&count)
-	if count != 1 {
-		t.Fatalf("幂等创建足迹不得重复落库: 实际 %d 条", count)
-	}
-	var entryCount int64
-	db.DB.Model(&models.LifeEntry{}).Where("footprint_id = ?", first.Data.ID).Count(&entryCount)
-	if entryCount != 1 {
-		t.Fatalf("幂等创建足迹不得重复创建伴生散页: 实际 %d 条", entryCount)
-	}
-}
-
-// ── 契约 A：clear_city 显式清空散页属地，且优先于 city_code 字段
-func TestUpdateEntryClearCity(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	entry := models.LifeEntry{Type: "travel", Title: "属地清空", Content: "x", CityCode: "330100", CityName: "杭州市"}
-	if err := db.DB.Create(&entry).Error; err != nil {
-		t.Fatalf("创建散页失败: %v", err)
-	}
-
-	// 携带 city_code 也必须被 clear_city 压过（优先级契约）
-	w := doJSON(r, http.MethodPut, "/api/v1/entries/"+u64(entry.ID), token, map[string]any{
-		"clear_city": true, "city_code": "110100",
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.LifeEntry
-	if err := db.DB.First(&reloaded, entry.ID).Error; err != nil {
-		t.Fatalf("回读失败: %v", err)
-	}
-	if reloaded.CityCode != "" {
-		t.Fatalf("clear_city 后 city_code 应为空, 实际 %q", reloaded.CityCode)
-	}
-}
-
-// ── 契约 A：UpdateTransaction 的 clear_city
-func TestUpdateTransactionClearCity(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	tx := models.Transaction{Amount: 100, Type: "expense", Category: "餐饮", CityCode: "330100"}
-	if err := db.DB.Create(&tx).Error; err != nil {
-		t.Fatalf("创建账目失败: %v", err)
-	}
-
-	w := doJSON(r, http.MethodPut, "/api/v1/transactions/"+u64(tx.ID), token, map[string]any{
-		"amount": 100, "category": "餐饮", "clear_city": true,
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.Transaction
-	if err := db.DB.First(&reloaded, tx.ID).Error; err != nil {
-		t.Fatalf("回读失败: %v", err)
-	}
-	if reloaded.CityCode != "" {
-		t.Fatalf("clear_city 后账目 city_code 应为空, 实际 %q", reloaded.CityCode)
 	}
 }
 
@@ -449,87 +310,6 @@ func TestUpdateTransactionOmittedTextFieldsKeepValues(t *testing.T) {
 	}
 }
 
-// ── 发现 12：已转售设备重复转售 → 400
-func TestSellGearAssetRejectsAlreadySold(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	w := doJSON(r, http.MethodPost, "/api/v1/assets/gear", token, map[string]any{
-		"name": "测试相机", "category": "数码器材", "price_cents": 100000,
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("录入设备失败: %d %s", w.Code, w.Body.String())
-	}
-	var created struct {
-		Data models.GearItem `json:"data"`
-	}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
-
-	sell := func() *httptest.ResponseRecorder {
-		return doJSON(r, http.MethodPost, "/api/v1/assets/gear/"+created.Data.ID+"/sell", token, map[string]any{
-			"sold_price_cents": 50000,
-		})
-	}
-	if w := sell(); w.Code != http.StatusOK {
-		t.Fatalf("首次转售失败: %d %s", w.Code, w.Body.String())
-	}
-	if w := sell(); w.Code != http.StatusBadRequest {
-		t.Fatalf("重复转售应 400, 实际 %d %s", w.Code, w.Body.String())
-	}
-
-	// 只应产生一笔回血收入
-	var income int64
-	db.DB.Model(&models.Transaction{}).
-		Where("type = 'income' AND title = ?", "设备转售回血: 测试相机").
-		Select("COALESCE(COUNT(*), 0)").Scan(&income)
-	if income != 1 {
-		t.Fatalf("重复转售不得重复生成回血收入, 实际 %d 笔", income)
-	}
-}
-
-func TestSellGearAssetRollsBackWhenIncomeFails(t *testing.T) {
-	r, token := setupContractRouter(t)
-	created := doJSON(r, http.MethodPost, "/api/v1/assets/gear", token, map[string]any{
-		"name": "回滚相机", "category": "数码器材", "price_cents": 100000,
-	})
-	if created.Code != http.StatusOK {
-		t.Fatalf("录入设备失败: %d %s", created.Code, created.Body.String())
-	}
-	var gear struct {
-		Data models.GearItem `json:"data"`
-	}
-	if err := json.Unmarshal(created.Body.Bytes(), &gear); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.DB.Exec("DROP TABLE transactions").Error; err != nil {
-		t.Fatal(err)
-	}
-	sell := doJSON(r, http.MethodPost, "/api/v1/assets/gear/"+gear.Data.ID+"/sell", token, map[string]any{
-		"sold_price_cents": 50000,
-	})
-	if sell.Code != http.StatusInternalServerError {
-		t.Fatalf("收入流水写入失败时应 500 并回滚，实际 %d %s", sell.Code, sell.Body.String())
-	}
-	var profile models.CuratorProfile
-	if err := db.DB.First(&profile).Error; err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(profile.EDCGear, `"status":"sold"`) {
-		t.Fatalf("流水失败后设备状态必须回滚为 active: %s", profile.EDCGear)
-	}
-
-	// 恢复运行环境后重试：不应被「已售出」守卫拒绝。
-	if err := db.DB.AutoMigrate(&models.Transaction{}); err != nil {
-		t.Fatal(err)
-	}
-	retry := doJSON(r, http.MethodPost, "/api/v1/assets/gear/"+gear.Data.ID+"/sell", token, map[string]any{
-		"sold_price_cents": 50000,
-	})
-	if retry.Code != http.StatusOK {
-		t.Fatalf("回滚后的重试应成功: %d %s", retry.Code, retry.Body.String())
-	}
-}
-
 // ── 发现 5：公开详情接口非数字 id → 400
 func TestPublicDetailEndpointsRejectNonNumericID(t *testing.T) {
 	r, token := setupContractRouter(t)
@@ -545,216 +325,11 @@ func TestPublicDetailEndpointsRejectNonNumericID(t *testing.T) {
 	}
 }
 
-func TestCreateTransactionRollsBackWhenGearLinkFails(t *testing.T) {
-	r, token := setupContractRouter(t)
-	if err := db.DB.Exec("DELETE FROM curator_profiles").Error; err != nil {
-		t.Fatal(err)
-	}
-	const key = "crid-tx-gear-fail-0001"
-	body := map[string]any{
-		"amount": 12345, "type": "expense", "category": "数码器材", "title": "联动失败账目",
-		"link_gear_asset": true, "client_request_id": key,
-	}
-
-	w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, body)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("缺失主理人档案时设备联动应失败并回滚，实际 %d %s", w.Code, w.Body.String())
-	}
-	var count int64
-	db.DB.Model(&models.Transaction{}).Where("client_request_id = ?", key).Count(&count)
-	if count != 0 {
-		t.Fatalf("设备联动失败时账目必须回滚，实际仍有 %d 条", count)
-	}
-
-	// 修复运行环境后同一幂等键重试：应完整成功，且只落一笔。
-	if err := db.DB.Create(&models.CuratorProfile{Name: "恢复主理人"}).Error; err != nil {
-		t.Fatal(err)
-	}
-	w2 := doJSON(r, http.MethodPost, "/api/v1/transactions", token, body)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("修复后重试失败: %d %s", w2.Code, w2.Body.String())
-	}
-	db.DB.Model(&models.Transaction{}).Where("client_request_id = ?", key).Count(&count)
-	if count != 1 {
-		t.Fatalf("幂等重试应只落一笔，实际 %d 条", count)
-	}
-	var profile models.CuratorProfile
-	if err := db.DB.First(&profile).Error; err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(profile.EDCGear, "联动失败账目") {
-		t.Fatalf("成功后设备应写回档案: %s", profile.EDCGear)
-	}
-}
-
-func TestCreateEntryRollsBackWhenFootprintSyncFails(t *testing.T) {
-	r, token := setupContractRouter(t)
-	if err := db.DB.Exec("DROP TABLE footprints").Error; err != nil {
-		t.Fatal(err)
-	}
-	body := map[string]any{
-		"type": "travel", "content": "下渗失败回滚",
-		"city_code": "510100", "city_name": "成都市",
-		"occurred_at": "2026-10-24T08:00", "client_request_id": "crid-fp-fail-0001",
-	}
-	w := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("足迹下渗失败时应整体回滚并返回 500，实际 %d %s", w.Code, w.Body.String())
-	}
-	var count int64
-	db.DB.Model(&models.LifeEntry{}).Count(&count)
-	if count != 0 {
-		t.Fatalf("足迹下渗失败不得留下散页，实际 %d 条", count)
-	}
-
-	if err := db.DB.AutoMigrate(&models.Footprint{}); err != nil {
-		t.Fatal(err)
-	}
-	w2 := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("修复后重试应成功: %d %s", w2.Code, w2.Body.String())
-	}
-	db.DB.Model(&models.LifeEntry{}).Count(&count)
-	if count != 1 {
-		t.Fatalf("重试后应只有一条散页，实际 %d 条", count)
-	}
-}
-
-func TestCreateEntryProjectCompanionPersistsIdempotencyKey(t *testing.T) {
-	r, token := setupContractRouter(t)
-	// 兜底校验修复后 project_id 必须指向真实存在的造物行
-	project := models.Project{Title: "造物四十二", Status: "进行中"}
-	if err := db.DB.Create(&project).Error; err != nil {
-		t.Fatalf("创建造物失败: %v", err)
-	}
-	projectID := project.ID
-	companion := models.LifeEntry{Type: "project", Title: "造物伴生", Content: "初始内容", ProjectID: &projectID}
-	if err := db.DB.Create(&companion).Error; err != nil {
-		t.Fatal(err)
-	}
-	const key = "crid-project-reuse-0001"
-	body := map[string]any{
-		"type": "project", "title": "造物伴生", "content": "修订内容",
-		"project_id": projectID, "client_request_id": key,
-	}
-
-	w := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
-	if w.Code != http.StatusOK {
-		t.Fatalf("复用伴生记录失败: %d %s", w.Code, w.Body.String())
-	}
-	var first struct {
-		Data models.LifeEntry `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
-		t.Fatal(err)
-	}
-	if first.Data.ID != companion.ID {
-		t.Fatalf("应复用伴生记录 #%d，实际 #%d", companion.ID, first.Data.ID)
-	}
-	var saved models.LifeEntry
-	if err := db.DB.First(&saved, companion.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if saved.ClientRequestID == nil || *saved.ClientRequestID != key {
-		t.Fatalf("复用分支必须持久化幂等键: %v", saved.ClientRequestID)
-	}
-
-	// 超过 10 秒复用窗口后，同一幂等键的重试仍须命中同一行。
-	if err := db.DB.Model(&models.LifeEntry{}).Where("id = ?", companion.ID).
-		Update("created_at", time.Now().Add(-time.Minute)).Error; err != nil {
-		t.Fatal(err)
-	}
-	w2 := doJSON(r, http.MethodPost, "/api/v1/entries", token, body)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("幂等重试失败: %d %s", w2.Code, w2.Body.String())
-	}
-	var second struct {
-		Data models.LifeEntry `json:"data"`
-	}
-	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
-		t.Fatal(err)
-	}
-	if second.Data.ID != companion.ID {
-		t.Fatalf("幂等重试应返回 #%d，实际 #%d", companion.ID, second.Data.ID)
-	}
-	var total int64
-	db.DB.Model(&models.LifeEntry{}).Count(&total)
-	if total != 1 {
-		t.Fatalf("幂等重试不得新建记录，实际 %d 条", total)
-	}
-}
-
-func TestUpdateFootprintClearsTitleAndCompanionContent(t *testing.T) {
-	r, token := setupContractRouter(t)
-	entry := models.LifeEntry{Type: "travel", Title: "原标题", Content: "原正文"}
-	if err := db.DB.Create(&entry).Error; err != nil {
-		t.Fatal(err)
-	}
-	footprint := models.Footprint{
-		CityCode: "330100", CityName: "杭州市", Title: "原旅程标题", Note: "原随笔",
-		VisitedAt: time.Now(), LifeEntryID: &entry.ID,
-	}
-	if err := db.DB.Create(&footprint).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.DB.Model(&models.LifeEntry{}).Where("id = ?", entry.ID).Update("footprint_id", footprint.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	path := "/api/v1/footprints/" + u64(footprint.ID)
-
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"title": nil, "note": nil}); w.Code != http.StatusOK {
-		t.Fatalf("null 更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var kept models.Footprint
-	var keptEntry models.LifeEntry
-	db.DB.First(&kept, footprint.ID)
-	db.DB.First(&keptEntry, entry.ID)
-	if kept.Title != "原旅程标题" || kept.Note != "原随笔" || keptEntry.Title != "原标题" || keptEntry.Content != "原正文" {
-		t.Fatalf("null 不得清空旅程/伴生文本: %+v / %+v", kept, keptEntry)
-	}
-
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"title": "", "note": ""}); w.Code != http.StatusOK {
-		t.Fatalf("清空失败: %d %s", w.Code, w.Body.String())
-	}
-	db.DB.First(&kept, footprint.ID)
-	db.DB.First(&keptEntry, entry.ID)
-	if kept.Title != "" || kept.Note != "" || keptEntry.Title != "" || keptEntry.Content != "" {
-		t.Fatalf("显式空串应清空旅程及伴生正文: %+v / %+v", kept, keptEntry)
-	}
-}
-
-func TestUpdateEntryExplicitEmptyLocationKeepsCity(t *testing.T) {
-	r, token := setupContractRouter(t)
-	entry := models.LifeEntry{
-		Type: "life", Title: "地点清空", Content: "正文",
-		CityCode: "510100", CityName: "成都市", Location: "春熙路",
-	}
-	if err := db.DB.Create(&entry).Error; err != nil {
-		t.Fatal(err)
-	}
-	w := doJSON(r, http.MethodPut, "/api/v1/entries/"+u64(entry.ID), token, map[string]any{
-		"city_code": "510100", "city_name": "成都市", "location": "",
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var saved models.LifeEntry
-	if err := db.DB.First(&saved, entry.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if saved.CityCode != "510100" {
-		t.Fatalf("城市应保留: %+v", saved)
-	}
-	if saved.Location != "" {
-		t.Fatalf("显式清空具体地点不得被城市名回填: %q", saved.Location)
-	}
-}
-
 func TestUpdateWishTextFieldsPreserveNull(t *testing.T) {
 	r, token := setupContractRouter(t)
 	wish := models.Wish{
 		Title: "原标题", Kind: "travel", Note: "原备注", Spec: "原规格",
-		CityCode: "330100", CityName: "杭州市", Budget: 12345, Status: "wanting",
+		Budget: 12345, Status: "wanting",
 	}
 	if err := db.DB.Create(&wish).Error; err != nil {
 		t.Fatal(err)
@@ -762,7 +337,7 @@ func TestUpdateWishTextFieldsPreserveNull(t *testing.T) {
 	path := "/api/v1/wishes/" + u64(wish.ID)
 
 	w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"title": nil, "note": nil, "spec": nil, "city_code": nil, "city_name": nil, "budget": nil,
+		"title": nil, "note": nil, "spec": nil, "budget": nil,
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("null 更新失败: %d %s", w.Code, w.Body.String())
@@ -770,20 +345,19 @@ func TestUpdateWishTextFieldsPreserveNull(t *testing.T) {
 	var kept models.Wish
 	db.DB.First(&kept, wish.ID)
 	if kept.Title != wish.Title || kept.Note != wish.Note || kept.Spec != wish.Spec ||
-		kept.CityCode != wish.CityCode || kept.CityName != wish.CityName || kept.Budget != wish.Budget {
+		kept.Budget != wish.Budget {
 		t.Fatalf("null 不得清空心愿字段: %+v", kept)
 	}
 
 	w = doJSON(r, http.MethodPut, path, token, map[string]any{
-		"note": "", "spec": "", "city_code": "", "city_name": "", "budget": 0,
+		"note": "", "spec": "", "budget": 0,
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("清空失败: %d %s", w.Code, w.Body.String())
 	}
 	var cleared models.Wish
 	db.DB.First(&cleared, wish.ID)
-	if cleared.Note != "" || cleared.Spec != "" || cleared.CityCode != "" ||
-		cleared.CityName != "" || cleared.Budget != 0 {
+	if cleared.Note != "" || cleared.Spec != "" || cleared.Budget != 0 {
 		t.Fatalf("显式空串应清空心愿字段: %+v", cleared)
 	}
 }
@@ -844,25 +418,6 @@ func TestUpdateTransactionTextFieldsPreserveNull(t *testing.T) {
 	}
 }
 
-func TestUpdateFootprintNotePreservesNull(t *testing.T) {
-	r, token := setupContractRouter(t)
-	footprint := models.Footprint{CityCode: "330100", CityName: "杭州市", Title: "标题", Note: "原随笔", VisitedAt: time.Now()}
-	if err := db.DB.Create(&footprint).Error; err != nil {
-		t.Fatal(err)
-	}
-	w := doJSON(r, http.MethodPut, "/api/v1/footprints/"+u64(footprint.ID), token, map[string]any{"note": nil})
-	if w.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var kept models.Footprint
-	if err := db.DB.First(&kept, footprint.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if kept.Note != footprint.Note {
-		t.Fatalf("null 不得清空随笔: %q", kept.Note)
-	}
-}
-
 func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -872,13 +427,10 @@ func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 		detachWish bool
 		unbound    bool
 	}{
-		{name: "related_footprint", owner: "footprint", related: true},
-		{name: "related_footprint_rebind", owner: "footprint", related: true, clearFirst: true},
 		{name: "related_wish", owner: "wish", related: true},
 		{name: "detach_wish_keep_image", owner: "wish", related: true, detachWish: true},
 		{name: "detach_wish_rebind_image", owner: "wish", related: true, detachWish: true, clearFirst: true},
 		{name: "detached_wish_rejects_new_image", owner: "wish", related: true, detachWish: true, unbound: true},
-		{name: "foreign_footprint", owner: "footprint"},
 		{name: "foreign_wish", owner: "wish"},
 		{name: "foreign_entry", owner: "entry"},
 	} {
@@ -886,9 +438,6 @@ func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 			r, token := setupContractRouter(t)
 			ownerID := uint(700)
 			entry := models.LifeEntry{Type: "life", Title: "原记录", Content: "原内容"}
-			if tc.related && tc.owner == "footprint" {
-				entry.FootprintID = &ownerID
-			}
 			if tc.related && tc.owner == "wish" {
 				entry.WishID = &ownerID
 			}
@@ -900,8 +449,6 @@ func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 				attachment.EntryID = &entry.ID
 			}
 			switch tc.owner {
-			case "footprint":
-				attachment.FootprintID = &ownerID
 			case "wish":
 				attachment.WishID = &ownerID
 			case "entry":
@@ -929,7 +476,7 @@ func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 				t.Fatal(err)
 			}
 			sameID := func(a, b *uint) bool { return a == nil && b == nil || a != nil && b != nil && *a == *b }
-			if !sameID(reloaded.EntryID, attachment.EntryID) || !sameID(reloaded.FootprintID, attachment.FootprintID) || !sameID(reloaded.WishID, attachment.WishID) {
+			if !sameID(reloaded.EntryID, attachment.EntryID) || !sameID(reloaded.WishID, attachment.WishID) {
 				t.Fatalf("原有附件归属不得被改写: %+v", reloaded)
 			}
 			var updated models.LifeEntry
@@ -941,156 +488,6 @@ func TestUpdateEntryAttachmentOwnership(t *testing.T) {
 			}
 			if wantStatus == http.StatusOK && tc.detachWish && updated.WishID != nil {
 				t.Fatal("引用 null 仍应解绑心愿")
-			}
-		})
-	}
-}
-
-func TestFootprintAttachmentReadUnion(t *testing.T) {
-	for _, primaryOnly := range []bool{false, true} {
-		t.Run(fmt.Sprint(primaryOnly), func(t *testing.T) {
-			r, token := setupContractRouter(t)
-			entry := models.LifeEntry{Type: "travel", Content: "共享记录", OccurredAt: time.Now()}
-			if err := db.DB.Create(&entry).Error; err != nil {
-				t.Fatal(err)
-			}
-			footprints := []models.Footprint{
-				{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now(), LifeEntryID: &entry.ID},
-				{CityCode: "510100", CityName: "成都市", VisitedAt: time.Now()},
-			}
-			if err := db.DB.Create(&footprints).Error; err != nil {
-				t.Fatal(err)
-			}
-			entryOwner := footprints[0].ID
-			if primaryOnly {
-				entryOwner = footprints[1].ID
-			}
-			if err := db.DB.Model(&entry).Update("footprint_id", entryOwner).Error; err != nil {
-				t.Fatal(err)
-			}
-			attachment := models.Attachment{ObjectKey: "entries/mixed.png", EntryID: &entry.ID, FootprintID: &footprints[1].ID}
-			if err := db.DB.Create(&attachment).Error; err != nil {
-				t.Fatal(err)
-			}
-			w := doJSON(r, http.MethodPut, "/api/v1/footprints/"+u64(footprints[0].ID), token,
-				map[string]any{"attachment_ids": []uint{attachment.ID}})
-			if w.Code != http.StatusOK {
-				t.Fatalf("保留共享图片失败: %d %s", w.Code, w.Body.String())
-			}
-			populateFootprintURLsBatch(footprints)
-			for _, fp := range footprints {
-				if len(fp.Attachments) != 1 || fp.Attachments[0].ID != attachment.ID {
-					t.Fatalf("批量返回应保留图片 #%d: footprint=%d attachments=%+v", attachment.ID, fp.ID, fp.Attachments)
-				}
-				populateFootprintURLs(&fp)
-				if len(fp.Attachments) != 1 || fp.Attachments[0].ID != attachment.ID {
-					t.Fatalf("详情与批量应一致: footprint=%d attachments=%+v", fp.ID, fp.Attachments)
-				}
-			}
-			var kept models.Attachment
-			if err := db.DB.First(&kept, attachment.ID).Error; err != nil {
-				t.Fatal(err)
-			}
-			if kept.EntryID == nil || *kept.EntryID != entry.ID || kept.FootprintID == nil || *kept.FootprintID != footprints[1].ID {
-				t.Fatalf("保留图片不得改写原归属: %+v", kept)
-			}
-		})
-	}
-}
-
-func TestUpdateFootprintAttachmentSelection(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		clear   bool
-		replace bool
-	}{
-		{name: "clear_flag", clear: true},
-		{name: "empty_list"},
-		{name: "replace", replace: true},
-		{name: "clear_then_replace", clear: true, replace: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r, token := setupContractRouter(t)
-			entries := []models.LifeEntry{
-				{Type: "travel", Content: "旅程主记录", OccurredAt: time.Now()},
-				{Type: "travel", Content: "旅程另一条记录", OccurredAt: time.Now()},
-				{Type: "life", Content: "无关记录", OccurredAt: time.Now()},
-			}
-			if err := db.DB.Create(&entries).Error; err != nil {
-				t.Fatal(err)
-			}
-			fp := models.Footprint{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now(), LifeEntryID: &entries[0].ID}
-			if err := db.DB.Create(&fp).Error; err != nil {
-				t.Fatal(err)
-			}
-			linkedIDs := []uint{entries[0].ID, entries[1].ID}
-			if err := db.DB.Model(&models.LifeEntry{}).Where("id IN ?", linkedIDs).Update("footprint_id", fp.ID).Error; err != nil {
-				t.Fatal(err)
-			}
-			wishID := uint(800)
-			attachments := []models.Attachment{
-				{ObjectKey: "entries/primary.png", EntryID: &entries[0].ID, FootprintID: &fp.ID, WishID: &wishID},
-				{ObjectKey: "entries/extra.png", EntryID: &entries[1].ID},
-				{ObjectKey: "entries/unrelated.png", EntryID: &entries[2].ID},
-				{ObjectKey: "entries/new.png"},
-			}
-			if err := db.DB.Create(&attachments).Error; err != nil {
-				t.Fatal(err)
-			}
-			payload := map[string]any{"clear_attachments": tc.clear}
-			if tc.replace {
-				payload["attachment_ids"] = []uint{attachments[1].ID, attachments[3].ID}
-			} else if !tc.clear {
-				payload["attachment_ids"] = []uint{}
-			}
-			path := "/api/v1/footprints/" + u64(fp.ID)
-			w := doJSON(r, http.MethodPut, path, token, payload)
-			if w.Code != http.StatusOK {
-				t.Fatalf("清理旅程图片失败: %d %s", w.Code, w.Body.String())
-			}
-			wantCount := 0
-			if tc.replace {
-				wantCount = 2
-			}
-			for _, method := range []string{http.MethodPut, http.MethodGet} {
-				if method == http.MethodGet {
-					w = doJSON(r, method, path, token, nil)
-				}
-				var response struct {
-					Data models.Footprint `json:"data"`
-				}
-				if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-					t.Fatal(err)
-				}
-				if w.Code != http.StatusOK || len(response.Data.Attachments) != wantCount {
-					t.Fatalf("%s 应返回 %d 张图片: %d %s", method, wantCount, w.Code, w.Body.String())
-				}
-			}
-			batch := []models.Footprint{fp}
-			populateFootprintURLsBatch(batch)
-			if len(batch[0].Attachments) != wantCount {
-				t.Fatalf("列表与详情图片应一致: %d", len(batch[0].Attachments))
-			}
-			var removed, extra, unrelated models.Attachment
-			for _, item := range []struct {
-				id  uint
-				dst *models.Attachment
-			}{{attachments[0].ID, &removed}, {attachments[1].ID, &extra}, {attachments[2].ID, &unrelated}} {
-				if err := db.DB.First(item.dst, item.id).Error; err != nil {
-					t.Fatal(err)
-				}
-			}
-			if removed.EntryID != nil || removed.FootprintID != nil || removed.WishID == nil || *removed.WishID != wishID {
-				t.Fatalf("已移除图片应解绑当前旅程及散页，保留心愿归属: %+v", removed)
-			}
-			if tc.replace && (extra.EntryID == nil || *extra.EntryID != entries[1].ID) {
-				t.Fatal("保留图片不得从其他旅程记录迁移到主记录")
-			}
-			if !tc.replace && extra.EntryID != nil {
-				t.Fatal("清空图片应同时解绑该旅程其他记录的图片")
-			}
-			if unrelated.EntryID == nil || *unrelated.EntryID != entries[2].ID {
-				t.Fatal("不得修改无关记录的图片")
 			}
 		})
 	}

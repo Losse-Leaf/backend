@@ -27,15 +27,11 @@ func setupTombstoneRouter(t *testing.T) (*gin.Engine, string) {
 	r := gin.New()
 	r.GET("/api/v1/entries", GetLifeEntriesV1)
 	r.GET("/api/v1/transactions", GetTransactions)
-	r.GET("/api/v1/projects", GetProjectsV1)
 	r.GET("/api/v1/wishes", GetWishes)
-	r.GET("/api/v1/footprints", GetFootprints)
 
 	r.DELETE("/api/v1/entries/:id", DeleteLifeEntry)
 	r.DELETE("/api/v1/transactions/:id", DeleteTransaction)
-	r.DELETE("/api/v1/projects/:id", DeleteProject)
 	r.DELETE("/api/v1/wishes/:id", DeleteWish)
-	r.DELETE("/api/v1/footprints/:id", DeleteFootprint)
 	return r, token
 }
 
@@ -118,19 +114,6 @@ func TestPurgeWritesSyncTombstones(t *testing.T) {
 			purgePath: func(id uint) string { return "/api/v1/transactions/" + u64(id) + "?purge=true" },
 		},
 		{
-			name:       "project",
-			entityType: TombstoneEntityProject,
-			listPath:   "/api/v1/projects",
-			seed: func() uint {
-				item := models.Project{Title: "待物理删除项目"}
-				if err := db.DB.Create(&item).Error; err != nil {
-					t.Fatalf("seed project: %v", err)
-				}
-				return item.ID
-			},
-			purgePath: func(id uint) string { return "/api/v1/projects/" + u64(id) + "?purge=true" },
-		},
-		{
 			name:       "wish",
 			entityType: TombstoneEntityWish,
 			listPath:   "/api/v1/wishes",
@@ -143,19 +126,6 @@ func TestPurgeWritesSyncTombstones(t *testing.T) {
 				return item.ID
 			},
 			purgePath: func(id uint) string { return "/api/v1/wishes/" + u64(id) + "?purge=true" },
-		},
-		{
-			name:       "footprint",
-			entityType: TombstoneEntityFootprint,
-			listPath:   "/api/v1/footprints",
-			seed: func() uint {
-				item := models.Footprint{CityCode: "330100", CityName: "杭州", VisitedAt: time.Now()}
-				if err := db.DB.Create(&item).Error; err != nil {
-					t.Fatalf("seed footprint: %v", err)
-				}
-				return item.ID
-			},
-			purgePath: func(id uint) string { return "/api/v1/footprints/" + u64(id) + "?purge=true" },
 		},
 	}
 
@@ -231,74 +201,6 @@ func TestPurgeWritesSyncTombstones(t *testing.T) {
 				t.Fatalf("expected 1 tombstone for %s/%d, got %d", tc.entityType, id, count)
 			}
 		})
-	}
-}
-
-// 级联物理删除：项目 purge 连带散页、足迹 purge 连带首生散页、
-// 散页 purge 连带首生足迹，都必须逐条留下墓碑。
-func TestPurgeCascadeWritesSyncTombstones(t *testing.T) {
-	r, token := setupTombstoneRouter(t)
-	oldSince := sinceParam(time.Now().Add(-2 * time.Hour))
-
-	project := models.Project{Title: "级联项目"}
-	if err := db.DB.Create(&project).Error; err != nil {
-		t.Fatal(err)
-	}
-	entryA := models.LifeEntry{Type: "project", Title: "项目散页A", ProjectID: &project.ID, OccurredAt: time.Now()}
-	entryB := models.LifeEntry{Type: "project", Title: "项目散页B", ProjectID: &project.ID, OccurredAt: time.Now()}
-	if err := db.DB.Create(&entryA).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.DB.Create(&entryB).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	if w := doJSON(r, http.MethodDelete, "/api/v1/projects/"+u64(project.ID)+"?purge=true", token, nil); w.Code != http.StatusOK {
-		t.Fatalf("purge project failed: %d %s", w.Code, w.Body.String())
-	}
-
-	w := doJSON(r, http.MethodGet, "/api/v1/entries?since="+oldSince, token, nil)
-	rows := tombstoneRows(t, w, "entries")
-	for _, id := range []uint{entryA.ID, entryB.ID} {
-		row := findTombstoneRow(rows, id)
-		if row == nil || row["deleted_at"] == nil {
-			t.Fatalf("expected cascade entry tombstone for id=%d, rows=%v", id, rows)
-		}
-	}
-
-	// 足迹 purge 连带首生散页
-	entryC := models.LifeEntry{Type: "travel", Title: "足迹首生散页", OccurredAt: time.Now()}
-	if err := db.DB.Create(&entryC).Error; err != nil {
-		t.Fatal(err)
-	}
-	fp := models.Footprint{CityCode: "330100", CityName: "杭州", VisitedAt: time.Now(), LifeEntryID: &entryC.ID}
-	if err := db.DB.Create(&fp).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodDelete, "/api/v1/footprints/"+u64(fp.ID)+"?purge=true", token, nil); w.Code != http.StatusOK {
-		t.Fatalf("purge footprint failed: %d %s", w.Code, w.Body.String())
-	}
-
-	w = doJSON(r, http.MethodGet, "/api/v1/entries?since="+oldSince, token, nil)
-	if row := findTombstoneRow(tombstoneRows(t, w, "entries"), entryC.ID); row == nil {
-		t.Fatalf("expected cascade entry tombstone for footprint first-born entry id=%d", entryC.ID)
-	}
-
-	// 散页 purge 连带首生足迹
-	entryD := models.LifeEntry{Type: "travel", Title: "将连带删除足迹", OccurredAt: time.Now()}
-	if err := db.DB.Create(&entryD).Error; err != nil {
-		t.Fatal(err)
-	}
-	fpD := models.Footprint{CityCode: "310100", CityName: "上海", VisitedAt: time.Now(), LifeEntryID: &entryD.ID}
-	if err := db.DB.Create(&fpD).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodDelete, "/api/v1/entries/"+u64(entryD.ID)+"?purge=true", token, nil); w.Code != http.StatusOK {
-		t.Fatalf("purge entry failed: %d %s", w.Code, w.Body.String())
-	}
-	w = doJSON(r, http.MethodGet, "/api/v1/footprints?since="+oldSince, token, nil)
-	if row := findTombstoneRow(tombstoneRows(t, w, ""), fpD.ID); row == nil {
-		t.Fatalf("expected cascade footprint tombstone for id=%d", fpD.ID)
 	}
 }
 

@@ -11,25 +11,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"loose-leaf/internal/db"
-	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 )
 
-// TestCompanionEntries 校验「所有二级对象都要在时间流里留下一条一级记录」这一契约。
-//
-// 后端历史行为不一致：心愿 / 造物创建时会建伴生记录但编辑不更新、删除留孤儿；
-// 器物则从头到尾都没有伴生记录。这里逐条钉住期望行为，防止回退。
+// TestCompanionEntries 校验「心愿在时间流里留下一条伴生一级记录」这一契约。
 func TestCompanionEntries(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
-
-	testMasterKey := "lldt_companion_device_token_1"
-	seedTestAdminDevice(testMasterKey)
-
-	// 器物接口要求主理人档案已初始化
-	if err := db.DB.Create(&models.CuratorProfile{Name: "测试主理人"}).Error; err != nil {
-		t.Fatalf("seed curator profile: %v", err)
-	}
 
 	r := gin.New()
 	v1 := r.Group("/api/v1")
@@ -37,12 +25,6 @@ func TestCompanionEntries(t *testing.T) {
 		v1.POST("/wishes", CreateWish)
 		v1.PUT("/wishes/:id", UpdateWish)
 		v1.DELETE("/wishes/:id", DeleteWish)
-	}
-	write := v1.Group("")
-	write.Use(middleware.AdminAuthRequired())
-	{
-		write.POST("/assets/gear", AddGearAsset)
-		write.DELETE("/assets/gear/:id", DeleteGearAsset)
 	}
 
 	// countEntriesByWish 统计某心愿关联的伴生一级记录
@@ -59,7 +41,7 @@ func TestCompanionEntries(t *testing.T) {
 		return e.Title
 	}
 
-	// ── 1. 心愿：创建 / 编辑 / 删除的伴生记录语义 ──────────────────────────
+	// ── 心愿：创建 / 编辑 / 删除的伴生记录语义 ──────────────────────────
 	t.Run("Wish companion entry lifecycle", func(t *testing.T) {
 		body, _ := json.Marshal(map[string]any{
 			"title":  "补档的旧心愿",
@@ -121,62 +103,6 @@ func TestCompanionEntries(t *testing.T) {
 		}
 		if n := countEntriesByWish(wishID); n != 0 {
 			t.Fatalf("deleting a wish must remove its companion entry, %d left", n)
-		}
-	})
-
-	// ── 2. 器物：添置时必须建伴生记录，删除时必须清理 ──────────────────────
-	t.Run("Gear companion entry lifecycle", func(t *testing.T) {
-		body, _ := json.Marshal(map[string]any{
-			"name":          "测试用相机",
-			"category":      "数码器材",
-			"price_cents":   599900,
-			"purchase_date": "2026-03-01",
-		})
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest(http.MethodPost, "/api/v1/assets/gear", bytes.NewBuffer(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Device-Token", testMasterKey)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("add gear failed: %d %s", w.Code, w.Body.String())
-		}
-		var resp struct {
-			Data models.GearItem `json:"data"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode gear: %v", err)
-		}
-		gearID := resp.Data.ID
-		if gearID == "" {
-			t.Fatalf("gear id missing in response: %s", w.Body.String())
-		}
-
-		var n int64
-		db.DB.Model(&models.LifeEntry{}).Where("gear_id = ?", gearID).Count(&n)
-		if n != 1 {
-			t.Fatalf("adding a gear must create exactly 1 companion entry, got %d", n)
-		}
-
-		var gearEntry models.LifeEntry
-		db.DB.Where("gear_id = ?", gearID).First(&gearEntry)
-		if gearEntry.Title != "添置器物 · 测试用相机" {
-			t.Fatalf("unexpected gear companion title: %q", gearEntry.Title)
-		}
-		// 伴生记录要落在购入日期上（补档）
-		if gearEntry.OccurredAt.Year() != 2026 || gearEntry.OccurredAt.Month() != time.March {
-			t.Fatalf("gear companion entry should be dated at the purchase date, got %v", gearEntry.OccurredAt)
-		}
-
-		w2 := httptest.NewRecorder()
-		req2, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("/api/v1/assets/gear/%s", gearID), nil)
-		req2.Header.Set("X-Device-Token", testMasterKey)
-		r.ServeHTTP(w2, req2)
-		if w2.Code != http.StatusOK {
-			t.Fatalf("delete gear failed: %d %s", w2.Code, w2.Body.String())
-		}
-		db.DB.Model(&models.LifeEntry{}).Where("gear_id = ?", gearID).Count(&n)
-		if n != 0 {
-			t.Fatalf("deleting a gear must remove its companion entry, %d left", n)
 		}
 	})
 }

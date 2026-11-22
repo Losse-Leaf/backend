@@ -52,79 +52,6 @@ func TestListAggregateIgnoresPagination(t *testing.T) {
 	}
 }
 
-// 足迹列表的 total_spent 仅管理员可见，ETag 必须按角色隔离。
-func TestFootprintETagRoleIsolation(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	setupTestFullDB(t)
-	enableAllPublicModulesForTest(t)
-
-	adminKey := "lldt_audit_fp_etag"
-	seedTestAdminDevice(adminKey)
-
-	visited := time.Date(2026, 6, 1, 10, 0, 0, 0, time.Local)
-	fp := models.Footprint{CityCode: "310100", CityName: "上海市", VisitedAt: visited}
-	if err := db.DB.Create(&fp).Error; err != nil {
-		t.Fatalf("seed footprint: %v", err)
-	}
-	tx := models.Transaction{
-		Amount: 12800, Type: "expense", Category: "餐饮",
-		OccurredAt: visited, FootprintID: &fp.ID,
-	}
-	db.DB.Create(&tx)
-
-	r := gin.New()
-	r.GET("/api/v1/footprints", GetFootprints)
-	r.PUT("/api/v1/transactions/:id", UpdateTransaction)
-
-	guest := httptest.NewRecorder()
-	r.ServeHTTP(guest, httptest.NewRequest(http.MethodGet, "/api/v1/footprints", nil))
-	if guest.Code != http.StatusOK {
-		t.Fatalf("guest request failed: %d", guest.Code)
-	}
-	guestETag := guest.Header().Get("ETag")
-	if guestETag == "" {
-		t.Fatalf("missing guest ETag")
-	}
-	if guest.Header().Get("Vary") == "" {
-		t.Fatalf("role-dependent footprint list must send Vary")
-	}
-
-	admin := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/footprints", nil)
-	req.Header.Set("Authorization", "Bearer "+adminKey)
-	req.Header.Set("If-None-Match", guestETag)
-	r.ServeHTTP(admin, req)
-	if admin.Code != http.StatusOK {
-		t.Fatalf("admin must not inherit guest 304, got %d", admin.Code)
-	}
-	adminETag := admin.Header().Get("ETag")
-	if adminETag == guestETag {
-		t.Fatalf("admin/guest ETags must differ: %s", adminETag)
-	}
-
-	// 改一笔已挂载的账目 → 旅程花销变了 → 足迹 ETag 必须变化。
-	body, _ := json.Marshal(TransactionRequest{
-		Amount: 20000, Type: "expense", Category: "餐饮",
-		OccurredAt: visited.Format("2006-01-02T15:04:05+08:00"),
-	})
-	put := httptest.NewRecorder()
-	putReq := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/transactions/%d", tx.ID), bytes.NewReader(body))
-	putReq.Header.Set("Content-Type", "application/json")
-	putReq.Header.Set("Authorization", "Bearer "+adminKey)
-	r.ServeHTTP(put, putReq)
-	if put.Code != http.StatusOK {
-		t.Fatalf("update transaction failed: %d %s", put.Code, put.Body.String())
-	}
-
-	after := httptest.NewRecorder()
-	afterReq := httptest.NewRequest(http.MethodGet, "/api/v1/footprints", nil)
-	afterReq.Header.Set("Authorization", "Bearer "+adminKey)
-	r.ServeHTTP(after, afterReq)
-	if got := after.Header().Get("ETag"); got == adminETag {
-		t.Fatalf("footprint ETag must change after linked transaction update, still %s", got)
-	}
-}
-
 // 散页内嵌的心愿必须与心愿列表同口径脱敏，访客不能绕过 /wishes 看到实付金额。
 func TestEmbeddedWishFinancialRedaction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -135,7 +62,6 @@ func TestEmbeddedWishFinancialRedaction(t *testing.T) {
 	seedTestAdminDevice(adminKey)
 
 	txID := uint(7)
-	gearID := "gear_audit"
 	wish := models.Wish{
 		Title:         "一台胶片机",
 		Kind:          "item",
@@ -143,7 +69,6 @@ func TestEmbeddedWishFinancialRedaction(t *testing.T) {
 		ActualCost:    480000,
 		Status:        "fulfilled",
 		TransactionID: &txID,
-		GearID:        &gearID,
 	}
 	if err := db.DB.Create(&wish).Error; err != nil {
 		t.Fatalf("seed wish: %v", err)
@@ -179,9 +104,9 @@ func TestEmbeddedWishFinancialRedaction(t *testing.T) {
 			if w == nil {
 				t.Fatalf("%s: embedded wish missing", label)
 			}
-			if w.ActualCost != 0 || w.TransactionID != nil || w.GearID != nil {
-				t.Fatalf("%s leaks wish finances: actual_cost=%d tx=%v gear=%v",
-					label, w.ActualCost, w.TransactionID, w.GearID)
+			if w.ActualCost != 0 || w.TransactionID != nil {
+				t.Fatalf("%s leaks wish finances: actual_cost=%d tx=%v",
+					label, w.ActualCost, w.TransactionID)
 			}
 			if w.Budget != 500000 {
 				t.Fatalf("%s: budget is public and must stay, got %d", label, w.Budget)
@@ -288,10 +213,8 @@ func TestCleanupUploadKeepsSharedAttachments(t *testing.T) {
 	}
 }
 
-// 显式清空契约：content 为空串、clear_city=true 必须真正清空城市归属，不能被“省略=保持”吞掉。
-// 契约 A 修正：clear_city 只清城市归属（city_code/city_name），location 归契约 C 管理 ——
-// 未显式携带 location 时保持原值；全清需显式携带 location 空串。
-func TestEntryExplicitClearContentAndCity(t *testing.T) {
+// 显式清空契约：content 为空串、location 为空串必须真正清空。
+func TestEntryExplicitClearContentAndLocation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 	adminKey := "lldt_clear_entry"
@@ -299,7 +222,7 @@ func TestEntryExplicitClearContentAndCity(t *testing.T) {
 
 	entry := models.LifeEntry{
 		Type: "life", Title: "有正文", Content: "要被清空",
-		OccurredAt: time.Now(), CityCode: "330100", CityName: "杭州市", Location: "西湖边",
+		OccurredAt: time.Now(), Location: "西湖边",
 	}
 	if err := db.DB.Create(&entry).Error; err != nil {
 		t.Fatalf("seed: %v", err)
@@ -307,7 +230,7 @@ func TestEntryExplicitClearContentAndCity(t *testing.T) {
 
 	r := gin.New()
 	r.PUT("/api/v1/entries/:id", UpdateLifeEntry)
-	body := `{"content":"","clear_city":true}`
+	body := `{"content":""}`
 	req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/entries/%d", entry.ID), bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminKey)
@@ -319,16 +242,15 @@ func TestEntryExplicitClearContentAndCity(t *testing.T) {
 
 	var got models.LifeEntry
 	db.DB.First(&got, entry.ID)
-	if got.Content != "" || got.CityCode != "" || got.CityName != "" {
-		t.Fatalf("explicit clear failed: content=%q city=%q/%q", got.Content, got.CityCode, got.CityName)
+	if got.Content != "" {
+		t.Fatalf("explicit clear failed: content=%q", got.Content)
 	}
-	// clear_city 不再连带清空 location：用户填写的具体地点由契约 C 显式管理
 	if got.Location != "西湖边" {
-		t.Fatalf("clear_city 后 location 应保持原值, 实际 %q", got.Location)
+		t.Fatalf("未携带 location 时应保持原值, 实际 %q", got.Location)
 	}
 
 	// 全清路径：显式携带 location 空串才清空地点（契约 C）
-	body2 := `{"content":"","clear_city":true,"location":""}`
+	body2 := `{"content":"","location":""}`
 	req2 := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/entries/%d", entry.ID), bytes.NewBufferString(body2))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer "+adminKey)
@@ -340,33 +262,5 @@ func TestEntryExplicitClearContentAndCity(t *testing.T) {
 	db.DB.First(&got, entry.ID)
 	if got.Location != "" {
 		t.Fatalf("显式携带 location 空串应清空地点, 实际 %q", got.Location)
-	}
-}
-
-// 心愿目的地支持显式清空（空串 = 清空）。
-func TestWishExplicitClearCity(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	setupTestFullDB(t)
-	adminKey := "lldt_clear_wish"
-	seedTestAdminDevice(adminKey)
-
-	wish := models.Wish{Title: "去大理", Kind: "travel", CityCode: "532900", CityName: "大理白族自治州", Status: "wanting"}
-	if err := db.DB.Create(&wish).Error; err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	r := gin.New()
-	r.PUT("/api/v1/wishes/:id", UpdateWish)
-	req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/v1/wishes/%d", wish.ID), bytes.NewBufferString(`{"city_code":"","city_name":""}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+adminKey)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("update failed: %d %s", w.Code, w.Body.String())
-	}
-	var got models.Wish
-	db.DB.First(&got, wish.ID)
-	if got.CityCode != "" || got.CityName != "" {
-		t.Fatalf("wish city clear failed: %q/%q", got.CityCode, got.CityName)
 	}
 }

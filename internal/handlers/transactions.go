@@ -32,8 +32,6 @@ type TransactionRequest struct {
 	Note                    string `json:"note"`
 	PaymentMethod           string `json:"payment_method"`
 	WishID                  *uint  `json:"wish_id"`
-	FootprintID             *uint  `json:"footprint_id"`
-	CityCode                string `json:"city_code"`
 	OccurredAt              string `json:"occurred_at"`
 	IsInstallment           *bool  `json:"is_installment"`
 	ClearInstallment        bool   `json:"clear_installment"`
@@ -46,14 +44,10 @@ type TransactionRequest struct {
 	InstallmentFeeMode      string `json:"installment_fee_mode"`
 	InstallmentFeeValue     int64  `json:"installment_fee_value"`
 	FirstDueDate            string `json:"first_due_date"`
-	LinkGearAsset           bool   `json:"link_gear_asset"`
-	GearCategory            string `json:"gear_category"`
-	GearSpec                string `json:"gear_spec"`
-	ClearCity               bool   `json:"clear_city"`
 	ClientRequestID         string `json:"client_request_id"`
 }
 
-// CreateTransaction 记一笔 (支持分期付款与随身设备库双向绑定 RC-53)
+// CreateTransaction 记一笔 (支持分期付款与心愿单联动)
 func CreateTransaction(c *gin.Context) {
 	var req TransactionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -70,7 +64,6 @@ func CreateTransaction(c *gin.Context) {
 		Error(c, http.StatusBadRequest, "发生时间格式无法识别")
 		return
 	}
-	cleanCityCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", "")
 
 	clientRequestID := strings.TrimSpace(req.ClientRequestID)
 	if existing, deleted, ok := findIdempotentReplay[models.Transaction](clientRequestID, func(t *models.Transaction) (uint, bool) {
@@ -121,9 +114,6 @@ func CreateTransaction(c *gin.Context) {
 	if req.WishID != nil && *req.WishID == 0 {
 		req.WishID = nil
 	}
-	if req.FootprintID != nil && *req.FootprintID == 0 {
-		req.FootprintID = nil
-	}
 	if req.WishID != nil && *req.WishID > 0 {
 		var wishCount int64
 		db.DB.Unscoped().Model(&models.Wish{}).Where("id = ?", *req.WishID).Count(&wishCount)
@@ -131,18 +121,6 @@ func CreateTransaction(c *gin.Context) {
 			Error(c, http.StatusBadRequest, "关联的心愿不存在")
 			return
 		}
-	}
-	if req.FootprintID != nil && *req.FootprintID > 0 {
-		var fpCount int64
-		db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
-		if fpCount == 0 {
-			Error(c, http.StatusBadRequest, "关联的旅程不存在")
-			return
-		}
-	}
-	if req.WishID != nil && req.FootprintID != nil {
-		Error(c, http.StatusBadRequest, "心愿与足迹只能二选一")
-		return
 	}
 
 	record := models.Transaction{
@@ -153,15 +131,11 @@ func CreateTransaction(c *gin.Context) {
 		Note:          strings.TrimSpace(req.Note),
 		PaymentMethod: strings.TrimSpace(req.PaymentMethod),
 		WishID:        req.WishID,
-		FootprintID:   req.FootprintID,
-		CityCode:      cleanCityCode,
 		OccurredAt:    occurred,
 	}
 	if clientRequestID != "" {
 		record.ClientRequestID = &clientRequestID
 	}
-
-	autoLinkTransactionFootprint(&record)
 
 	if req.IsInstallment != nil && *req.IsInstallment {
 		AssembleInstallmentTransaction(
@@ -178,43 +152,12 @@ func CreateTransaction(c *gin.Context) {
 		)
 	}
 
-	linkGear := req.LinkGearAsset
-	if linkGear {
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
-	}
-
 	err = db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
 
-		var newGearID string
-		if linkGear {
-			gearCategory := strings.TrimSpace(req.GearCategory)
-			if gearCategory == "" {
-				gearCategory = record.Category
-			}
-			createdGear, err := appendGearItemTx(tx, models.GearItem{
-				Name:         record.Title,
-				Spec:         req.GearSpec,
-				Category:     gearCategory,
-				Status:       "active",
-				PriceCents:   record.Amount,
-				PurchaseDate: record.OccurredAt.In(config.BeijingLocation).Format("2006-01-02"),
-				Note:         record.Note,
-			}, record.OccurredAt, false, false)
-			if err != nil {
-				return err
-			}
-			newGearID = createdGear.ID
-		}
-
 		if req.IsInstallment != nil && *req.IsInstallment && record.Type == "expense" {
-			kind := "expense"
-			if linkGear {
-				kind = "asset"
-			}
 			_, _, err := CreatePlanForTransactionTx(
 				tx,
 				&record,
@@ -224,8 +167,7 @@ func CreateTransaction(c *gin.Context) {
 				req.InstallmentFeeValue,
 				req.FirstDueDate,
 				req.RepaymentDay,
-				kind,
-				newGearID,
+				"expense",
 			)
 			if err != nil {
 				return err
@@ -260,9 +202,6 @@ func CreateTransaction(c *gin.Context) {
 		return
 	}
 
-	if record.FootprintID != nil {
-		touchFootprintTimestamps(db.DB, *record.FootprintID)
-	}
 	InvalidateStatsCache()
 
 	Success(c, record)
@@ -437,10 +376,6 @@ func UpdateTransaction(c *gin.Context) {
 	}
 	var rawKeys map[string]json.RawMessage
 	_ = json.Unmarshal(rawBytes, &rawKeys)
-	oldFootprintID := uint(0)
-	if tx.FootprintID != nil {
-		oldFootprintID = *tx.FootprintID
-	}
 	if req.Amount < 0 {
 		Error(c, http.StatusBadRequest, "金额必须大于 0")
 		return
@@ -484,27 +419,6 @@ func UpdateTransaction(c *gin.Context) {
 			tx.WishID = req.WishID
 		}
 	}
-	footprintUnbound := false
-	if req.FootprintID != nil {
-		if *req.FootprintID == 0 {
-			tx.FootprintID = nil
-			footprintUnbound = true
-		} else {
-			var fpCount int64
-			db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
-			if fpCount == 0 {
-				Error(c, http.StatusBadRequest, "关联的旅程不存在")
-				return
-			}
-			tx.FootprintID = req.FootprintID
-		}
-	}
-	wishCarriedBound := req.WishID != nil && *req.WishID > 0
-	footprintCarriedBound := req.FootprintID != nil && *req.FootprintID > 0
-	if (wishCarriedBound && tx.FootprintID != nil) || (footprintCarriedBound && tx.WishID != nil) {
-		Error(c, http.StatusBadRequest, "心愿与足迹只能二选一")
-		return
-	}
 
 	if !transactionCategoryAllowed(tx.Type, req.Category) {
 		Error(c, http.StatusBadRequest, "分类不存在于分类字典")
@@ -520,11 +434,6 @@ func UpdateTransaction(c *gin.Context) {
 	if req.PaymentMethod != "" || hasJSONValue(rawKeys, "payment_method") {
 		tx.PaymentMethod = strings.TrimSpace(req.PaymentMethod)
 	}
-	clearCity := req.ClearCity
-	if !clearCity && req.CityCode != "" {
-		cCode, _, _ := ResolveCityCodeAndName(req.CityCode, "", "")
-		tx.CityCode = cCode
-	}
 
 	if req.OccurredAt != "" {
 		t, err := ParseFlexTime(req.OccurredAt)
@@ -533,13 +442,6 @@ func UpdateTransaction(c *gin.Context) {
 			return
 		}
 		tx.OccurredAt = t
-	}
-
-	if !footprintUnbound {
-		autoLinkTransactionFootprint(&tx)
-	}
-	if clearCity {
-		tx.CityCode = ""
 	}
 
 	if req.IsInstallment != nil && *req.IsInstallment {
@@ -596,11 +498,6 @@ func UpdateTransaction(c *gin.Context) {
 		Error(c, http.StatusInternalServerError, "更新账目失败")
 		return
 	}
-	if tx.FootprintID != nil {
-		touchFootprintTimestamps(db.DB, oldFootprintID, *tx.FootprintID)
-	} else {
-		touchFootprintTimestamps(db.DB, oldFootprintID)
-	}
 	InvalidateStatsCache()
 
 	Success(c, tx)
@@ -635,9 +532,6 @@ func DeleteTransaction(c *gin.Context) {
 			Error(c, http.StatusInternalServerError, "物理删除失败: "+err.Error())
 			return
 		}
-		if tx.FootprintID != nil {
-			touchFootprintTimestamps(db.DB, *tx.FootprintID)
-		}
 		InvalidateStatsCache()
 		Success(c, gin.H{"id": id, "purged": true})
 		return
@@ -665,9 +559,6 @@ func DeleteTransaction(c *gin.Context) {
 	}); err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
-	}
-	if tx.FootprintID != nil {
-		touchFootprintTimestamps(db.DB, *tx.FootprintID)
 	}
 	Success(c, gin.H{"id": id, "deleted": true})
 }

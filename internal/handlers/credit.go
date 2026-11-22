@@ -14,6 +14,53 @@ import (
 	"gorm.io/gorm"
 )
 
+// calculateDaysUntilRepayment 计算距离每月独立还款日的天数倒计时（按北京时间计算 RC-134）
+func calculateDaysUntilRepayment(repaymentDay int) int {
+	if repaymentDay < 1 {
+		repaymentDay = 1
+	}
+	if repaymentDay > 31 {
+		repaymentDay = 31
+	}
+	now := config.NowInBeijing()
+	year, month, day := now.Date()
+
+	daysInCurrentMonth := time.Date(year, month+1, 0, 0, 0, 0, 0, now.Location()).Day()
+	targetDayThisMonth := repaymentDay
+	if targetDayThisMonth > daysInCurrentMonth {
+		targetDayThisMonth = daysInCurrentMonth
+	}
+
+	targetDate := time.Date(year, month, targetDayThisMonth, 0, 0, 0, 0, now.Location())
+	todayDate := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+
+	if day <= targetDayThisMonth {
+		diff := int(targetDate.Sub(todayDate).Hours() / 24)
+		if diff < 0 {
+			diff = 0
+		}
+		return diff
+	}
+
+	nextMonth := month + 1
+	nextYear := year
+	if nextMonth > 12 {
+		nextMonth = 1
+		nextYear++
+	}
+	daysInNextMonth := time.Date(nextYear, nextMonth+1, 0, 0, 0, 0, 0, now.Location()).Day()
+	targetDayNextMonth := repaymentDay
+	if targetDayNextMonth > daysInNextMonth {
+		targetDayNextMonth = daysInNextMonth
+	}
+	targetDateNextMonth := time.Date(nextYear, nextMonth, targetDayNextMonth, 0, 0, 0, 0, now.Location())
+	diff := int(targetDateNextMonth.Sub(todayDate).Hours() / 24)
+	if diff < 0 {
+		diff = 0
+	}
+	return diff
+}
+
 // CalculateElapsedInstallmentMonths 根据购买时间(occurredAt)与每月还款日(repaymentDay)，计算截至 now 已经历的还款期数与剩余期数
 func CalculateElapsedInstallmentMonths(occurredAt time.Time, totalMonths int, repaymentDay int, now time.Time) (paidMonths int, remainMonths int) {
 	if totalMonths <= 0 {

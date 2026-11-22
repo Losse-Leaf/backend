@@ -13,7 +13,6 @@ import (
 
 	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
-	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 	"loose-leaf/internal/storage"
 
@@ -263,16 +262,13 @@ func GetConfigV1(c *gin.Context) {
 	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil || cfg.ID == 0 {
 		cfg = models.SiteConfig{
 			SiteName:        "散页 · 个人生活志",
-			SiteSubtitle:    "日常 · 资产 · 心愿 · 行迹 · 造物",
+			SiteSubtitle:    "日常 · 记账 · 心愿",
 			CuratorName:     "",
 			DefaultLocation: "",
 		}
 	}
 	cfg.PublicModules = ParsePublicModulesRaw(cfg.PublicModulesRaw)
 	setAuthVaryHeader(c)
-	if !middleware.IsAdmin(c) {
-		cfg.InitialLiquidBalance = 0
-	}
 	Success(c, cfg)
 }
 

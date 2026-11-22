@@ -138,14 +138,6 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 	db.DB.Find(&wishes)
 	counts["wishes"] = int64(len(wishes))
 
-	var footprints []models.Footprint
-	db.DB.Find(&footprints)
-	counts["footprints"] = int64(len(footprints))
-
-	var projects []models.Project
-	db.DB.Find(&projects)
-	counts["projects"] = int64(len(projects))
-
 	var transactions []models.Transaction
 	db.DB.Find(&transactions)
 	counts["transactions"] = int64(len(transactions))
@@ -183,8 +175,6 @@ func CreateBackup(ctx context.Context) (*BackupItem, error) {
 		"curator_profile":   curatorProfile,
 		"entries":           entries,
 		"wishes":            wishes,
-		"footprints":        footprints,
-		"projects":          projects,
 		"transactions":      transactions,
 		"categories":        categories,
 		"credit_channels":   creditChannels,

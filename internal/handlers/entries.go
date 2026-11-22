@@ -20,12 +20,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// validEntryTypes 生活散页类型白名单（RC-128 四维收敛后的全部合法取值）。
+// validEntryTypes 生活散页类型白名单。
 var validEntryTypes = map[string]bool{
-	"life":    true,
-	"travel":  true,
-	"project": true,
-	"wish":    true,
+	"life": true,
+	"wish": true,
 }
 
 // DeriveTitleFromContent 从正文派生标题（朋友圈式发布：只填正文，标题取首行）
@@ -59,15 +57,6 @@ func populateEntryURLs(e *models.LifeEntry) {
 	}
 	e.Attachments = populateAttachmentURLs(e.Attachments)
 
-	if e.ProjectID != nil && *e.ProjectID > 0 {
-		var proj models.Project
-		if db.DB.Where("id = ?", *e.ProjectID).Limit(1).Find(&proj).RowsAffected > 0 {
-			e.Project = &proj
-		}
-	} else {
-		e.Project = nil
-	}
-
 	if e.WishID != nil && *e.WishID > 0 {
 		var wish models.Wish
 		if db.DB.Where("id = ?", *e.WishID).Limit(1).Find(&wish).RowsAffected > 0 {
@@ -78,21 +67,17 @@ func populateEntryURLs(e *models.LifeEntry) {
 	}
 }
 
-// populateEntryURLsBatch 批量填充一组条目的附件、项目与心愿关联 (BE-30)
+// populateEntryURLsBatch 批量填充一组条目的附件与心愿关联 (BE-30)
 func populateEntryURLsBatch(entries []models.LifeEntry) {
 	if len(entries) == 0 {
 		return
 	}
 
 	entryIDs := make([]uint, 0, len(entries))
-	projectIDs := make([]uint, 0, len(entries))
 	wishIDs := make([]uint, 0, len(entries))
 	for i := range entries {
 		if entries[i].ID > 0 {
 			entryIDs = append(entryIDs, entries[i].ID)
-		}
-		if entries[i].ProjectID != nil && *entries[i].ProjectID > 0 {
-			projectIDs = append(projectIDs, *entries[i].ProjectID)
 		}
 		if entries[i].WishID != nil && *entries[i].WishID > 0 {
 			wishIDs = append(wishIDs, *entries[i].WishID)
@@ -110,15 +95,6 @@ func populateEntryURLsBatch(entries []models.LifeEntry) {
 		}
 	}
 
-	projMap := make(map[uint]models.Project)
-	if len(projectIDs) > 0 {
-		var projs []models.Project
-		db.DB.Where("id IN ?", projectIDs).Find(&projs)
-		for _, p := range projs {
-			projMap[p.ID] = p
-		}
-	}
-
 	wishMap := make(map[uint]models.Wish)
 	if len(wishIDs) > 0 {
 		var wishes []models.Wish
@@ -131,14 +107,6 @@ func populateEntryURLsBatch(entries []models.LifeEntry) {
 	for i := range entries {
 		e := &entries[i]
 		e.Attachments = populateAttachmentURLs(attMap[e.ID])
-
-		e.Project = nil
-		if e.ProjectID != nil && *e.ProjectID > 0 {
-			if p, ok := projMap[*e.ProjectID]; ok {
-				proj := p
-				e.Project = &proj
-			}
-		}
 
 		e.Wish = nil
 		if e.WishID != nil && *e.WishID > 0 {
@@ -157,17 +125,12 @@ func redactEmbeddedWishFinances(w *models.Wish) {
 	}
 	w.ActualCost = 0
 	w.TransactionID = nil
-	w.GearID = nil
 }
 
 // redactVisitorEntry 对单条访客可见散页剥离私密关联实体并脱敏财务字段。
 func redactVisitorEntry(e *models.LifeEntry) {
 	if e == nil {
 		return
-	}
-	if e.Project != nil && e.Project.IsPrivate {
-		e.Project = nil
-		e.ProjectID = nil
 	}
 	if e.Wish != nil && e.Wish.IsPrivate {
 		e.Wish = nil
@@ -184,22 +147,18 @@ func redactEmbeddedWishFinancesBatch(entries []models.LifeEntry) {
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
-	Type            string `json:"type"` // life, travel, project, wish
+	Type            string `json:"type"` // life, wish
 	Title           string `json:"title"`
 	Content         string `json:"content" binding:"required"`
 	OccurredAt      string `json:"occurred_at"`
 	Location        string `json:"location"`
-	CityCode        string `json:"city_code"`
-	CityName        string `json:"city_name"`
-	ProjectID       *uint  `json:"project_id"`
 	WishID          *uint  `json:"wish_id"`
-	FootprintID     *uint  `json:"footprint_id"`
 	AttachmentIDs   []uint `json:"attachment_ids"`
 	ClientRequestID string `json:"client_request_id"`
 	IsPrivate       bool   `json:"is_private"`
 }
 
-// CreateLifeEntry 创建一条新的生活档案记录（支持主流自然下渗点亮足迹与造物伴生去重）
+// CreateLifeEntry 创建一条新的生活档案记录
 func CreateLifeEntry(c *gin.Context) {
 	var req CreateEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -227,117 +186,23 @@ func CreateLifeEntry(c *gin.Context) {
 		title = DeriveTitleFromContent(content, 40)
 	}
 	location := strings.TrimSpace(req.Location)
-	cityCode := strings.TrimSpace(req.CityCode)
-	cityName := strings.TrimSpace(req.CityName)
-
-	if req.FootprintID != nil && *req.FootprintID > 0 && cityCode == "" {
-		var fp models.Footprint
-		if err := db.DB.First(&fp, *req.FootprintID).Error; err == nil && fp.ID > 0 {
-			cityCode = fp.CityCode
-			if cityName == "" {
-				cityName = fp.CityName
-			}
-		}
-	}
-
-	cityCode, cityName, location = ResolveCityCodeAndName(cityCode, cityName, location)
-	if cityCode != "" && location == "" {
-		location = cityName
-	}
-
-	// 若前端在 CreateProject 后立即调用了 CreateLifeEntry，复用刚伴生创建的同项目记录，避免重复入库
-	if req.Type == "project" && req.ProjectID != nil && *req.ProjectID > 0 {
-		var existing models.LifeEntry
-		if err := db.DB.Where("project_id = ? AND type = 'project'", *req.ProjectID).Order("id DESC").Limit(1).Find(&existing).Error; err == nil && existing.ID > 0 {
-			keyCompatible := clientRequestID == "" || existing.ClientRequestID == nil || *existing.ClientRequestID == clientRequestID
-			if time.Since(existing.CreatedAt) < 10*time.Second && (existing.Title == title || title == "") && keyCompatible {
-				reuseErr := db.DB.Transaction(func(tx *gorm.DB) error {
-					if clientRequestID != "" && existing.ClientRequestID == nil {
-						existing.ClientRequestID = &clientRequestID
-					}
-					if title != "" {
-						existing.Title = title
-					}
-					if content != "" {
-						existing.Content = content
-					}
-					if req.OccurredAt != "" {
-						existing.OccurredAt = occurred
-					}
-					if location != "" {
-						existing.Location = location
-					}
-					if cityCode != "" {
-						existing.CityCode = cityCode
-						existing.CityName = cityName
-					}
-					if req.FootprintID != nil {
-						existing.FootprintID = req.FootprintID
-					}
-					if err := tx.Save(&existing).Error; err != nil {
-						return err
-					}
-					if len(req.AttachmentIDs) > 0 {
-						if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{"entry_id": existing.ID}); err != nil {
-							return err
-						}
-					}
-					if err := syncFootprintFromLifeEntry(&existing, req.AttachmentIDs, tx); err != nil {
-						return err
-					}
-					return nil
-				})
-				if reuseErr != nil {
-					if errors.Is(reuseErr, errAttachmentClaimConflict) {
-						Error(c, http.StatusBadRequest, "绑定附件失败: "+reuseErr.Error())
-					} else {
-						Error(c, http.StatusInternalServerError, "更新项目伴生记录失败: "+reuseErr.Error())
-					}
-					return
-				}
-				db.DB.First(&existing, existing.ID)
-				populateEntryURLs(&existing)
-				InvalidateStatsCache()
-				Success(c, existing)
-				return
-			}
-		}
-	}
 
 	entryType := strings.TrimSpace(req.Type)
 	if entryType == "" {
 		entryType = "life"
 	}
 	if !validEntryTypes[entryType] {
-		Error(c, http.StatusBadRequest, "type 仅支持 life / travel / project / wish")
+		Error(c, http.StatusBadRequest, "type 仅支持 life / wish")
 		return
 	}
 
-	if req.ProjectID != nil && *req.ProjectID > 0 && entryType != "project" {
-		Error(c, http.StatusBadRequest, "project_id 仅支持 type=project 的散页")
-		return
-	}
 	if req.WishID != nil && *req.WishID > 0 && entryType != "wish" {
 		Error(c, http.StatusBadRequest, "wish_id 仅支持 type=wish 的散页")
 		return
 	}
 
-	if req.ProjectID != nil && *req.ProjectID == 0 {
-		req.ProjectID = nil
-	}
 	if req.WishID != nil && *req.WishID == 0 {
 		req.WishID = nil
-	}
-	if req.FootprintID != nil && *req.FootprintID == 0 {
-		req.FootprintID = nil
-	}
-	if req.ProjectID != nil && *req.ProjectID > 0 {
-		var projectCount int64
-		db.DB.Unscoped().Model(&models.Project{}).Where("id = ?", *req.ProjectID).Count(&projectCount)
-		if projectCount == 0 {
-			Error(c, http.StatusBadRequest, "关联的造物不存在")
-			return
-		}
 	}
 	if req.WishID != nil && *req.WishID > 0 {
 		var wishCount int64
@@ -347,27 +212,15 @@ func CreateLifeEntry(c *gin.Context) {
 			return
 		}
 	}
-	if req.FootprintID != nil && *req.FootprintID > 0 {
-		var fpCount int64
-		db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
-		if fpCount == 0 {
-			Error(c, http.StatusBadRequest, "关联的旅程不存在")
-			return
-		}
-	}
 
 	entry := models.LifeEntry{
-		Type:        entryType,
-		Title:       title,
-		Content:     content,
-		OccurredAt:  occurred,
-		Location:    location,
-		CityCode:    cityCode,
-		CityName:    cityName,
-		ProjectID:   req.ProjectID,
-		WishID:      req.WishID,
-		FootprintID: req.FootprintID,
-		IsPrivate:   req.IsPrivate,
+		Type:       entryType,
+		Title:      title,
+		Content:    content,
+		OccurredAt: occurred,
+		Location:   location,
+		WishID:     req.WishID,
+		IsPrivate:  req.IsPrivate,
 	}
 	if clientRequestID != "" {
 		entry.ClientRequestID = &clientRequestID
@@ -381,9 +234,6 @@ func CreateLifeEntry(c *gin.Context) {
 			if err := claimAttachments(tx, req.AttachmentIDs, map[string]any{"entry_id": entry.ID}); err != nil {
 				return err
 			}
-		}
-		if err := syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx); err != nil {
-			return err
 		}
 		return nil
 	})
@@ -472,15 +322,11 @@ func GetLifeEntriesV1(c *gin.Context) {
 		}
 	}
 
-	// 核心视角动态映射 (4 大纯化形态: daily, travel, project, wish)
+	// 核心视角动态映射 (daily, wish)
 	if category != "" && category != "all" {
 		switch category {
 		case "daily":
 			query = query.Where("type = ?", "life")
-		case "travel":
-			query = query.Where("type = ? OR (city_code != '' AND city_code IS NOT NULL)", "travel")
-		case "project":
-			query = query.Where("type = ? OR (project_id IS NOT NULL AND project_id > 0)", "project")
 		case "wish":
 			query = query.Where("type = ? OR (wish_id IS NOT NULL AND wish_id > 0)", "wish")
 		}
@@ -643,14 +489,9 @@ type UpdateEntryRequest struct {
 	Content          string `json:"content"`
 	OccurredAt       string `json:"occurred_at"`
 	Location         string `json:"location"`
-	CityCode         string `json:"city_code"`
-	CityName         string `json:"city_name"`
-	ProjectID        *uint  `json:"project_id"`
 	WishID           *uint  `json:"wish_id"`
-	FootprintID      *uint  `json:"footprint_id"`
 	AttachmentIDs    []uint `json:"attachment_ids"`
 	ClearAttachments bool   `json:"clear_attachments"`
-	ClearCity        bool   `json:"clear_city"`
 	IsPrivate        *bool  `json:"is_private"`
 }
 
@@ -675,7 +516,7 @@ func UpdateLifeEntry(c *gin.Context) {
 
 	if req.Type != "" {
 		if !validEntryTypes[req.Type] {
-			Error(c, http.StatusBadRequest, "type 仅支持 life / travel / project / wish")
+			Error(c, http.StatusBadRequest, "type 仅支持 life / wish")
 			return
 		}
 		entry.Type = req.Type
@@ -695,75 +536,8 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.IsPrivate = *req.IsPrivate
 	}
 
-	if req.ClearCity {
-		entry.CityCode = ""
-		entry.CityName = ""
-		if hasJSONValue(rawKeys, "location") {
-			entry.Location = strings.TrimSpace(req.Location)
-		}
-	} else if hasJSONValue(rawKeys, "location") || hasJSONValue(rawKeys, "city_code") || hasJSONValue(rawKeys, "city_name") ||
-		req.Location != "" || req.CityCode != "" || req.CityName != "" {
-		curCode := entry.CityCode
-		if hasJSONValue(rawKeys, "city_code") || req.CityCode != "" {
-			curCode = req.CityCode
-		}
-		curName := entry.CityName
-		if hasJSONValue(rawKeys, "city_name") || req.CityName != "" {
-			curName = req.CityName
-		}
-		curLoc := entry.Location
-		if hasJSONValue(rawKeys, "location") || req.Location != "" {
-			curLoc = req.Location
-		}
-		if strings.TrimSpace(curCode) == "" && strings.TrimSpace(curName) == "" && strings.TrimSpace(curLoc) == "" {
-			entry.CityCode = ""
-			entry.CityName = ""
-			entry.Location = ""
-		} else {
-			cCode, cName, cLoc := ResolveCityCodeAndName(curCode, curName, curLoc)
-			entry.CityCode = cCode
-			entry.CityName = cName
-			entry.Location = cLoc
-		}
-	}
-	if req.FootprintID != nil {
-		if *req.FootprintID == 0 {
-			req.FootprintID = nil
-		} else {
-			var fpCount int64
-			db.DB.Unscoped().Model(&models.Footprint{}).Where("id = ?", *req.FootprintID).Count(&fpCount)
-			if fpCount == 0 {
-				Error(c, http.StatusBadRequest, "关联的旅程不存在")
-				return
-			}
-		}
-		entry.FootprintID = req.FootprintID
-		if req.FootprintID != nil && *req.FootprintID > 0 && entry.CityCode == "" && !req.ClearCity {
-			var fp models.Footprint
-			if err := db.DB.First(&fp, *req.FootprintID).Error; err == nil && fp.ID > 0 {
-				entry.CityCode = fp.CityCode
-				if entry.CityName == "" {
-					entry.CityName = fp.CityName
-				}
-			}
-		}
-	}
-	if entry.CityCode != "" && entry.Location == "" && !hasJSONValue(rawKeys, "location") {
-		entry.Location = entry.CityName
-	}
-	if _, present := rawKeys["project_id"]; present {
-		if req.ProjectID != nil && *req.ProjectID == 0 {
-			req.ProjectID = nil
-		}
-		if req.ProjectID != nil && *req.ProjectID > 0 {
-			var projectCount int64
-			db.DB.Unscoped().Model(&models.Project{}).Where("id = ?", *req.ProjectID).Count(&projectCount)
-			if projectCount == 0 {
-				Error(c, http.StatusBadRequest, "关联的造物不存在")
-				return
-			}
-		}
-		entry.ProjectID = req.ProjectID
+	if hasJSONValue(rawKeys, "location") || req.Location != "" {
+		entry.Location = strings.TrimSpace(req.Location)
 	}
 	if _, present := rawKeys["wish_id"]; present {
 		if req.WishID != nil && *req.WishID == 0 {
@@ -780,23 +554,9 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.WishID = req.WishID
 	}
 
-	if req.ProjectID != nil && *req.ProjectID > 0 && entry.Type != "project" {
-		Error(c, http.StatusBadRequest, "project_id 仅支持 type=project 的散页")
-		return
-	}
 	if req.WishID != nil && *req.WishID > 0 && entry.Type != "wish" {
 		Error(c, http.StatusBadRequest, "wish_id 仅支持 type=wish 的散页")
 		return
-	}
-	if req.Type != "" && req.Type != "project" {
-		boundProject := entry.ProjectID
-		if _, present := rawKeys["project_id"]; present {
-			boundProject = req.ProjectID
-		}
-		if boundProject != nil && *boundProject > 0 {
-			Error(c, http.StatusBadRequest, "切换类型前需显式解绑 project_id（携带 null）")
-			return
-		}
 	}
 	if req.Type != "" && req.Type != "wish" {
 		boundWish := entry.WishID
@@ -836,9 +596,6 @@ func UpdateLifeEntry(c *gin.Context) {
 				return err
 			}
 		}
-		if err := syncFootprintFromLifeEntry(&entry, req.AttachmentIDs, tx); err != nil {
-			return err
-		}
 		return nil
 	})
 	if err != nil {
@@ -876,25 +633,6 @@ func DeleteLifeEntry(c *gin.Context) {
 				return err
 			}
 			keysToDelete = append(keysToDelete, keys...)
-			var bornFps []models.Footprint
-			tx.Where("life_entry_id = ?", entry.ID).Find(&bornFps)
-			for _, fp := range bornFps {
-				var refCount int64
-				tx.Model(&models.LifeEntry{}).
-					Where("footprint_id = ? AND id != ?", fp.ID, entry.ID).
-					Count(&refCount)
-				if refCount == 0 {
-					if err := tx.Unscoped().Delete(&models.Footprint{}, fp.ID).Error; err != nil {
-						return err
-					}
-					if err := recordSyncTombstone(tx, TombstoneEntityFootprint, fp.ID); err != nil {
-						return err
-					}
-					if err := tx.Model(&models.Wish{}).Where("footprint_id = ?", fp.ID).Update("footprint_id", nil).Error; err != nil {
-						return err
-					}
-				}
-			}
 			tx.Model(&models.Wish{}).Where("life_entry_id = ?", entry.ID).Update("life_entry_id", nil)
 			if err := recordSyncTombstone(tx, TombstoneEntityEntry, entry.ID); err != nil {
 				return err
@@ -913,26 +651,7 @@ func DeleteLifeEntry(c *gin.Context) {
 		return
 	}
 
-	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Delete(&entry).Error; err != nil {
-			return err
-		}
-		var bornFps []models.Footprint
-		tx.Where("life_entry_id = ?", entry.ID).Find(&bornFps)
-		for _, fp := range bornFps {
-			var refCount int64
-			tx.Model(&models.LifeEntry{}).
-				Where("footprint_id = ? AND id != ?", fp.ID, entry.ID).
-				Count(&refCount)
-			if refCount == 0 {
-				if err := tx.Delete(&models.Footprint{}, fp.ID).Error; err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil {
+	if err := db.DB.Delete(&entry).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}

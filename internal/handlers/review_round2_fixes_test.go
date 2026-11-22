@@ -202,7 +202,7 @@ func TestLifeEntryTypeWhitelist(t *testing.T) {
 
 	// 合法 type 创建 → 200
 	w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
-		"type": "travel", "content": "合法类型",
+		"type": "wish", "content": "合法类型",
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("合法 type 创建失败: %d %s", w.Code, w.Body.String())
@@ -221,7 +221,7 @@ func TestLifeEntryTypeWhitelist(t *testing.T) {
 	}
 	var reloaded models.LifeEntry
 	db.DB.First(&reloaded, created.Data.ID)
-	if reloaded.Type != "travel" {
+	if reloaded.Type != "wish" {
 		t.Fatalf("被拒绝的更新不得改写 type: %s", reloaded.Type)
 	}
 
@@ -230,7 +230,7 @@ func TestLifeEntryTypeWhitelist(t *testing.T) {
 		t.Fatalf("空串 type 应视为未携带: %d %s", w.Code, w.Body.String())
 	}
 	db.DB.First(&reloaded, created.Data.ID)
-	if reloaded.Type != "travel" {
+	if reloaded.Type != "wish" {
 		t.Fatalf("空串 type 不得清空: %s", reloaded.Type)
 	}
 }
@@ -277,53 +277,5 @@ func TestWishKindStatusWhitelist(t *testing.T) {
 	db.DB.First(&reloaded, created.Data.ID)
 	if reloaded.Kind != "travel" || reloaded.Status != "shelved" {
 		t.Fatalf("白名单值应正常落库: kind=%s status=%s", reloaded.Kind, reloaded.Status)
-	}
-}
-
-// ── 4. 显式解绑旅程后不得被自动重挂 ────────────────────────────────
-
-func TestUpdateTransactionFootprintZeroUnbindSkipsAutoRelink(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	fp := models.Footprint{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now()}
-	if err := db.DB.Create(&fp).Error; err != nil {
-		t.Fatal(err)
-	}
-	tx := models.Transaction{
-		Amount: 100, Type: "expense", Category: "餐饮",
-		CityCode: "330100", OccurredAt: time.Now(),
-	}
-	if err := db.DB.Create(&tx).Error; err != nil {
-		t.Fatal(err)
-	}
-	// 模拟已被挂载到旅程的状态
-	if err := db.DB.Model(&tx).Update("footprint_id", fp.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	path := "/api/v1/transactions/" + u64(tx.ID)
-
-	// 显式携带 footprint_id=0 = 解绑：同城窗口规则不得立刻把它挂回去
-	w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 100, "category": "餐饮", "footprint_id": 0,
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("解绑失败: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.Transaction
-	db.DB.First(&reloaded, tx.ID)
-	if reloaded.FootprintID != nil {
-		t.Fatalf("显式解绑后不得被自动重挂: %v", reloaded.FootprintID)
-	}
-
-	// 未携带 footprint_id（nil）→ 行为不变：自动对齐仍会挂回同城窗口内的旅程
-	w2 := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 100, "category": "餐饮",
-	})
-	if w2.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w2.Code, w2.Body.String())
-	}
-	db.DB.First(&reloaded, tx.ID)
-	if reloaded.FootprintID == nil || *reloaded.FootprintID != fp.ID {
-		t.Fatalf("未携带 footprint_id 时自动挂载行为应保持: %v", reloaded.FootprintID)
 	}
 }

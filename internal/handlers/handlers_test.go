@@ -335,21 +335,17 @@ func TestIncrementalSyncAndETagCaching(t *testing.T) {
 	}
 }
 
-func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
+func TestTransactionIncrementalSyncAndETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestFullDB(t)
 	enableAllPublicModulesForTest(t)
-	adminKey := "lldt_tx_project_sync_key"
+	adminKey := "lldt_tx_sync_key"
 	seedTestAdminDevice(adminKey)
 
 	r := gin.New()
 	r.POST("/api/v1/transactions", CreateTransaction)
 	r.GET("/api/v1/transactions", GetTransactions)
 	r.DELETE("/api/v1/transactions/:id", DeleteTransaction)
-
-	r.POST("/api/v1/projects", CreateProject)
-	r.GET("/api/v1/projects", GetProjectsV1)
-	r.DELETE("/api/v1/projects/:id", DeleteProject)
 
 	// 1. Transactions CRUD, ETag & Soft Delete
 	txReq := TransactionRequest{
@@ -420,57 +416,6 @@ func TestTransactionAndProjectIncrementalSyncAndETag(t *testing.T) {
 	if item["deleted_at"] == nil {
 		t.Fatalf("expected deleted_at to be populated in transaction")
 	}
-
-	// 2. Projects CRUD, ETag & Soft Delete
-	projReq := ProjectRequest{
-		Title:       "Test Project",
-		Description: "A great project",
-		Category:    "code",
-	}
-	body, _ = json.Marshal(projReq)
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("failed to create project")
-	}
-
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
-	r.ServeHTTP(w, req)
-	projEtag := w.Header().Get("ETag")
-	if projEtag == "" {
-		t.Fatalf("expected ETag for projects")
-	}
-
-	// 304 on matching ETag
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
-	req.Header.Set("If-None-Match", projEtag)
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusNotModified {
-		t.Fatalf("expected 304 for projects, got %d", w.Code)
-	}
-
-	// Soft delete project
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/projects/1", nil)
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("failed to soft delete project")
-	}
-
-	// Normal list returns empty
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodGet, "/api/v1/projects", nil)
-	r.ServeHTTP(w, req)
-	var projListResp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &projListResp)
-	projs := projListResp["data"].([]interface{})
-	if len(projs) != 0 {
-		t.Fatalf("expected 0 active projects, got %d", len(projs))
-	}
 }
 
 func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
@@ -484,7 +429,6 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 	r.GET("/api/v1/entries/on-this-day", GetOnThisDayEntries)
 	r.GET("/api/v1/search", GlobalSearch)
 	r.POST("/api/v1/wishes", CreateWish)
-	r.POST("/api/v1/projects", CreateProject)
 
 	// 1. Seed entries across years for On-This-Day & Cursor Pagination
 	entriesToSeed := []CreateEntryRequest{
@@ -494,8 +438,6 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 			Content:    "在桂花香气中走过苏堤",
 			OccurredAt: "2024-10-15T14:00:00+08:00",
 			Location:   "杭州西湖",
-			CityCode:   "330100",
-			CityName:   "杭州市",
 		},
 		{
 			Type:       "life",
@@ -503,8 +445,6 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 			Content:    "拉坯与利坯的静心时刻",
 			OccurredAt: "2025-10-15T16:00:00+08:00",
 			Location:   "景德镇",
-			CityCode:   "360200",
-			CityName:   "景德镇市",
 		},
 		{
 			Type:       "life",
@@ -566,26 +506,15 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 		t.Fatalf("expected 2 historical entries on Oct 15, got %d", len(otdEntries))
 	}
 
-	// 4. Seed Wish and Project and test GlobalSearch
+	// 4. Seed Wish and test GlobalSearch
 	wishBody, _ := json.Marshal(CreateWishRequest{
-		Title:    "收藏一把西湖手工绸伞",
-		Kind:     "item",
-		Note:     "杭州非遗手艺",
-		CityName: "杭州市",
-		Budget:   38000,
+		Title:  "收藏一把西湖手工绸伞",
+		Kind:   "item",
+		Note:   "杭州非遗手艺",
+		Budget: 38000,
 	})
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodPost, "/api/v1/wishes", bytes.NewBuffer(wishBody))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-
-	projBody, _ := json.Marshal(ProjectRequest{
-		Title:       "西湖植物志图鉴",
-		Description: "整理杭州西湖四季植物标本",
-		Category:    "人文自然",
-	})
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewBuffer(projBody))
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
@@ -603,9 +532,6 @@ func TestCursorPaginationOnThisDayAndGlobalSearch(t *testing.T) {
 	}
 	if len(searchData["wishes"].([]interface{})) == 0 {
 		t.Errorf("expected wishes matching '西湖'")
-	}
-	if len(searchData["projects"].([]interface{})) == 0 {
-		t.Errorf("expected projects matching '西湖'")
 	}
 }
 

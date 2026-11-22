@@ -33,9 +33,7 @@ func setupTestDB(t *testing.T) {
 		&models.Attachment{},
 		&models.LifeEntry{},
 		&models.Transaction{},
-		&models.Project{},
 		&models.Wish{},
-		&models.Footprint{},
 		&models.CreditChannel{},
 		&models.CategoryOption{},
 	)

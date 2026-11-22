@@ -33,9 +33,7 @@ func setupTestFullDB(t *testing.T) {
 		&models.Attachment{},
 		&models.LifeEntry{},
 		&models.Transaction{},
-		&models.Project{},
 		&models.Wish{},
-		&models.Footprint{},
 		&models.CreditChannel{},
 		&models.InstallmentPlan{},
 		&models.InstallmentItem{},
@@ -124,7 +122,6 @@ func TestProfileAndConfig(t *testing.T) {
 			Title:       "数字手艺人",
 			Location:    "杭州",
 			SocialLinks: `{"github":"https://github.com/example"}`,
-			EDCGear:     `[{"name":"机械相机","category":"影像器材"}]`,
 		}
 		db.DB.Create(&initialProfile)
 

@@ -82,34 +82,12 @@ func TestBE2_List304UsesAtMostOneSQL(t *testing.T) {
 			},
 		},
 		{
-			name:    "projects",
-			path:    "/api/v1/projects",
-			handler: GetProjectsV1,
-			seed: func(t *testing.T) {
-				if err := db.DB.Create(&models.Project{Title: "项目"}).Error; err != nil {
-					t.Fatalf("seed project: %v", err)
-				}
-			},
-		},
-		{
 			name:    "wishes",
 			path:    "/api/v1/wishes",
 			handler: GetWishes,
 			seed: func(t *testing.T) {
 				if err := db.DB.Create(&models.Wish{Title: "心愿", Kind: "item"}).Error; err != nil {
 					t.Fatalf("seed wish: %v", err)
-				}
-			},
-		},
-		{
-			name:    "footprints",
-			path:    "/api/v1/footprints",
-			handler: GetFootprints,
-			seed: func(t *testing.T) {
-				if err := db.DB.Create(&models.Footprint{
-					CityCode: "330100", CityName: "杭州", VisitedAt: now,
-				}).Error; err != nil {
-					t.Fatalf("seed footprint: %v", err)
 				}
 			},
 		},
@@ -229,12 +207,12 @@ func TestBE2_AggregateListQueryIgnoresOffset(t *testing.T) {
 	setupTestFullDB(t)
 
 	for i := 0; i < 5; i++ {
-		if err := db.DB.Create(&models.Project{Title: "proj"}).Error; err != nil {
-			t.Fatalf("seed project: %v", err)
+		if err := db.DB.Create(&models.Wish{Title: "wish", Kind: "item"}).Error; err != nil {
+			t.Fatalf("seed wish: %v", err)
 		}
 	}
 
-	agg, err := aggregateListQuery(db.DB.Model(&models.Project{}).Offset(3))
+	agg, err := aggregateListQuery(db.DB.Model(&models.Wish{}).Offset(3))
 	if err != nil {
 		t.Fatalf("aggregateListQuery failed: %v", err)
 	}

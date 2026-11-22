@@ -14,27 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func sanitizeEDCGear(raw string, isAdmin bool) any {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return []models.GearItem{}
-	}
-	var dummy models.CuratorProfile
-	dummy.EDCGear = raw
-	list := loadProfileGear(&dummy)
-	if isAdmin {
-		return list
-	}
-	sanitized := make([]models.GearItem, len(list))
-	for i, g := range list {
-		// 访客严格脱敏财务字段 (RC-53)
-		g.PriceCents = 0
-		g.SoldPriceCents = 0
-		sanitized[i] = g
-	}
-	return sanitized
-}
-
 func parseSocialMap(raw string) map[string]any {
 	result := make(map[string]any)
 	raw = strings.TrimSpace(raw)
@@ -61,15 +40,13 @@ func populateProfileData(p *models.CuratorProfile, isAdmin bool) {
 	socialMap["github"] = p.Github
 	p.SocialData = socialMap
 
-	p.EDCGearData = sanitizeEDCGear(p.EDCGear, isAdmin)
-
 	if p.AvatarURL != "" {
 		p.AvatarKey = storage.ExtractObjectKey(p.AvatarURL)
 		p.AvatarURL = storage.SignResourceURL(p.AvatarURL)
 	}
 }
 
-// GetCuratorProfile 获取主理人完整档案 (全端动态获取，访客模式脱敏 EDC 财务信息 RC-53)
+// GetCuratorProfile 获取主理人基础档案 (全端动态获取)
 func GetCuratorProfile(c *gin.Context) {
 	if !RequirePublicModuleOrAdmin(c, "profile") {
 		return
@@ -193,14 +170,9 @@ func UpdateCuratorProfile(c *gin.Context) {
 		}
 	}
 
-	// RC-132: edc_gear 仅由 /api/v1/assets/gear 三接口及心愿归册联动写入，PUT /profile 忽略该字段以杜绝双写互踩
 	profile.UpdatedAt = time.Now()
 
-	// 关键（第三轮 P2-7）：Save 是全字段覆盖 —— 会把请求开始时读到的旧 EDCGear 一并
-	// 写回，与持 profileGearMu 的器物写路径（记账联动/心愿归册/AddGearAsset）并发时，
-	// 并发新增的设备会被旧值静默冲掉。「忽略 edc_gear」必须落实为「不写这一列」：
-	// Omit 掉 EDCGear 字段，其余列保持 Save 语义不变。
-	if err := db.DB.Omit("EDCGear").Save(&profile).Error; err != nil {
+	if err := db.DB.Save(&profile).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新主理人档案失败: "+err.Error())
 		return
 	}

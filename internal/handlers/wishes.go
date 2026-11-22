@@ -81,8 +81,6 @@ type CreateWishRequest struct {
 	Kind       string `json:"kind"` // item | travel | milestone
 	Note       string `json:"note"`
 	Spec       string `json:"spec"`
-	CityCode   string `json:"city_code"`
-	CityName   string `json:"city_name"`
 	Budget     int64  `json:"budget"`
 	TargetDate string `json:"target_date"`
 	// PlantedAt 许下心愿的时刻（可选，支持补录过去的心愿）
@@ -99,39 +97,27 @@ type UpdateWishRequest struct {
 	Title string `json:"title"`
 	Kind  string `json:"kind"`
 	// PlantedAt 许下心愿的时刻（可选，支持补档）
-	PlantedAt     string `json:"planted_at"`
-	Note          string `json:"note"`
-	Spec          string `json:"spec"`
-	CityCode      string `json:"city_code"`
-	CityName      string `json:"city_name"`
-	Budget        int64  `json:"budget"`
-	ActualCost    *int64 `json:"actual_cost"`
-	Status        string `json:"status"` // wanting | fulfilled | shelved
-	TargetDate    string `json:"target_date"`
-	FulfilledAt   string `json:"fulfilled_at"`
-	AttachmentIDs []uint `json:"attachment_ids"`
-	// ClearAttachments 显式声明「本次要解除全部参考图绑定」
-	//
-	// 关键：单传空数组**不足以**表达「解绑」意图 ——
-	// 已发布的客户端把 attachmentIds 定义成非可选数组（默认 `[]`），
-	// JSONEncoder 必定写出 `"attachment_ids": []`，
-	// 而部分客户端的心愿编辑弹窗**根本没有附件 UI**，
-	// 于是每次改个标题/预算，服务端都会把该心愿的照片 `wish_id` 置空。
-	// 跨端更刺眼：用 web 传了图，再用 mac 改个字，图片就没了。
-	ClearAttachments bool  `json:"clear_attachments"`
-	IsPrivate        *bool `json:"is_private"`
+	PlantedAt        string `json:"planted_at"`
+	Note             string `json:"note"`
+	Spec             string `json:"spec"`
+	Budget           int64  `json:"budget"`
+	ActualCost       *int64 `json:"actual_cost"`
+	Status           string `json:"status"` // wanting | fulfilled | shelved
+	TargetDate       string `json:"target_date"`
+	FulfilledAt      string `json:"fulfilled_at"`
+	AttachmentIDs    []uint `json:"attachment_ids"`
+	ClearAttachments bool   `json:"clear_attachments"`
+	IsPrivate        *bool  `json:"is_private"`
 }
 
-// ResolveWishRequest 归册仪式请求 (4种归册情景与多模块联动 RC-53)
+// ResolveWishRequest 归册仪式请求 (心愿转记账流水与伴生散页联动)
 type ResolveWishRequest struct {
 	FulfilledAt       string `json:"fulfilled_at"`    // 默认当前，支持历史补录，强制 <= now
 	ActualCost        int64  `json:"actual_cost"`     // 单位：分
 	ResolutionType    string `json:"resolution_type"` // exact(原配原价) | altered(改选替代) | relinquished(理性拔草)
 	ActualTitle       string `json:"actual_title"`    // 实际购买物品名 (altered 专用)
 	CreateTransaction bool   `json:"create_transaction"`
-	CreateGearAsset   bool   `json:"create_gear_asset"` // item 专属一键建入随身设备库
 	CreateLifeEntry   bool   `json:"create_life_entry"`
-	CreateFootprint   bool   `json:"create_footprint"`
 	EntryContent      string `json:"entry_content"`
 	AttachmentIDs     []uint `json:"attachment_ids"`
 	// 分期付款支持 (RC-53)
@@ -335,8 +321,6 @@ func CreateWish(c *gin.Context) {
 		Kind:       wishKind,
 		Note:       strings.TrimSpace(req.Note),
 		Spec:       strings.TrimSpace(req.Spec),
-		CityCode:   strings.TrimSpace(req.CityCode),
-		CityName:   strings.TrimSpace(req.CityName),
 		Budget:     req.Budget,
 		Status:     "wanting",
 		TargetDate: targetDate,
@@ -358,9 +342,6 @@ func CreateWish(c *gin.Context) {
 			Content: buildWishCompanionContent(wish),
 			// 关键：伴生散页落在**实际许下的时刻**，补档的心愿才会出现在时间流的正确位置
 			OccurredAt: plantedMoment,
-			Location:   wish.CityName,
-			CityCode:   wish.CityCode,
-			CityName:   wish.CityName,
 			WishID:     &wish.ID,
 		}
 		if err := tx.Create(&companionEntry).Error; err != nil {
@@ -453,17 +434,6 @@ func UpdateWish(c *gin.Context) {
 	if req.Spec != "" || hasJSONValue(rawKeys, "spec") {
 		wish.Spec = strings.TrimSpace(req.Spec)
 	}
-	// 契约 C：城市同样支持显式清空（空串 = 清空），否则用户删掉目的地后
-	// 保存提示成功、下次拉取又把旧城市“复活”。
-	if hasJSONValue(rawKeys, "city_code") || req.CityCode != "" {
-		wish.CityCode = strings.TrimSpace(req.CityCode)
-	}
-	if hasJSONValue(rawKeys, "city_name") || req.CityName != "" {
-		wish.CityName = strings.TrimSpace(req.CityName)
-	}
-	if hasJSONValue(rawKeys, "city_code") && req.CityCode == "" {
-		wish.CityName = ""
-	}
 	// 关键：预算要能改成 0；null 保持原值；负数直接 400（兜底校验修复）。
 	if req.Budget != 0 || hasJSONValue(rawKeys, "budget") {
 		if req.Budget < 0 {
@@ -533,10 +503,6 @@ func UpdateWish(c *gin.Context) {
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		// 若通过直接更新状态标记心愿达成，自动伴生创建一条达成一级记录 (Record-First Architecture，纳入同一事务)
 		if wish.Status == "fulfilled" && oldStatus != "fulfilled" {
-			entryType := "wish"
-			if wish.Kind == "travel" && wish.CityCode != "" {
-				entryType = "travel"
-			}
 			fulfilledTime := config.NowInBeijing()
 			if wish.FulfilledAt != nil {
 				fulfilledTime = *wish.FulfilledAt
@@ -546,22 +512,16 @@ func UpdateWish(c *gin.Context) {
 				entryContent = fmt.Sprintf("圆满达成心愿「%s」", wish.Title)
 			}
 			companionEntry := models.LifeEntry{
-				Type:       entryType,
+				Type:       "wish",
 				Title:      companionWishFulfilledTitlePrefix + wish.Title,
 				Content:    entryContent,
 				OccurredAt: fulfilledTime,
-				Location:   wish.CityName,
-				CityCode:   wish.CityCode,
-				CityName:   wish.CityName,
 				WishID:     &wish.ID,
 			}
 			if err := tx.Create(&companionEntry).Error; err != nil {
 				return err
 			}
 			wish.LifeEntryID = &companionEntry.ID
-			if err := syncFootprintFromLifeEntry(&companionEntry, req.AttachmentIDs, tx); err != nil {
-				return err
-			}
 		}
 
 		// 普通编辑（未触发达成）时，同步更新「许下心愿」那条伴生散页，
@@ -703,14 +663,6 @@ func ResolveWish(c *gin.Context) {
 		actualTitle = wish.Title
 	}
 
-	// 联动建 gear 时要先取器物互斥锁，再开启数据库事务（锁序 profileGearMu → DB，
-	// 与 CreateTransaction / SellGearAsset 对齐）：原先「事务内取锁」会与其它
-	// 器物写操作互等 SQLite 的唯一写者名额，造成锁序反转死锁。
-	if req.CreateGearAsset && wish.Kind == "item" {
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
-	}
-
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		wish.ResolutionType = resType
 		wish.FulfilledAt = &fulfilledAt
@@ -719,7 +671,7 @@ func ResolveWish(c *gin.Context) {
 		if resType == "relinquished" {
 			wish.Status = "relinquished"
 			wish.ActualCost = 0
-			// 不生成支出流水，不增加设备库，不产生任何负债
+			// 不生成支出流水，不产生任何负债
 			if req.CreateLifeEntry {
 				content := strings.TrimSpace(req.EntryContent)
 				if content == "" {
@@ -730,7 +682,6 @@ func ResolveWish(c *gin.Context) {
 					Title:      "理性拔草 · " + wish.Title,
 					Content:    content,
 					OccurredAt: fulfilledAt,
-					Location:   wish.CityName,
 					WishID:     &wish.ID,
 				}
 				if err := tx.Create(&entry).Error; err != nil {
@@ -783,10 +734,9 @@ func ResolveWish(c *gin.Context) {
 				Type:          "expense",
 				Category:      category,
 				Title:         displayTitle,
-				Note:          fmt.Sprintf("三维心愿归册支出 (类别: %s, 方案: %s)", wish.Kind, resType),
+				Note:          fmt.Sprintf("心愿归册支出 (类别: %s, 方案: %s)", wish.Kind, resType),
 				PaymentMethod: paymentMethod,
 				WishID:        &wish.ID,
-				CityCode:      wish.CityCode,
 				OccurredAt:    fulfilledAt,
 			}
 
@@ -812,35 +762,7 @@ func ResolveWish(c *gin.Context) {
 			createdTx = &newTx
 		}
 
-		// 联动 2: 固定资产设备入库 (item 专属，双向联动 RC-53)
-		if req.CreateGearAsset && wish.Kind == "item" {
-			gearName := actualTitle
-			if gearName == "" {
-				gearName = wish.Title
-			}
-			createdGear, err := appendGearItemTx(tx, models.GearItem{
-				Name:         gearName,
-				Spec:         wish.Spec,
-				Category:     "数码器材",
-				Status:       "active",
-				PriceCents:   req.ActualCost,
-				PurchaseDate: fulfilledAt.In(config.BeijingLocation).Format("2006-01-02"),
-				Note:         fmt.Sprintf("心愿归册入库 (心愿 #%d: %s)", wish.ID, wish.Title),
-			}, fulfilledAt, wish.IsPrivate, false)
-			if err != nil {
-				return err
-			}
-			gearID := createdGear.ID
-			wish.GearID = &gearID
-		}
-
 		if createdTx != nil && req.IsInstallment {
-			gearID := ""
-			kind := "expense"
-			if wish.GearID != nil {
-				gearID = *wish.GearID
-				kind = "asset"
-			}
 			_, _, err := CreatePlanForTransactionTx(
 				tx,
 				createdTx,
@@ -850,32 +772,24 @@ func ResolveWish(c *gin.Context) {
 				0,
 				"",
 				req.RepaymentDay,
-				kind,
-				gearID,
+				"expense",
 			)
 			if err != nil {
 				return err
 			}
 		}
 
-		// 联动 3: 时间流散页随笔 (Record-First: 若勾选了生成足迹或生成动态，均保证伴生一级记录)
-		if req.CreateLifeEntry || (req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "") {
+		// 联动 2: 时间流散页随笔
+		if req.CreateLifeEntry {
 			content := strings.TrimSpace(req.EntryContent)
 			if content == "" {
 				content = fmt.Sprintf("圆满达成心愿「%s」", actualTitle)
 			}
-			entryType := "wish"
-			if wish.Kind == "travel" && req.CreateFootprint {
-				entryType = "travel"
-			}
 			entry := models.LifeEntry{
-				Type:       entryType,
+				Type:       "wish",
 				Title:      companionWishFulfilledTitlePrefix + actualTitle,
 				Content:    content,
 				OccurredAt: fulfilledAt,
-				Location:   wish.CityName,
-				CityCode:   wish.CityCode,
-				CityName:   wish.CityName,
 				WishID:     &wish.ID,
 			}
 			if err := tx.Create(&entry).Error; err != nil {
@@ -889,45 +803,6 @@ func ResolveWish(c *gin.Context) {
 					"wish_id":  wish.ID,
 					"entry_id": entry.ID,
 				}); err != nil {
-					return err
-				}
-			}
-		}
-
-		// 联动 4: 足迹打卡 (travel 专属，仅当用户明确勾选 CreateFootprint 时生成)
-		if req.CreateFootprint && wish.Kind == "travel" && wish.CityCode != "" {
-			cityName := wish.CityName
-			if cityName == "" {
-				cityName = "旅行目的地"
-			}
-			fpNote := strings.TrimSpace(req.EntryContent)
-			if fpNote == "" {
-				fpNote = "心愿达成履迹: " + wish.Title
-			}
-			footprint := models.Footprint{
-				CityCode:    wish.CityCode,
-				CityName:    cityName,
-				VisitedAt:   fulfilledAt,
-				Note:        fpNote,
-				WishID:      &wish.ID,
-				LifeEntryID: wish.LifeEntryID,
-			}
-			if err := tx.Create(&footprint).Error; err != nil {
-				return err
-			}
-			wish.FootprintID = &footprint.ID
-
-			if len(req.AttachmentIDs) > 0 {
-				// 归属校验后绑定：联动 3 可能已把附件挂到 wish/entry 上，
-				// 这里补挂 footprint —— 三个目标值都与本实体一致，不会误判为抢占。
-				targets := map[string]any{
-					"footprint_id": footprint.ID,
-					"wish_id":      wish.ID,
-				}
-				if wish.LifeEntryID != nil && *wish.LifeEntryID > 0 {
-					targets["entry_id"] = *wish.LifeEntryID
-				}
-				if err := claimAttachments(tx, req.AttachmentIDs, targets); err != nil {
 					return err
 				}
 			}
@@ -985,9 +860,6 @@ func DeleteWish(c *gin.Context) {
 		if purge {
 			// 解绑错误必须上抛：吞掉后事务仍会提交，留下指向已删心愿的逻辑外键。
 			if err := tx.Model(&models.Transaction{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&models.Footprint{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {
 				return err
 			}
 			if err := tx.Model(&models.Attachment{}).Where("wish_id = ?", w.ID).Update("wish_id", nil).Error; err != nil {

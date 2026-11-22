@@ -146,7 +146,6 @@ func CreatePlanForTransactionTx(
 	firstDueDate string,
 	repayDay int,
 	kind string,
-	assetID string,
 ) (*models.InstallmentPlan, []models.InstallmentItem, error) {
 	if !tx.Migrator().HasTable(&models.InstallmentPlan{}) || !tx.Migrator().HasTable(&models.InstallmentItem{}) {
 		return nil, nil, nil
@@ -158,11 +157,7 @@ func CreatePlanForTransactionTx(
 		periods = 120
 	}
 	if kind == "" {
-		if assetID != "" {
-			kind = "asset"
-		} else {
-			kind = "expense"
-		}
+		kind = "expense"
 	}
 	if feeMode == "" {
 		feeMode = "none"
@@ -239,7 +234,6 @@ func CreatePlanForTransactionTx(
 		FeeMode:         feeMode,
 		FeeValue:        feeValue,
 		Kind:            kind,
-		AssetID:         assetID,
 		PurchaseEntryID: &tr.ID,
 		CategoryName:    tr.Category,
 		Status:          "active",
@@ -289,23 +283,18 @@ func CreatePlanForTransactionTx(
 
 // CreateInstallmentPlanRequest 创建分期计划请求
 type CreateInstallmentPlanRequest struct {
-	ChannelID       uint    `json:"channel_id"`
-	ChannelCode     string  `json:"channel_code"`
-	Title           string  `json:"title"`
-	Kind            string  `json:"kind"` // "asset" | "expense"
-	Principal       int64   `json:"principal"`
+	ChannelID    uint   `json:"channel_id"`
+	ChannelCode  string `json:"channel_code"`
+	Title        string `json:"title"`
+	Kind         string `json:"kind"` // "expense"
+	Principal    int64  `json:"principal"`
 	Periods      int    `json:"periods"`
 	FeeMode      string `json:"fee_mode"` // "none" | "fixed_per_period" | "rate_per_period" | "total_fee"
 	FeeValue     int64  `json:"fee_value"`
 	FirstDueDate string `json:"first_due_date"`
 	RepayDay     int    `json:"repay_day"`
-	AssetID      string `json:"asset_id,omitempty"`
-	CreateNewGear bool  `json:"create_new_gear,omitempty"` // 类型 A 且录入新设备时为 true
-	GearName     string `json:"gear_name,omitempty"`
-	GearSpec     string `json:"gear_spec,omitempty"`
-	GearCategory string `json:"gear_category,omitempty"`
-	CategoryID   *uint  `json:"category_id,omitempty"`   // 类型 B 分类 ID
-	CategoryName string `json:"category_name,omitempty"` // 类型 B 分类名称
+	CategoryID   *uint  `json:"category_id,omitempty"`   // 分类 ID
+	CategoryName string `json:"category_name,omitempty"` // 分类名称
 	PurchaseDate string `json:"purchase_date,omitempty"` // 购买日期 YYYY-MM-DD
 	Note         string `json:"note,omitempty"`
 }
@@ -332,10 +321,10 @@ func CreateInstallmentPlan(c *gin.Context) {
 		return
 	}
 	if req.Kind == "" {
-		req.Kind = "asset"
+		req.Kind = "expense"
 	}
-	if req.Kind != "asset" && req.Kind != "expense" {
-		Error(c, http.StatusBadRequest, "分期类型仅支持 'asset' (购入装备) 或 'expense' (一笔消费)")
+	if req.Kind != "expense" {
+		Error(c, http.StatusBadRequest, "分期类型仅支持 'expense' (消费分期)")
 		return
 	}
 
@@ -388,12 +377,6 @@ func CreateInstallmentPlan(c *gin.Context) {
 		return
 	}
 
-	// 联动建 gear 时先取器物互斥锁再开事务（锁序 profileGearMu → DB，与 CreateTransaction / ResolveWish 一致）
-	if req.Kind == "asset" {
-		profileGearMu.Lock()
-		defer profileGearMu.Unlock()
-	}
-
 	dbTx := db.DB.Begin()
 	defer dbTx.Rollback()
 
@@ -424,7 +407,6 @@ func CreateInstallmentPlan(c *gin.Context) {
 		TotalFee:     totalFee,
 		FirstDueDate: firstDueDate,
 		RepayDay:     repayDay,
-		AssetID:      req.AssetID,
 		CategoryID:   req.CategoryID,
 		CategoryName: req.CategoryName,
 		Status:       "active",
@@ -433,31 +415,7 @@ func CreateInstallmentPlan(c *gin.Context) {
 		UpdatedAt:    now,
 	}
 
-	// 类型 A：购入装备处理
-	if req.Kind == "asset" {
-		gearName := req.GearName
-		if gearName == "" && req.Title != "" {
-			gearName = req.Title
-		}
-		if (req.CreateNewGear || req.AssetID == "") && gearName != "" {
-			createdGear, err := appendGearItemTx(dbTx, models.GearItem{
-				Name:         gearName,
-				Spec:         req.GearSpec,
-				Category:     req.GearCategory,
-				Status:       "active",
-				PriceCents:   req.Principal,
-				PurchaseDate: purchaseOccurredAt.Format("2006-01-02"),
-			}, purchaseOccurredAt, false, false)
-			if err != nil {
-				dbTx.Rollback()
-				Error(c, http.StatusInternalServerError, "保存新装备资产失败: "+err.Error())
-				return
-			}
-			plan.AssetID = createdGear.ID
-		}
-	}
-
-	// 类型 B：一笔消费处理 (生成购买日支出流水，标记 source = 'installment_purchase'，不扣现金)
+	// 一笔消费处理 (生成购买日支出流水，标记 source = 'installment_purchase'，不扣现金)
 	if req.Kind == "expense" {
 		cat := req.CategoryName
 		if cat == "" {

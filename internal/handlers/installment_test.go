@@ -43,8 +43,6 @@ func setupInstallmentRouter(masterKey string) *gin.Engine {
 			write.PUT("/transactions/:id", UpdateTransaction)
 			write.DELETE("/transactions/:id", DeleteTransaction)
 
-			write.GET("/assets/overview", GetAssetsOverview)
-			write.PUT("/assets/liquid-balance", SetInitialLiquidBalance)
 			write.GET("/credit-channels", GetCreditChannels)
 			write.DELETE("/categories/:id", DeleteCategory)
 
@@ -123,11 +121,11 @@ func TestCalculateDueDate_MonthEndClamp(t *testing.T) {
 	}
 }
 
-// 3. 用户指定的数值用例（必须通过的测试用例）：
-// 本金 ¥1,200，3 期，每期固定手续费 ¥6，类型 A，渠道花呗（25 日），首期 11 月 25 日：
-// - 创建后：固定资产 +1,200，待还负债 1,200，流动资金不变，净资产不变，月支出不变
-// - 标记第 1 期已还：流动资金 −406，负债 800，该月支出 +6，净资产 −6
-// - 全部还完：流动资金累计 −1,218，负债 0，手续费支出合计 18
+// 3. 分期数值与还款/撤销全链路用例：
+// 本金 ¥1,200，3 期，每期固定手续费 ¥6，消费分期，渠道花呗（25 日），首期 11 月 25 日：
+// - 创建后：待还总本金 1,200，产生购买日支出流水
+// - 标记第 1 期已还：待还总本金 800，月度支出增加手续费 +6
+// - 全部还完：待还总本金 0，手续费支出合计 18
 // - 重复标记同一期：不得重复入账；撤销已还：金额与账目全部回滚
 func TestInstallmentUserNumericalCase(t *testing.T) {
 	setupInstallmentTestDB(t)
@@ -138,23 +136,19 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 	// 设置花呗渠道还款日为 25
 	db.DB.Model(&models.CreditChannel{}).Where("code = ?", "huabei").Update("repayment_day", 25)
 
-	// 初始流动资金设为 0
-	db.DB.Model(&models.SiteConfig{}).Where("id = 1").Update("initial_liquid_balance", 0)
-
-	// Step 1: 创建分期计划 (本金 120000分, 3期, 每期固定600分, 类型 A, 首期 2026-11-25)
+	// Step 1: 创建分期计划 (本金 120000分, 3期, 每期固定600分, 消费分期, 首期 2026-11-25)
 	createReq := CreateInstallmentPlanRequest{
-		ChannelCode:   "huabei",
-		Title:         "MacBook Air M3",
-		Kind:          "asset",
-		Principal:     120000, // ¥1,200.00
-		Periods:       3,
-		FeeMode:       "fixed_per_period",
-		FeeValue:      600, // ¥6.00
-		FirstDueDate:  "2026-11-25",
-		RepayDay:      25,
-		CreateNewGear: true,
-		GearName:      "MacBook Air M3",
-		GearCategory:  "数码器材",
+		ChannelCode:  "huabei",
+		Title:        "MacBook Air M3",
+		Kind:         "expense",
+		CategoryName: "数码器材",
+		Principal:    120000, // ¥1,200.00
+		Periods:      3,
+		FeeMode:      "fixed_per_period",
+		FeeValue:     600, // ¥6.00
+		PurchaseDate: "2026-10-15",
+		FirstDueDate: "2026-11-25",
+		RepayDay:     25,
 	}
 	body, _ := json.Marshal(createReq)
 	req, _ := http.NewRequest("POST", "/api/v1/installment-plans", bytes.NewBuffer(body))
@@ -185,38 +179,26 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 		}
 	}
 
-	// 验证 Checkpoint 1：创建后大盘状态
-	// 固定资产 +1,200，待还负债 1,200，流动资金不变 (0)，净资产不变 (0)，月支出不变 (0)
-	getOverview := func() AssetsOverviewResponse {
-		reqO, _ := http.NewRequest("GET", "/api/v1/assets/overview", nil)
+	getSummary := func() InstallmentSummaryResponse {
+		reqO, _ := http.NewRequest("GET", "/api/v1/installment-plans/summary", nil)
 		reqO.Header.Set("Authorization", "Bearer "+token)
 		wO := httptest.NewRecorder()
 		r.ServeHTTP(wO, reqO)
 		if wO.Code != http.StatusOK {
-			t.Fatalf("获取大盘失败: code=%d, body=%s", wO.Code, wO.Body.String())
+			t.Fatalf("获取分期汇总失败: code=%d, body=%s", wO.Code, wO.Body.String())
 		}
 		var resp struct {
-			Data AssetsOverviewResponse `json:"data"`
+			Data InstallmentSummaryResponse `json:"data"`
 		}
 		_ = json.Unmarshal(wO.Body.Bytes(), &resp)
 		return resp.Data
 	}
 
-	ov1 := getOverview()
-	if ov1.FixedAssets != 120000 {
-		t.Errorf("Checkpoint 1: 固定资产应为 120000 (+1,200元), got %d", ov1.FixedAssets)
-	}
-	if ov1.TotalLiabilities != 120000 {
-		t.Errorf("Checkpoint 1: 待还负债应为 120000 (1,200元), got %d", ov1.TotalLiabilities)
-	}
-	if ov1.LiquidBalance != 0 {
-		t.Errorf("Checkpoint 1: 流动资金应为 0, got %d", ov1.LiquidBalance)
-	}
-	if ov1.NetWorth != 0 {
-		t.Errorf("Checkpoint 1: 净资产应为 0, got %d", ov1.NetWorth)
+	ov1 := getSummary()
+	if ov1.TotalRemainingPrincipal != 120000 {
+		t.Errorf("Checkpoint 1: 待还本金应为 120000 (1,200元), got %d", ov1.TotalRemainingPrincipal)
 	}
 
-	// 验证 Checkpoint 1 月度支出为 0
 	getMonthlySummary := func(y, m int) (int64, int64) {
 		reqS, _ := http.NewRequest("GET", fmt.Sprintf("/api/v1/transactions/summary?year=%04d&month=%02d", y, m), nil)
 		reqS.Header.Set("Authorization", "Bearer "+token)
@@ -233,7 +215,7 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 	}
 	expNov, _ := getMonthlySummary(2026, 11)
 	if expNov != 0 {
-		t.Errorf("Checkpoint 1: 创建分期不产生月支出, got %d, want 0", expNov)
+		t.Errorf("Checkpoint 1: 11月尚未还款，月支出应为 0, got %d", expNov)
 	}
 
 	// Step 2: 标记第 1 期已还 (应还 40600 = 40000 + 600)
@@ -252,17 +234,9 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 		t.Fatalf("标记第 1 期已还失败: code=%d body=%s", wP1.Code, wP1.Body.String())
 	}
 
-	// 验证 Checkpoint 2：标记第 1 期已还后
-	// 流动资金 −406 (-40600分)，负债 800 (80000分)，该月支出 +6 (600分)，净资产 −6 (-600分)
-	ov2 := getOverview()
-	if ov2.LiquidBalance != -40600 {
-		t.Errorf("Checkpoint 2: 流动资金应为 -40600 (-¥406), got %d", ov2.LiquidBalance)
-	}
-	if ov2.TotalLiabilities != 80000 {
-		t.Errorf("Checkpoint 2: 待还负债应为 80000 (¥800), got %d", ov2.TotalLiabilities)
-	}
-	if ov2.NetWorth != -600 {
-		t.Errorf("Checkpoint 2: 净资产应为 -600 (-¥6), got %d", ov2.NetWorth)
+	ov2 := getSummary()
+	if ov2.TotalRemainingPrincipal != 80000 {
+		t.Errorf("Checkpoint 2: 待还本金应为 80000 (¥800), got %d", ov2.TotalRemainingPrincipal)
 	}
 	expNov2, _ := getMonthlySummary(2026, 11)
 	if expNov2 != 600 {
@@ -292,17 +266,9 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 		}
 	}
 
-	// 验证 Checkpoint 4：全部还完后
-	// 流动资金累计 −1,218 (-121800分)，负债 0，手续费支出合计 18 (1800分)，净资产累计 −18 (-1800分)
-	ov3 := getOverview()
-	if ov3.LiquidBalance != -121800 {
-		t.Errorf("Checkpoint 4: 流动资金累计应为 -121800 (-¥1,218), got %d", ov3.LiquidBalance)
-	}
-	if ov3.TotalLiabilities != 0 {
-		t.Errorf("Checkpoint 4: 待还负债应为 0, got %d", ov3.TotalLiabilities)
-	}
-	if ov3.NetWorth != -1800 {
-		t.Errorf("Checkpoint 4: 净资产应为 -1800 (-¥18), got %d", ov3.NetWorth)
+	ov3 := getSummary()
+	if ov3.TotalRemainingPrincipal != 0 {
+		t.Errorf("Checkpoint 4: 待还本金应为 0, got %d", ov3.TotalRemainingPrincipal)
 	}
 	expNovAll, _ := getMonthlySummary(2026, 11)
 	if expNovAll != 1800 {
@@ -310,7 +276,6 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 	}
 
 	// Step 4: 撤销第 1 期已还测试
-	// 验证金额与账目全部回滚
 	reqUnpay, _ := http.NewRequest("POST", fmt.Sprintf("/api/v1/installment-items/%d/unpay", item1.ID), nil)
 	reqUnpay.Header.Set("Authorization", "Bearer "+token)
 	wUnpay := httptest.NewRecorder()
@@ -319,20 +284,10 @@ func TestInstallmentUserNumericalCase(t *testing.T) {
 		t.Fatalf("撤销第 1 期还款失败: code=%d body=%s", wUnpay.Code, wUnpay.Body.String())
 	}
 
-	ov4 := getOverview()
-	// 流动资金应回退 +406 -> 从 -121800 变为 -81200
-	if ov4.LiquidBalance != -81200 {
-		t.Errorf("Checkpoint 5: 撤销第 1 期后流动资金应回退到 -81200 (-¥812), got %d", ov4.LiquidBalance)
+	ov4 := getSummary()
+	if ov4.TotalRemainingPrincipal != 40000 {
+		t.Errorf("Checkpoint 5: 撤销第 1 期后待还本金应恢复为 40000 (¥400), got %d", ov4.TotalRemainingPrincipal)
 	}
-	// 负债应恢复 +400 -> 40000分 (¥400)
-	if ov4.TotalLiabilities != 40000 {
-		t.Errorf("Checkpoint 5: 撤销第 1 期后负债应恢复为 40000 (¥400), got %d", ov4.TotalLiabilities)
-	}
-	// 净资产应回滚 -> -1200 (-¥12)
-	if ov4.NetWorth != -1200 {
-		t.Errorf("Checkpoint 5: 撤销第 1 期后净资产应为 -1200 (-¥12), got %d", ov4.NetWorth)
-	}
-	// 计划状态应自动回退为 "active"
 	var planCheck models.InstallmentPlan
 	db.DB.First(&planCheck, "id = ?", plan.ID)
 	if planCheck.Status != "active" {
@@ -351,7 +306,7 @@ func TestInstallmentAdvanceSettlement(t *testing.T) {
 	createReq := CreateInstallmentPlanRequest{
 		ChannelCode:  "huabei",
 		Title:        "相机镜头",
-		Kind:         "asset",
+		Kind:         "expense",
 		Principal:    120000,
 		Periods:      3,
 		FeeMode:      "none",
@@ -442,7 +397,7 @@ func TestInstallmentProtectionConstraints(t *testing.T) {
 	createReq := CreateInstallmentPlanRequest{
 		ChannelCode:  "huabei",
 		Title:        "耳机",
-		Kind:         "asset",
+		Kind:         "expense",
 		Principal:    60000,
 		Periods:      3,
 		FeeMode:      "fixed_per_period",
@@ -527,17 +482,14 @@ func TestInstallmentProtectionConstraints(t *testing.T) {
 	}
 }
 
-// 6. 类型 B（一笔消费）分期资金流转测试
+// 6. 消费分期资金流转测试
 func TestInstallmentTypeBExpense(t *testing.T) {
 	setupInstallmentTestDB(t)
 	token := "token_test_installment_type_b_123"
 	seedTestAdminDevice(token)
 	r := setupInstallmentRouter(token)
 
-	// 初始流动资金设为 100000 (¥1,000.00)
-	db.DB.Model(&models.SiteConfig{}).Where("id = 1").Update("initial_liquid_balance", 100000)
-
-	// 创建类型 B「一笔消费」分期 (本金 60000分 ¥600.00，2期，每期固定手续费 1000分 ¥10.00)
+	// 创建「一笔消费」分期 (本金 60000分 ¥600.00，2期，每期固定手续费 1000分 ¥10.00)
 	createReq := CreateInstallmentPlanRequest{
 		ChannelCode:  "huabei",
 		Title:        "年度旅行酒店预订",
@@ -559,21 +511,16 @@ func TestInstallmentTypeBExpense(t *testing.T) {
 		t.Fatalf("创建类型 B 分期失败: %s", w.Body.String())
 	}
 
-	// 验证 Checkpoint 1：购买日产生一笔支出流水，计入 11 月支出 (¥600)，但不扣流动资金 (仍为 ¥1,000)
-	reqO, _ := http.NewRequest("GET", "/api/v1/assets/overview", nil)
+	reqO, _ := http.NewRequest("GET", "/api/v1/installment-plans/summary", nil)
 	reqO.Header.Set("Authorization", "Bearer "+token)
 	wO := httptest.NewRecorder()
 	r.ServeHTTP(wO, reqO)
 	var respO struct {
-		Data AssetsOverviewResponse `json:"data"`
+		Data InstallmentSummaryResponse `json:"data"`
 	}
 	_ = json.Unmarshal(wO.Body.Bytes(), &respO)
-
-	if respO.Data.LiquidBalance != 100000 {
-		t.Errorf("类型 B 创建后不应扣流动资金: got %d, want 100000", respO.Data.LiquidBalance)
-	}
-	if respO.Data.TotalLiabilities != 60000 {
-		t.Errorf("类型 B 创建后负债应为 60000 (¥600), got %d", respO.Data.TotalLiabilities)
+	if respO.Data.TotalRemainingPrincipal != 60000 {
+		t.Errorf("创建后待还本金应为 60000 (¥600), got %d", respO.Data.TotalRemainingPrincipal)
 	}
 
 	reqS, _ := http.NewRequest("GET", "/api/v1/transactions/summary?year=2026&month=11", nil)
@@ -587,7 +534,7 @@ func TestInstallmentTypeBExpense(t *testing.T) {
 	}
 	_ = json.Unmarshal(wS.Body.Bytes(), &respS)
 	if respS.Data.TotalExpense != 60000 {
-		t.Errorf("类型 B 购买流水应计入 11 月支出: got %d, want 60000", respS.Data.TotalExpense)
+		t.Errorf("购买流水应计入 11 月支出: got %d, want 60000", respS.Data.TotalExpense)
 	}
 
 	// 验证 Checkpoint 2：标记第 1 期已还 (30000 本金 + 1000 手续费 = 31000)
@@ -609,12 +556,11 @@ func TestInstallmentTypeBExpense(t *testing.T) {
 		t.Fatalf("还款失败: %s", wP.Body.String())
 	}
 
-	// 流动资金此时扣减 31000 -> 100000 - 31000 = 69000
 	wO2 := httptest.NewRecorder()
 	r.ServeHTTP(wO2, reqO)
 	_ = json.Unmarshal(wO2.Body.Bytes(), &respO)
-	if respO.Data.LiquidBalance != 69000 {
-		t.Errorf("还款后流动资金应扣减 31000 (¥310): got %d, want 69000", respO.Data.LiquidBalance)
+	if respO.Data.TotalRemainingPrincipal != 30000 {
+		t.Errorf("还款后待还本金应为 30000: got %d", respO.Data.TotalRemainingPrincipal)
 	}
 
 	// 11 月支出：原购买 60000 + 手续费 1000 = 61000 (还款本金 30000 不重复计入月支出)
@@ -637,7 +583,7 @@ func TestUpdateInstallmentItemDueDate(t *testing.T) {
 	createReq := CreateInstallmentPlanRequest{
 		ChannelCode:  "huabei",
 		Title:        "旧标题",
-		Kind:         "asset",
+		Kind:         "expense",
 		Principal:    120000,
 		Periods:      3,
 		FeeMode:      "none",

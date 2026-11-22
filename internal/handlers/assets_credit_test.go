@@ -52,11 +52,6 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			write.GET("/transactions/summary", GetTransactionSummary)
 			write.POST("/transactions", CreateTransaction)
 
-			write.GET("/assets/overview", GetAssetsOverview)
-			write.POST("/assets/gear", AddGearAsset)
-			write.POST("/assets/gear/:id/sell", SellGearAsset)
-			write.DELETE("/assets/gear/:id", DeleteGearAsset)
-
 			write.GET("/credit-channels", GetCreditChannels)
 			write.POST("/credit-channels", CreateCreditChannel)
 			write.PUT("/credit-channels/:id", UpdateCreditChannel)
@@ -173,182 +168,19 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		}
 	})
 
-	// 2. 访客端绝对隔离与设备脱敏 (Visitor Zero-Knowledge & Desensitization RC-53)
-	t.Run("Visitor Desensitization and Auth Isolation", func(t *testing.T) {
-		// 初始化主理人并植入带有价格的随身设备
-		var profile models.CuratorProfile
-		db.DB.FirstOrCreate(&profile)
-		initialGears := []models.GearItem{
-			{
-				ID:             "gear_test_01",
-				Name:           "Leica M11",
-				Spec:           "银色旁轴机身",
-				Category:       "摄影器材",
-				Status:         "active",
-				PriceCents:     6800000, // 68,000 元
-				PurchaseDate:   "2026-05-01",
-				SoldPriceCents: 0,
-			},
-		}
-		gearJSON, _ := json.Marshal(initialGears)
-		profile.EDCGear = string(gearJSON)
-		db.DB.Save(&profile)
-
-		// 2.1 访客 GET /api/v1/profile 应该严格脱敏 price_cents 与 sold_price_cents
+	// 2. 访客端绝对隔离 (Visitor Auth Isolation RC-53)
+	t.Run("Visitor Auth Isolation", func(t *testing.T) {
+		// 访客请求 GET /api/v1/transactions 必须返回 401 Unauthorized (RC-53)
 		w := httptest.NewRecorder()
-		req, _ := http.NewRequest(http.MethodGet, "/api/v1/profile", nil)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on guest get profile, got %d", w.Code)
-		}
-		var guestResp map[string]interface{}
-		_ = json.Unmarshal(w.Body.Bytes(), &guestResp)
-		guestData := guestResp["data"].(map[string]interface{})
-		guestGearList := guestData["edc_gear"].([]interface{})
-		if len(guestGearList) != 1 {
-			t.Fatalf("expected 1 gear, got %d", len(guestGearList))
-		}
-		firstGear := guestGearList[0].(map[string]interface{})
-		if _, exists := firstGear["price_cents"]; exists {
-			t.Fatalf("SECURITY VIOLATION: visitor must not see price_cents! got %v", firstGear["price_cents"])
-		}
-		if _, exists := firstGear["sold_price_cents"]; exists {
-			t.Fatalf("SECURITY VIOLATION: visitor must not see sold_price_cents!")
-		}
-
-		// 2.2 管理员 GET /api/v1/profile 可以看到完整的 price_cents
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodGet, "/api/v1/profile", nil)
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on admin get profile, got %d", w.Code)
-		}
-		var adminResp map[string]interface{}
-		_ = json.Unmarshal(w.Body.Bytes(), &adminResp)
-		adminData := adminResp["data"].(map[string]interface{})
-		adminGearList := adminData["edc_gear"].([]interface{})
-		adminFirstGear := adminGearList[0].(map[string]interface{})
-		if int64(adminFirstGear["price_cents"].(float64)) != 6800000 {
-			t.Fatalf("expected admin to see 6800000 price_cents, got %v", adminFirstGear["price_cents"])
-		}
-
-		// 2.3 访客请求 GET /api/v1/transactions 必须返回 401 Unauthorized (RC-53)
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/transactions", nil)
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("SECURITY VIOLATION: guest must get 401 on transactions, got %d", w.Code)
 		}
-
-		// 2.4 访客请求 GET /api/v1/assets/overview 必须返回 401 Unauthorized (RC-53)
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodGet, "/api/v1/assets/overview", nil)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("SECURITY VIOLATION: guest must get 401 on assets overview, got %d", w.Code)
-		}
 	})
 
-	// 3. 设备全生命周期双向绑定与资产大盘 (Gear Lifecycle & Assets Overview RC-53)
-	t.Run("Gear Lifecycle and Assets Overview", func(t *testing.T) {
-		// 3.1 录入新设备并同步生成支出账单 (买入即记账)
-		addReq := AddGearAssetRequest{
-			Name:              "Mac Studio M2 Max",
-			Category:          "数码设备",
-			Spec:              "32GB + 1TB",
-			PriceCents:        1649900,
-			PurchaseDate:      "2026-10-10",
-			PaymentMethod:     "支付宝",
-			Note:              "桌面主力生产力",
-			CreateTransaction: true,
-		}
-		body, _ := json.Marshal(addReq)
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest(http.MethodPost, "/api/v1/assets/gear", bytes.NewBuffer(body))
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		req.Header.Set("Content-Type", "application/json")
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on add gear asset, got %d", w.Code)
-		}
-		var addResp map[string]interface{}
-		_ = json.Unmarshal(w.Body.Bytes(), &addResp)
-		gearData := addResp["data"].(map[string]interface{})
-		gearID := gearData["id"].(string)
-
-		// 验证支出账单已自动创建
-		var txCount int64
-		db.DB.Model(&models.Transaction{}).Where("title = ?", "购置设备: Mac Studio M2 Max").Count(&txCount)
-		if txCount != 1 {
-			t.Fatalf("expected 1 auto created expense transaction, got %d", txCount)
-		}
-
-		// 3.2 资产大盘看板查询
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodGet, "/api/v1/assets/overview", nil)
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on assets overview, got %d", w.Code)
-		}
-		var overviewResp map[string]interface{}
-		_ = json.Unmarshal(w.Body.Bytes(), &overviewResp)
-		overviewData := overviewResp["data"].(map[string]interface{})
-		gearSummary := overviewData["gear_summary"].(map[string]interface{})
-		if int(gearSummary["active_count"].(float64)) < 1 {
-			t.Fatalf("expected active_count >= 1, got %v", gearSummary["active_count"])
-		}
-
-		// 3.3 设备出二手转售并自动生成回血流水 (卖出自动生成回血收入账单)
-		sellReq := SellGearAssetRequest{
-			SoldPriceCents: 1250000, // 12,500 元
-			SoldDate:       "2026-10-10",
-			Note:           "转售给同城朋友",
-		}
-		body, _ = json.Marshal(sellReq)
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/assets/gear/%s/sell", gearID), bytes.NewBuffer(body))
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		req.Header.Set("Content-Type", "application/json")
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on sell gear asset, got %d: %s", w.Code, w.Body.String())
-		}
-
-		// 验证自动生成了一条收入流水 (分类: 二手回血)
-		var incomeCount int64
-		db.DB.Model(&models.Transaction{}).
-			Where("type = 'income' AND category = '二手回血' AND amount = 1250000").
-			Count(&incomeCount)
-		if incomeCount != 1 {
-			t.Fatalf("expected 1 auto generated income transaction for second-hand recovery, got %d", incomeCount)
-		}
-
-		// 3.4 再次检查资产大盘：在用固资中该设备已出表，回血总额记录在 sold_recovered_value
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodGet, "/api/v1/assets/overview", nil)
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		r.ServeHTTP(w, req)
-		var overviewAfterSell map[string]interface{}
-		_ = json.Unmarshal(w.Body.Bytes(), &overviewAfterSell)
-		summaryAfterSell := overviewAfterSell["data"].(map[string]interface{})["gear_summary"].(map[string]interface{})
-		if int64(summaryAfterSell["sold_recovered_value"].(float64)) < 1250000 {
-			t.Fatalf("expected sold_recovered_value >= 1250000, got %v", summaryAfterSell["sold_recovered_value"])
-		}
-
-		// 3.5 删除设备单品
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest(http.MethodDelete, fmt.Sprintf("/api/v1/assets/gear/%s", gearID), nil)
-		req.Header.Set("Authorization", "Bearer "+testMasterKey)
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on delete gear, got %d", w.Code)
-		}
-	})
-
-	// 4. 记账大件反向同步建入设备库与分期付款支持 (RC-53)
-	t.Run("Create Transaction with Installment and Link Gear", func(t *testing.T) {
+	// 3. 记账分期付款与心愿联动支持 (RC-53)
+	t.Run("Create Transaction with Installment and Wish Linkage", func(t *testing.T) {
 		txReq := TransactionRequest{
 			Amount:                 239900,
 			Type:                   "expense",
@@ -361,9 +193,6 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			InstallmentTotalAmount: 239900,
 			InstallmentMonths:      12,
 			RepaymentDay:           10,
-			LinkGearAsset:          true,
-			GearCategory:           "数码器材",
-			GearSpec:               "Lightning 接口版",
 		}
 		body, _ := json.Marshal(txReq)
 		w := httptest.NewRecorder()
@@ -373,21 +202,6 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 on create transaction with installment, got %d", w.Code)
-		}
-
-		// 验证随身设备库自动收录了该条目
-		var profile models.CuratorProfile
-		db.DB.First(&profile)
-		gears := loadProfileGear(&profile)
-		foundGear := false
-		for _, g := range gears {
-			if g.Name == "AirPods Max 银色" && g.PriceCents == 239900 {
-				foundGear = true
-				break
-			}
-		}
-		if !foundGear {
-			t.Fatalf("expected AirPods Max to be linked to EDC gear, but not found")
 		}
 
 		// 验证关联心愿单时自动闭环流转为 fulfilled (RG-14)
@@ -419,9 +233,9 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		}
 	})
 
-	// 5. 三维心愿单四情景归册测试 (RC-53 4 Scenarios)
-	t.Run("Wish Resolution Four Scenarios", func(t *testing.T) {
-		// 5.1 情景 1: 原配原价达成 (exact)
+	// 4. 心愿单归册测试 (RC-53 Scenarios)
+	t.Run("Wish Resolution Scenarios", func(t *testing.T) {
+		// 4.1 情景 1: 原配原价达成 (exact)
 		wish1 := models.Wish{Title: "Sony 24-70 GM2", Kind: "item", Budget: 1599900, Status: "wanting"}
 		db.DB.Create(&wish1)
 
@@ -444,7 +258,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			t.Fatalf("wish 1 exact resolution failed: %+v", updatedWish1)
 		}
 
-		// 5.2 情景 2: 改选替代方案 (altered)
+		// 4.2 情景 2: 改选替代方案 (altered)
 		wish2 := models.Wish{Title: "MacBook Pro 16", Kind: "item", Budget: 1999900, Status: "wanting"}
 		db.DB.Create(&wish2)
 
@@ -468,7 +282,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			t.Fatalf("wish 2 altered resolution failed: %+v", updatedWish2)
 		}
 
-		// 5.3 情景 3: 理性拔草 / 释怀放弃 (relinquished)
+		// 4.3 情景 3: 理性拔草 / 释怀放弃 (relinquished)
 		wish3 := models.Wish{Title: "劳力士黑水鬼", Kind: "item", Budget: 8000000, Status: "wanting"}
 		db.DB.Create(&wish3)
 
@@ -488,11 +302,11 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		}
 		var updatedWish3 models.Wish
 		db.DB.First(&updatedWish3, wish3.ID)
-		if updatedWish3.Status != "relinquished" || updatedWish3.ActualCost != 0 || updatedWish3.TransactionID != nil || updatedWish3.GearID != nil {
-			t.Fatalf("relinquished wish must have actual_cost=0 and no tx/gear, got: %+v", updatedWish3)
+		if updatedWish3.Status != "relinquished" || updatedWish3.ActualCost != 0 || updatedWish3.TransactionID != nil {
+			t.Fatalf("relinquished wish must have actual_cost=0 and no tx, got: %+v", updatedWish3)
 		}
 
-		// 5.4 情景 4: 心愿达成 + 分期信贷 + 一键建入设备库 (RC-53)
+		// 4.4 情景 4: 心愿达成 + 分期信贷 (RC-53)
 		wish4 := models.Wish{Title: "iPad Pro 11 M4", Kind: "item", Spec: "256GB 黑色", Budget: 899900, Status: "wanting"}
 		db.DB.Create(&wish4)
 
@@ -500,7 +314,6 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 			ResolutionType:         "exact",
 			ActualCost:             899900,
 			CreateTransaction:      true,
-			CreateGearAsset:        true,
 			IsInstallment:          true,
 			InstallmentChannelCode: "baitiao",
 			InstallmentMonths:      12,
@@ -516,9 +329,6 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		}
 		var updatedWish4 models.Wish
 		db.DB.First(&updatedWish4, wish4.ID)
-		if updatedWish4.GearID == nil || *updatedWish4.GearID == "" {
-			t.Fatalf("expected wish4 to have gear_id linked, got nil")
-		}
 		if updatedWish4.TransactionID == nil {
 			t.Fatalf("expected wish4 to have transaction_id linked, got nil")
 		}

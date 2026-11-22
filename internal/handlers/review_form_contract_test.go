@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
-	"time"
 
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
@@ -342,44 +341,16 @@ func TestWishRejectsNegativeBudgetAndCost(t *testing.T) {
 	}
 }
 
-// ── 5. 设备固资：负价格 + 伪造分期渠道 ─────────────────────────────
-
-func TestAddGearAssetRejectsNegativePriceAndGhostChannel(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	if w := doJSON(r, http.MethodPost, "/api/v1/assets/gear", token, map[string]any{
-		"name": "负价格设备", "category": "数码器材", "price_cents": -1,
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("负价格设备应 400: %d %s", w.Code, w.Body.String())
-	}
-	if w := doJSON(r, http.MethodPost, "/api/v1/assets/gear", token, map[string]any{
-		"name": "伪渠道设备", "category": "数码器材", "price_cents": 100,
-		"is_installment": true, "installment_channel_code": "ghost_bank",
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("伪造分期渠道设备应 400: %d %s", w.Code, w.Body.String())
-	}
-}
-
 // ── 6. 散页 type 与归属外键配对 + 外键存在性 ────────────────────────
 
 func TestEntryTypeBindingPairing(t *testing.T) {
 	r, token := setupContractRouter(t)
 
-	project := models.Project{Title: "配对造物", Status: "进行中"}
-	if err := db.DB.Create(&project).Error; err != nil {
-		t.Fatal(err)
-	}
 	wish := models.Wish{Title: "配对心愿", Kind: "item", Status: "wanting"}
 	if err := db.DB.Create(&wish).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	// type=life 带 project_id → 400
-	if w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
-		"type": "life", "content": "x", "project_id": project.ID,
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("life+project_id 应 400: %d %s", w.Code, w.Body.String())
-	}
 	// type=life 带 wish_id → 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
 		"type": "life", "content": "x", "wish_id": wish.ID,
@@ -388,13 +359,13 @@ func TestEntryTypeBindingPairing(t *testing.T) {
 	}
 	// 配对正确 → 200
 	if w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
-		"type": "project", "content": "x", "project_id": project.ID,
+		"type": "wish", "content": "x", "wish_id": wish.ID,
 	}); w.Code != http.StatusOK {
-		t.Fatalf("project+project_id 应 200: %d %s", w.Code, w.Body.String())
+		t.Fatalf("wish+wish_id 应 200: %d %s", w.Code, w.Body.String())
 	}
 
 	// 切走类型但未显式解绑 → 400
-	entry := models.LifeEntry{Type: "project", Title: "待切类型", Content: "x", ProjectID: &project.ID}
+	entry := models.LifeEntry{Type: "wish", Title: "待切类型", Content: "x", WishID: &wish.ID}
 	if err := db.DB.Create(&entry).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -402,29 +373,29 @@ func TestEntryTypeBindingPairing(t *testing.T) {
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
 		"type": "life", "content": "改成日常",
 	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("切类型未解绑 project_id 应 400: %d %s", w.Code, w.Body.String())
+		t.Fatalf("切类型未解绑 wish_id 应 400: %d %s", w.Code, w.Body.String())
 	}
-	// 显式携带 project_id=null 解绑后切类型 → 200 且归属已清
+	// 显式携带 wish_id=null 解绑后切类型 → 200 且归属已清
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"type": "life", "content": "改成日常", "project_id": nil,
+		"type": "life", "content": "改成日常", "wish_id": nil,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("显式解绑后切类型应 200: %d %s", w.Code, w.Body.String())
 	}
 	var reloaded models.LifeEntry
 	db.DB.First(&reloaded, entry.ID)
-	if reloaded.Type != "life" || reloaded.ProjectID != nil {
-		t.Fatalf("解绑后应为 life 且 project_id 为空: type=%s project=%v", reloaded.Type, reloaded.ProjectID)
+	if reloaded.Type != "life" || reloaded.WishID != nil {
+		t.Fatalf("解绑后应为 life 且 wish_id 为空: type=%s wish=%v", reloaded.Type, reloaded.WishID)
 	}
 
-	// life 条目携带 project_id（哪怕存量就有）→ 400
+	// life 条目携带 wish_id → 400
 	lifeEntry := models.LifeEntry{Type: "life", Title: "纯日常", Content: "x"}
 	if err := db.DB.Create(&lifeEntry).Error; err != nil {
 		t.Fatal(err)
 	}
 	if w := doJSON(r, http.MethodPut, "/api/v1/entries/"+u64(lifeEntry.ID), token, map[string]any{
-		"content": "x", "project_id": project.ID,
+		"content": "x", "wish_id": wish.ID,
 	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("life 条目携带 project_id 应 400: %d %s", w.Code, w.Body.String())
+		t.Fatalf("life 条目携带 wish_id 应 400: %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -432,23 +403,16 @@ func TestEntryAndTransactionForeignKeyExistence(t *testing.T) {
 	r, token := setupContractRouter(t)
 
 	// 散页外键不存在 → 400
-	for _, fk := range []string{"project_id", "wish_id", "footprint_id"} {
-		if w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
-			"type": "life", "content": "x", fk: 999999,
-		}); w.Code != http.StatusBadRequest {
-			t.Fatalf("散页 %s=999999 应 400: %d %s", fk, w.Code, w.Body.String())
-		}
+	if w := doJSON(r, http.MethodPost, "/api/v1/entries", token, map[string]any{
+		"type": "wish", "content": "x", "wish_id": 999999,
+	}); w.Code != http.StatusBadRequest {
+		t.Fatalf("散页 wish_id=999999 应 400: %d %s", w.Code, w.Body.String())
 	}
 	// 账目外键不存在 → 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
 		"amount": 100, "type": "expense", "category": "餐饮", "wish_id": 999999,
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("账目 wish_id=999999 应 400: %d %s", w.Code, w.Body.String())
-	}
-	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "expense", "category": "餐饮", "footprint_id": 999999,
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("账目 footprint_id=999999 应 400: %d %s", w.Code, w.Body.String())
 	}
 
 	// wish_id=0 归一化为 nil（创建）
@@ -486,186 +450,6 @@ func TestEntryAndTransactionForeignKeyExistence(t *testing.T) {
 	db.DB.First(&reloaded, tx.ID)
 	if reloaded.WishID != nil {
 		t.Fatalf("wish_id=0 更新后应解绑, 实际 %v", *reloaded.WishID)
-	}
-}
-
-// ── 7. Project status 严格白名单（存量由启动迁移归一）───────────────
-
-func TestProjectStatusWhitelist(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	// 未知状态创建 → 400（英文历史态也一并拒绝 —— 存量归一交给启动迁移）
-	for _, status := range []string{"已下架", "Active", "Maintained", "WIP", "Archived", "持续维护"} {
-		if w := doJSON(r, http.MethodPost, "/api/v1/projects", token, map[string]any{
-			"title": "未知状态 " + status, "status": status,
-		}); w.Code != http.StatusBadRequest {
-			t.Fatalf("非中文四态 status %q 创建应 400: %d %s", status, w.Code, w.Body.String())
-		}
-	}
-	// 中文四态放行
-	for _, status := range []string{"进行中", "已完成", "维护中", "已搁置"} {
-		if w := doJSON(r, http.MethodPost, "/api/v1/projects", token, map[string]any{
-			"title": "状态 " + status, "status": status,
-		}); w.Code != http.StatusOK {
-			t.Fatalf("合法 status %q 创建应 200: %d %s", status, w.Code, w.Body.String())
-		}
-	}
-	// 省略 status → 默认「进行中」
-	w := doJSON(r, http.MethodPost, "/api/v1/projects", token, map[string]any{"title": "默认状态"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("省略 status 应 200: %d %s", w.Code, w.Body.String())
-	}
-	var created struct {
-		Data models.Project `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.Data.Status != "进行中" {
-		t.Fatalf("省略 status 应默认「进行中」, 实际 %q", created.Data.Status)
-	}
-
-	// 更新：未知值 400，中文四态放行
-	path := "/api/v1/projects/" + u64(created.Data.ID)
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"status": "On Sale"}); w.Code != http.StatusBadRequest {
-		t.Fatalf("未知 status 更新应 400: %d %s", w.Code, w.Body.String())
-	}
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"status": "已搁置"}); w.Code != http.StatusOK {
-		t.Fatalf("中文四态更新应 200: %d %s", w.Code, w.Body.String())
-	}
-}
-
-// 启动迁移：存量英文/历史表述一次性归一到中文四态，且幂等
-func TestNormalizeProjectStatusesMigration(t *testing.T) {
-	setupContractRouter(t)
-
-	projects := []models.Project{
-		{Title: "英文活跃", Status: "Active"},
-		{Title: "英文试验", Status: "WIP"},
-		{Title: "英文维护", Status: "Maintained"},
-		{Title: "英文归档", Status: "Archived"},
-		{Title: "mac 旧值", Status: "持续维护"},
-		{Title: "已是中文", Status: "进行中"},
-		{Title: "已是已完成", Status: "已完成"},
-	}
-	if err := db.DB.Create(&projects).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	db.NormalizeProjectStatuses(db.DB)
-	db.NormalizeProjectStatuses(db.DB) // 幂等：重复执行不漂移
-
-	want := map[string]string{
-		"英文活跃": "进行中", "英文试验": "进行中", "英文维护": "维护中",
-		"英文归档": "已搁置", "mac 旧值": "维护中", "已是中文": "进行中", "已是已完成": "已完成",
-	}
-	for title, expected := range want {
-		var p models.Project
-		if err := db.DB.Where("title = ?", title).First(&p).Error; err != nil {
-			t.Fatalf("回读 %s 失败: %v", title, err)
-		}
-		if p.Status != expected {
-			t.Fatalf("项目 %q 状态应为 %q, 实际 %q", title, expected, p.Status)
-		}
-	}
-}
-
-// ── 8. 足迹：返程倒挂交换 + 城市归一 ───────────────────────────────
-
-func TestUpdateFootprintSwapsReversedDepartedAt(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	fp := models.Footprint{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)}
-	if err := db.DB.Create(&fp).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodPut, "/api/v1/footprints/"+u64(fp.ID), token, map[string]any{
-		"visited_at": "2026-03-10", "departed_at": "2026-03-05",
-	}); w.Code != http.StatusOK {
-		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.Footprint
-	db.DB.First(&reloaded, fp.ID)
-	if reloaded.DepartedAt == nil {
-		t.Fatal("departed_at 不应丢失")
-	}
-	if !reloaded.VisitedAt.Before(*reloaded.DepartedAt) {
-		t.Fatalf("返程早于到访应自动交换: visited=%v departed=%v", reloaded.VisitedAt, *reloaded.DepartedAt)
-	}
-}
-
-func TestCreateFootprintNormalizesCityCode(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	// 伪 code + 字典城市名：反查回国标 code，名称取字典全称
-	w := doJSON(r, http.MethodPost, "/api/v1/footprints", token, map[string]any{
-		"city_code": "not-a-code", "city_name": "杭州市", "visited_at": "2026-03-10",
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("创建失败: %d %s", w.Code, w.Body.String())
-	}
-	var created struct {
-		Data models.Footprint `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
-		t.Fatal(err)
-	}
-	if created.Data.CityCode != "330100" || created.Data.CityName != "杭州市" {
-		t.Fatalf("伪 code 应反查回 330100/杭州市, 实际 %q/%q", created.Data.CityCode, created.Data.CityName)
-	}
-
-	// 合法 code + 矛盾城市名：名称以字典全称为准
-	w = doJSON(r, http.MethodPost, "/api/v1/footprints", token, map[string]any{
-		"city_code": "330100", "city_name": "火星", "visited_at": "2026-03-11",
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("创建失败: %d %s", w.Code, w.Body.String())
-	}
-	var second struct {
-		Data models.Footprint `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
-		t.Fatal(err)
-	}
-	if second.Data.CityCode != "330100" || second.Data.CityName != "杭州市" {
-		t.Fatalf("矛盾城市名应以字典为准: 实际 %q/%q", second.Data.CityCode, second.Data.CityName)
-	}
-}
-
-// ── 9. clear_city 只清城市归属不清 location（契约 A 修正）──────────
-
-func TestUpdateEntryClearCityKeepsLocation(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	entry := models.LifeEntry{
-		Type: "travel", Title: "属地修正", Content: "x",
-		CityCode: "330100", CityName: "杭州市", Location: "西湖边的小咖啡馆",
-	}
-	if err := db.DB.Create(&entry).Error; err != nil {
-		t.Fatal(err)
-	}
-	path := "/api/v1/entries/" + u64(entry.ID)
-
-	// clear_city=true 不再连带清空 location
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"clear_city": true}); w.Code != http.StatusOK {
-		t.Fatalf("clear_city 更新失败: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.LifeEntry
-	db.DB.First(&reloaded, entry.ID)
-	if reloaded.CityCode != "" || reloaded.CityName != "" {
-		t.Fatalf("clear_city 应清空城市归属: %q/%q", reloaded.CityCode, reloaded.CityName)
-	}
-	if reloaded.Location != "西湖边的小咖啡馆" {
-		t.Fatalf("clear_city 不得连带清空 location, 实际 %q", reloaded.Location)
-	}
-
-	// 全清必须显式携带 location 空串（契约 C）
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{"clear_city": true, "location": ""}); w.Code != http.StatusOK {
-		t.Fatalf("全清更新失败: %d %s", w.Code, w.Body.String())
-	}
-	db.DB.First(&reloaded, entry.ID)
-	if reloaded.Location != "" {
-		t.Fatalf("显式携带 location 空串应清空地点, 实际 %q", reloaded.Location)
 	}
 }
 
@@ -719,74 +503,6 @@ func TestEnsureCustomInstallmentChannelMigration(t *testing.T) {
 			t.Fatalf("无历史账目时还款日应兜底 10, 实际 %d", ch.RepaymentDay)
 		}
 	})
-}
-
-// ── 11. wish/footprint 互斥 ─────────────────────────────────────────
-
-func TestTransactionWishFootprintMutualExclusion(t *testing.T) {
-	r, token := setupContractRouter(t)
-
-	wish := models.Wish{Title: "互斥心愿", Kind: "item", Status: "wanting"}
-	if err := db.DB.Create(&wish).Error; err != nil {
-		t.Fatal(err)
-	}
-	fp := models.Footprint{CityCode: "330100", CityName: "杭州市", VisitedAt: time.Now()}
-	if err := db.DB.Create(&fp).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	// 创建：wish_id + footprint_id 双挂 → 400
-	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "expense", "category": "餐饮",
-		"wish_id": wish.ID, "footprint_id": fp.ID,
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("创建双挂应 400: %d %s", w.Code, w.Body.String())
-	}
-	// 单挂合法
-	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "expense", "category": "餐饮", "wish_id": wish.ID,
-	}); w.Code != http.StatusOK {
-		t.Fatalf("单挂心愿应 200: %d %s", w.Code, w.Body.String())
-	}
-
-	// 更新：给已挂心愿的账目再挂足迹 → 400
-	tx := models.Transaction{Amount: 100, Type: "expense", Category: "餐饮", WishID: &wish.ID}
-	if err := db.DB.Create(&tx).Error; err != nil {
-		t.Fatal(err)
-	}
-	path := "/api/v1/transactions/" + u64(tx.ID)
-	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 100, "category": "餐饮", "footprint_id": fp.ID,
-	}); w.Code != http.StatusBadRequest {
-		t.Fatalf("更新双挂应 400: %d %s", w.Code, w.Body.String())
-	}
-
-	// 存量双挂历史行（直插 DB）不携带外键的普通编辑放行 —— 只拦矛盾载荷，不拦历史数据维护
-	legacy := models.Transaction{Amount: 100, Type: "expense", Category: "餐饮", WishID: &wish.ID, FootprintID: &fp.ID}
-	if err := db.DB.Create(&legacy).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodPut, "/api/v1/transactions/"+u64(legacy.ID), token, map[string]any{
-		"amount": 100, "category": "餐饮", "title": "只改标题",
-	}); w.Code != http.StatusOK {
-		t.Fatalf("存量双挂行普通编辑应放行: %d %s", w.Code, w.Body.String())
-	}
-
-	// 先解绑（footprint_id=0）再挂心愿 → 合法
-	fpOnly := models.Transaction{Amount: 100, Type: "expense", Category: "餐饮", FootprintID: &fp.ID}
-	if err := db.DB.Create(&fpOnly).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodPut, "/api/v1/transactions/"+u64(fpOnly.ID), token, map[string]any{
-		"amount": 100, "category": "餐饮", "footprint_id": 0, "wish_id": wish.ID,
-	}); w.Code != http.StatusOK {
-		t.Fatalf("解绑足迹后挂心愿应 200: %d %s", w.Code, w.Body.String())
-	}
-	var reloaded models.Transaction
-	db.DB.First(&reloaded, fpOnly.ID)
-	if reloaded.FootprintID != nil || reloaded.WishID == nil || *reloaded.WishID != wish.ID {
-		t.Fatalf("应已切挂到心愿: footprint=%v wish=%v", reloaded.FootprintID, reloaded.WishID)
-	}
 }
 
 // ── 4(补). resolution_type 白名单 ───────────────────────────────────
@@ -869,15 +585,6 @@ func TestTransactionCategoryDictionary(t *testing.T) {
 		"amount": 100, "type": "expense", "category": "测试支出类",
 	}); w.Code != http.StatusOK {
 		t.Fatalf("库内分类应放行: %d %s", w.Code, w.Body.String())
-	}
-	// gear scope 并集：器物联动的 gear 分类可用作 expense 账单分类
-	if err := db.DB.Create(&models.CategoryOption{Scope: "gear", Name: "手冲咖啡工坊", SortOrder: 10}).Error; err != nil {
-		t.Fatal(err)
-	}
-	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "expense", "category": "手冲咖啡工坊",
-	}); w.Code != http.StatusOK {
-		t.Fatalf("gear scope 并集分类应放行: %d %s", w.Code, w.Body.String())
 	}
 
 	// 更新同口径：合法创建的账目改成字典外分类 → 400

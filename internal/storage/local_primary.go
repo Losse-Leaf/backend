@@ -223,6 +223,11 @@ func ReadObject(ctx context.Context, objectKey string) ([]byte, error) {
 		if data, err := readLocalObject(objectKey); err == nil {
 			return data, nil
 		}
+		if AlistMirrorEnabled() {
+			if data, err := FetchFromAlistAndCacheLocal(ctx, objectKey); err == nil {
+				return data, nil
+			}
+		}
 	}
 
 	// 回落：R2

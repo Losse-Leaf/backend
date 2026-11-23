@@ -405,6 +405,9 @@ func DeleteObjectWithContext(ctx context.Context, objectKey string) error {
 		return nil
 	}
 	localErr := DeleteLocalObject(objectKey)
+	if AlistMirrorEnabled() {
+		_ = DeleteFromAlist(ctx, objectKey)
+	}
 	snap := r2ClientsSnapshot()
 	if !snap.configured || snap.client == nil {
 		return localErr
@@ -791,8 +794,12 @@ func UploadObject(ctx context.Context, objectKey string, reader io.Reader, size 
 		return nil
 	}
 
-	// 未配置 R2：只写本地
-	return writeLocalObject(objectKey, reader, size)
+	// 未配置 R2：只写本地（若启用了同机 AList 5TB 云盘镜像则后台异步双写）
+	if err := writeLocalObject(objectKey, reader, size); err != nil {
+		return err
+	}
+	MirrorLocalToAlistAsync(objectKey, contentType)
+	return nil
 }
 
 // escapeObjectKeyPath 对对象键逐段做 URL 转义（保留 `/` 分隔符）。

@@ -84,6 +84,7 @@ func main() {
 
 	// BE-5：启动回填不再阻塞监听，改到 HTTP server 起来之后后台执行。
 	handlers.LoadStorageConfigFromDB()
+	handlers.StartVesperSpaceReconciler()
 
 	// 3. 生产模式或开发模式
 	if os.Getenv("GIN_MODE") == "release" {

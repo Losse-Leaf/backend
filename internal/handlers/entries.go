@@ -255,6 +255,7 @@ func CreateLifeEntry(c *gin.Context) {
 	db.DB.First(&entry, entry.ID)
 	populateEntryURLs(&entry)
 	InvalidateStatsCache()
+	SyncEntryToVesperSpaceAsync(entry.ID, nil)
 
 	Success(c, entry)
 }
@@ -578,6 +579,9 @@ func UpdateLifeEntry(c *gin.Context) {
 		entry.OccurredAt = t
 	}
 
+	var oldAttIDs []uint
+	db.DB.Model(&models.Attachment{}).Where("entry_id = ?", entry.ID).Pluck("id", &oldAttIDs)
+
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&entry).Error; err != nil {
 			return err
@@ -610,6 +614,7 @@ func UpdateLifeEntry(c *gin.Context) {
 	db.DB.First(&entry, entry.ID)
 	populateEntryURLs(&entry)
 	InvalidateStatsCache()
+	SyncEntryToVesperSpaceAsync(entry.ID, diffRemovedAttachmentIDs(oldAttIDs, entry.Attachments))
 
 	Success(c, entry)
 }
@@ -624,6 +629,9 @@ func DeleteLifeEntry(c *gin.Context) {
 		Error(c, http.StatusNotFound, "记录不存在或已被删除")
 		return
 	}
+
+	var attIDs []uint
+	db.DB.Model(&models.Attachment{}).Where("entry_id = ?", entry.ID).Pluck("id", &attIDs)
 
 	if purge {
 		var keysToDelete []string
@@ -647,6 +655,7 @@ func DeleteLifeEntry(c *gin.Context) {
 			_ = storage.DeleteObject(key)
 		}
 		InvalidateStatsCache()
+		DeleteSpaceWorksForAttachmentsAsync(attIDs, false)
 		Success(c, gin.H{"id": id, "purged": true})
 		return
 	}
@@ -656,6 +665,7 @@ func DeleteLifeEntry(c *gin.Context) {
 		return
 	}
 	InvalidateStatsCache()
+	DeleteSpaceWorksForAttachmentsAsync(attIDs, true)
 
 	Success(c, gin.H{"id": id, "deleted": true})
 }

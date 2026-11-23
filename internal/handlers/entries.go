@@ -26,6 +26,25 @@ var validEntryTypes = map[string]bool{
 	"wish": true,
 }
 
+// normalizeEntryCategory 归一化散页内容分类（与 Vesper Space 四大展区 1:1 对齐：Photography / Travel / Still Life / Motion，空字符串代表默认日常）。
+func normalizeEntryCategory(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	switch strings.ToLower(trimmed) {
+	case "", "daily", "life", "日常", "日常随笔":
+		return "", true
+	case "photography", "摄影":
+		return "Photography", true
+	case "travel", "旅途", "旅行":
+		return "Travel", true
+	case "still life", "still_life", "still-life", "stilllife", "静物", "器物":
+		return "Still Life", true
+	case "motion", "video", "影像":
+		return "Motion", true
+	default:
+		return "", false
+	}
+}
+
 // DeriveTitleFromContent 从正文派生标题（朋友圈式发布：只填正文，标题取首行）
 func DeriveTitleFromContent(content string, maxLength int) string {
 	if maxLength <= 0 {
@@ -147,7 +166,8 @@ func redactEmbeddedWishFinancesBatch(entries []models.LifeEntry) {
 
 // CreateEntryRequest 新增生活记录请求载荷
 type CreateEntryRequest struct {
-	Type            string `json:"type"` // life, wish
+	Type            string `json:"type"`     // life, wish
+	Category        string `json:"category"` // "", Photography, Travel, Still Life, Motion
 	Title           string `json:"title"`
 	Content         string `json:"content" binding:"required"`
 	OccurredAt      string `json:"occurred_at"`
@@ -213,8 +233,15 @@ func CreateLifeEntry(c *gin.Context) {
 		}
 	}
 
+	entryCategory, catOK := normalizeEntryCategory(req.Category)
+	if !catOK {
+		Error(c, http.StatusBadRequest, "category 仅支持 Photography / Travel / Still Life / Motion 或空")
+		return
+	}
+
 	entry := models.LifeEntry{
 		Type:       entryType,
+		Category:   entryCategory,
 		Title:      title,
 		Content:    content,
 		OccurredAt: occurred,
@@ -323,13 +350,17 @@ func GetLifeEntriesV1(c *gin.Context) {
 		}
 	}
 
-	// 核心视角动态映射 (daily, wish)
+	// 核心视角与分类动态映射 (daily, wish, Photography, Travel, Still Life, Motion)
 	if category != "" && category != "all" {
 		switch category {
 		case "daily":
 			query = query.Where("type = ?", "life")
 		case "wish":
 			query = query.Where("type = ? OR (wish_id IS NOT NULL AND wish_id > 0)", "wish")
+		default:
+			if normCat, ok := normalizeEntryCategory(category); ok && normCat != "" {
+				query = query.Where("category = ?", normCat)
+			}
 		}
 	}
 
@@ -486,6 +517,7 @@ func GetLifeEntryByID(c *gin.Context) {
 // UpdateEntryRequest 更新生活记录请求载荷（字段皆可选）
 type UpdateEntryRequest struct {
 	Type             string `json:"type"`
+	Category         string `json:"category"`
 	Title            string `json:"title"`
 	Content          string `json:"content"`
 	OccurredAt       string `json:"occurred_at"`
@@ -521,6 +553,14 @@ func UpdateLifeEntry(c *gin.Context) {
 			return
 		}
 		entry.Type = req.Type
+	}
+	if hasJSONValue(rawKeys, "category") || req.Category != "" {
+		normCat, ok := normalizeEntryCategory(req.Category)
+		if !ok {
+			Error(c, http.StatusBadRequest, "category 仅支持 Photography / Travel / Still Life / Motion 或空")
+			return
+		}
+		entry.Category = normCat
 	}
 	titleKeyPresent := hasJSONValue(rawKeys, "title")
 	if req.Title != "" || titleKeyPresent {

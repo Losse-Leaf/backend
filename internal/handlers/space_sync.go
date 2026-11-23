@@ -59,11 +59,32 @@ func isProjectableAttachment(att models.Attachment) bool {
 }
 
 func inferSpaceCategoryForEntry(entry models.LifeEntry, att models.Attachment) string {
+	// 1. 优先采纳散页显式指定的原生分类 (方式 A: Photography / Travel / Still Life / Motion)
+	if normCat, ok := normalizeEntryCategory(entry.Category); ok && normCat != "" {
+		return normCat
+	}
+
+	// 2. 视频附件自动归入影像 (Motion)
 	mime := strings.ToLower(strings.TrimSpace(att.MimeType))
 	ext := strings.ToLower(filepath.Ext(att.ObjectKey))
 	if strings.HasPrefix(mime, "video/") || ext == ".mp4" || ext == ".webm" {
 		return "Motion"
 	}
+
+	// 3. 兼容标题或正文中的话题标签 (#摄影 / #旅途 / #静物 / #影像)
+	combined := strings.ToLower(entry.Title + " " + entry.Content)
+	switch {
+	case strings.Contains(combined, "#motion") || strings.Contains(combined, "#影像"):
+		return "Motion"
+	case strings.Contains(combined, "#still") || strings.Contains(combined, "#静物") || strings.Contains(combined, "#器物"):
+		return "Still Life"
+	case strings.Contains(combined, "#travel") || strings.Contains(combined, "#旅途") || strings.Contains(combined, "#旅行"):
+		return "Travel"
+	case strings.Contains(combined, "#photo") || strings.Contains(combined, "#摄影") || strings.Contains(combined, "#街拍"):
+		return "Photography"
+	}
+
+	// 4. 智能兜底：心愿关联归入静物 (Still Life)，带地点归入旅途 (Travel)，其余归入摄影 (Photography)
 	if entry.Type == "wish" || (entry.WishID != nil && *entry.WishID > 0) {
 		return "Still Life"
 	}

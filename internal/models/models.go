@@ -11,6 +11,7 @@ import (
 type LifeEntry struct {
 	ID         uint      `gorm:"primaryKey;index:idx_entry_occurred_id,priority:2" json:"id"`
 	Type       string    `gorm:"index;index:idx_entry_type_occurred,priority:1" json:"type"` // life, wish
+	Category   string    `gorm:"size:32;index" json:"category"`                              // "", Photography, Travel, Still Life, Motion
 	Title      string    `json:"title"`
 	Content    string    `gorm:"type:text" json:"content"`
 	OccurredAt time.Time `gorm:"index:idx_entry_occurred_id,priority:1;index:idx_entry_type_occurred,priority:2;index" json:"occurred_at"`

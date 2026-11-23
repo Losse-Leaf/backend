@@ -130,16 +130,20 @@ func TestVesperSpaceDataLayerProjectionAndAlistMirror(t *testing.T) {
 		t.Fatalf("expected aspect 1.33 from 1600x1200, got %v", projected["aspect"])
 	}
 
-	// 3. Toggle entry to private -> automatic projection updates visibility to private
-	db.DB.Model(&entry).Update("is_private", true)
+	// 3. Toggle entry to private and set explicit Category (Option A: "静物" -> "Still Life") -> automatic projection updates visibility & category
+	normCat, _ := normalizeEntryCategory("静物")
+	db.DB.Model(&entry).Updates(map[string]any{
+		"is_private": true,
+		"category":   normCat,
+	})
 	if err := SyncEntryToVesperSpace(context.Background(), entry.ID, nil); err != nil {
 		t.Fatalf("SyncEntryToVesperSpace update failed: %v", err)
 	}
 	mu.Lock()
 	projectedPriv := spaceWorks[expectedWorkID]
 	mu.Unlock()
-	if projectedPriv["visibility"] != "private" {
-		t.Fatalf("expected private entry to project visibility=private, got %v", projectedPriv["visibility"])
+	if projectedPriv["visibility"] != "private" || projectedPriv["category"] != "Still Life" {
+		t.Fatalf("expected private entry to project visibility=private and category=Still Life, got %+v", projectedPriv)
 	}
 
 	// 4. Transparent fallback: remove local file, ReadObject pulls from AList /space/looseleaf and re-caches locally

@@ -403,16 +403,18 @@ func (a *audienceList) UnmarshalJSON(data []byte) error {
 }
 
 type oidcIDTokenClaims struct {
-	Iss   string       `json:"iss"`
-	Sub   string       `json:"sub"`
-	Aud   audienceList `json:"aud"`
-	Azp   string       `json:"azp"`
-	Exp   int64        `json:"exp"`
-	Iat   int64        `json:"iat"`
-	Nbf   int64        `json:"nbf"`
-	Nonce string       `json:"nonce"`
-	Email string       `json:"email"`
-	Name  string       `json:"name"`
+	Iss               string       `json:"iss"`
+	Sub               string       `json:"sub"`
+	Aud               audienceList `json:"aud"`
+	Azp               string       `json:"azp"`
+	Exp               int64        `json:"exp"`
+	Iat               int64        `json:"iat"`
+	Nbf               int64        `json:"nbf"`
+	Nonce             string       `json:"nonce"`
+	Email             string       `json:"email"`
+	Name              string       `json:"name"`
+	PreferredUsername string       `json:"preferred_username"`
+	Nickname          string       `json:"nickname"`
 }
 
 func selectJWK(keys []jwkItem, kid string, expectedKty string) (jwkItem, bool) {

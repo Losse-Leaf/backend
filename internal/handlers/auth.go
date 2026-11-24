@@ -1,106 +1,35 @@
 package handlers
 
 import (
-	"encoding/base64"
 	"errors"
-	"image/color"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/middleware"
 	"loose-leaf/internal/models"
 
 	"github.com/gin-gonic/gin"
-	qrcode "github.com/skip2/go-qrcode"
 	"gorm.io/gorm"
 )
 
-// generateQRCodeDataURL 生成散页纸墨风 base64 PNG Data URL 二维码 (RG-02, BE-20)
-// 前景墨色: 深暖墨黑 #181716 (R:24, G:23, B:22)
-// 背景纸色: 米白暖调棉纸 #F9F8F5 (R:249, G:248, B:245)
-func generateQRCodeDataURL(content string) string {
-	q, err := qrcode.New(content, qrcode.Medium)
-	if err != nil {
-		return ""
-	}
-	q.ForegroundColor = color.RGBA{R: 24, G: 23, B: 22, A: 255}
-	q.BackgroundColor = color.RGBA{R: 249, G: 248, B: 245, A: 255}
-	pngBytes, err := q.PNG(256)
-	if err != nil {
-		return ""
-	}
-	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
-}
-
 // ==========================================
-// 1. 发起设备配对工单 (Init Pairing)
+// 1. OAuth2 / OIDC 原生客户端一次性授权码换取会话 (ExchangeOIDCCode)
 // ==========================================
 
-type InitPairingRequest struct {
-	HubURL string `json:"hub_url"`
-}
-
-// InitPairing 签发 5 分钟有效期的配对工单（智能避开 localhost 回环，优先选用 Tailscale / 局域网 Wi-Fi IP）
-func InitPairing(c *gin.Context) {
-	var req InitPairingRequest
-	_ = c.ShouldBindJSON(&req)
-
-	smartHubURL, candidates := ResolveSmartHubURL(req.HubURL, c)
-
-	expiresIn := 300 // 5 分钟
-	ticket, err := issuePairTicket(db.DB, smartHubURL, time.Duration(expiresIn)*time.Second)
-	if err != nil {
-		Error(c, http.StatusInternalServerError, "生成配对工单失败: "+err.Error())
-		return
-	}
-
-	qrPayload := buildPairDeepLink(smartHubURL, ticket.Ticket)
-	qrDataURL := generateQRCodeDataURL(qrPayload)
-
-	Success(c, gin.H{
-		"ticket":             ticket.Ticket,
-		"hub_url":            smartHubURL,
-		"expires_at":         ticket.ExpiresAt.Format(time.RFC3339),
-		"expires_in_seconds": expiresIn,
-		"qr_payload":         qrPayload,
-		"qr_code_data_url":   qrDataURL,
-		"candidates":         candidates,
-	})
-}
-
-// RenderPairQRCode 动态生成指定中枢节点与工单的纸墨二维码 (GET /api/v1/auth/pair/qr)
-func RenderPairQRCode(c *gin.Context) {
-	hubURL := strings.TrimRight(strings.TrimSpace(c.Query("hub")), "/")
-	ticket := strings.TrimSpace(c.Query("ticket"))
-	if hubURL == "" || ticket == "" {
-		Error(c, http.StatusBadRequest, "缺少必要参数 hub 或 ticket")
-		return
-	}
-
-	payload := buildPairDeepLink(hubURL, ticket)
-	dataURL := generateQRCodeDataURL(payload)
-
-	Success(c, gin.H{
-		"hub_url":          hubURL,
-		"ticket":           ticket,
-		"qr_payload":       payload,
-		"qr_code_data_url": dataURL,
-	})
-}
-
-// ==========================================
-// 2. 确认设备配对握手并激活系统 (Confirm Pairing & Activate BE-19)
-// ==========================================
-
-type ConfirmPairingRequest struct {
-	Ticket      string `json:"ticket"`
+type ExchangeOIDCCodeRequest struct {
+	Code        string `json:"code"`
+	Ticket      string `json:"ticket"` // 兼容旧版客户端字段
 	DeviceName  string `json:"device_name"`
 	Platform    string `json:"platform"`
 	DeviceModel string `json:"device_model"`
 }
+
+// ConfirmPairingRequest 兼容旧版客户端与回归测试类型别名
+type ConfirmPairingRequest = ExchangeOIDCCodeRequest
 
 type ipAttemptTracker struct {
 	sync.Mutex
@@ -150,64 +79,69 @@ func (l *ipAttemptTracker) checkRateLimit(ip string, maxAttempts int, window tim
 	return true
 }
 
-// errPairTicketRedeemed 并发窗口内配对工单已被另一请求抢先核销（双花）
-var errPairTicketRedeemed = errors.New("配对工单已被核销")
+// errPairTicketRedeemed 并发窗口内授权码已被另一请求抢先核销（双花）
+var errPairTicketRedeemed = errors.New("授权码已被核销")
 
-// errLastActiveDevice 最后一台 active 设备不可吊销（防全端锁死）
+// errLastActiveDevice 离线认领模式下最后一台 active 设备不可吊销（防全端锁死）
 var errLastActiveDevice = errors.New("这是最后一台受信任设备，请先配对一台新设备再吊销最后一台")
 
-// ConfirmPairing 新设备通过扫码或配对深链提交 Ticket 完成握手，获取永久 Device Token；
-// 若当前系统尚未初始化 (initialized == false)，在同一事务中将 initialized 置为 true (BE-19)
-func ConfirmPairing(c *gin.Context) {
+// ExchangeOIDCCode 原生客户端（Android / macOS）通过 OAuth2 回调获得的一次性短效授权码换取登录会话。
+// POST /api/v1/auth/oidc/exchange（同时兼容旧路由 POST /api/v1/auth/pair/confirm）
+func ExchangeOIDCCode(c *gin.Context) {
 	if !pairLimiter.checkRateLimit(c.ClientIP(), 30, time.Minute) {
-		Error(c, http.StatusTooManyRequests, "配对请求过于频繁，请稍后再试")
+		Error(c, http.StatusTooManyRequests, "登录请求过于频繁，请稍后再试")
 		return
 	}
 
-	var req ConfirmPairingRequest
+	var req ExchangeOIDCCodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		Error(c, http.StatusBadRequest, "请求参数不合法")
 		return
 	}
 
-	ticketVal := strings.TrimSpace(req.Ticket)
-	if ticketVal == "" {
-		Error(c, http.StatusBadRequest, "必须提供配对工单 ticket 进行握手验证")
+	codeVal := strings.TrimSpace(req.Code)
+	if codeVal == "" {
+		codeVal = strings.TrimSpace(req.Ticket)
+	}
+	if codeVal == "" {
+		Error(c, http.StatusBadRequest, "缺少登录授权码 code")
 		return
 	}
 
-	// 首台设备必须先通过一次性认领码认领；未初始化时配对入口保持关闭。
 	var cfg models.SiteConfig
 	if err := db.DB.Limit(1).Find(&cfg).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "读取系统初始化状态失败")
 		return
 	}
 	if cfg.ID == 0 || !cfg.Initialized {
-		Error(c, http.StatusForbidden, "系统尚未完成首次认领，请先使用启动时打印的认领码认领首台设备")
+		Error(c, http.StatusForbidden, "系统尚未完成初始化，请先通过 Vesper Auth 登录激活")
 		return
 	}
 
 	now := time.Now()
 	var ticket models.PairTicket
 
-	if err := db.DB.Where("ticket = ?", ticketVal).First(&ticket).Error; err != nil {
-		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+	if err := db.DB.Where("ticket = ?", codeVal).First(&ticket).Error; err != nil {
+		Error(c, http.StatusBadRequest, "登录授权码无效、已过期或已被核销，请重新登录")
 		return
 	}
 	if ticket.Used || now.After(ticket.ExpiresAt) {
-		Error(c, http.StatusBadRequest, "配对工单无效、已过期或已被核销，请重新发起配对")
+		Error(c, http.StatusBadRequest, "登录授权码无效、已过期或已被核销，请重新登录")
 		return
 	}
 
-	device, rawDeviceToken := mintTrustedDevice(req.Platform, "", req.DeviceName, req.DeviceModel, now)
+	acct := oidcAccountInfo{
+		Sub:   ticket.AccountSub,
+		Name:  ticket.AccountName,
+		Email: ticket.AccountEmail,
+	}
+	device, rawDeviceToken := mintAccountSession(req.Platform, "", req.DeviceName, req.DeviceModel, acct, now)
 
 	err := db.DB.Transaction(func(tx *gorm.DB) error {
-		// 事务内**条件核销**：UPDATE pair_tickets SET used=1, ... WHERE ticket=? AND used=0。
-		// 原先「事务外读 ticket.Used 再无核销条件地 Save」存在 check-then-act 并发窗口，
-		// 两台设备可各持同一工单同时握手成功（工单双花）。这里以受影响行数做原子裁决：
-		// 抢不到核销权（RowsAffected != 1）的请求整体回滚，不创建设备。
+		// 事务内条件核销：UPDATE pair_tickets SET used=1, ... WHERE ticket=? AND used=0，
+		// 彻底杜绝并发双花。
 		res := tx.Model(&models.PairTicket{}).
-			Where("ticket = ? AND used = ?", ticketVal, false).
+			Where("ticket = ? AND used = ?", codeVal, false).
 			Updates(map[string]any{
 				"used":             true,
 				"used_at":          now,
@@ -228,7 +162,7 @@ func ConfirmPairing(c *gin.Context) {
 			Error(c, http.StatusBadRequest, errPairTicketRedeemed.Error())
 			return
 		}
-		Error(c, http.StatusInternalServerError, "保存配对设备记录失败: "+err.Error())
+		Error(c, http.StatusInternalServerError, "保存登录会话失败: "+err.Error())
 		return
 	}
 
@@ -237,96 +171,44 @@ func ConfirmPairing(c *gin.Context) {
 		hubURL = resolveHubURL(c)
 	}
 
-	// MOB-P1-69：配对成功的浏览器直接拿到 HttpOnly 会话 Cookie，
-	// 令牌不必再由前端写入 localStorage（JS 读不到 ⇒ 一次 XSS 也偷不走）。
-	// 原生端（Android / macOS）用请求头带令牌，Cookie 对它们无影响。
 	middleware.SetSessionCookie(c, rawDeviceToken)
 
 	c.JSON(http.StatusOK, Response{
 		Code:    http.StatusOK,
-		Message: "device paired successfully",
+		Message: "login session established",
 		Data: gin.H{
+			"access_token": rawDeviceToken,
+			"device_token": rawDeviceToken, // 兼容旧版客户端字段名
+			"session_id":   device.DeviceID,
 			"device_id":    device.DeviceID,
 			"device_name":  device.Name,
 			"platform":     device.Platform,
 			"paired_at":    device.PairedAt.Format(time.RFC3339),
-			"device_token": rawDeviceToken,
 			"initialized":  true,
 			"hub_url":      hubURL,
+			"account": gin.H{
+				"sub":   device.AccountSub,
+				"name":  device.AccountName,
+				"email": device.AccountEmail,
+			},
 		},
 	})
 }
 
-// ==========================================
-// 3. 轮询配对工单与装帧激活状态 (Poll Pairing Status BE-19)
-// ==========================================
-
-// PollPairingStatus 公开轮询配对工单核销状态与系统初始化状态
-// GET /api/v1/auth/pair/status?ticket=pair_tk_...
-func PollPairingStatus(c *gin.Context) {
-	ticketVal := strings.TrimSpace(c.Query("ticket"))
-	if ticketVal == "" {
-		Error(c, http.StatusBadRequest, "缺少 ticket 参数")
-		return
-	}
-
-	var cfg models.SiteConfig
-	db.DB.Limit(1).Find(&cfg)
-
-	var ticket models.PairTicket
-	if err := db.DB.Where("ticket = ?", ticketVal).Limit(1).Find(&ticket).Error; err != nil || ticket.ID == 0 {
-		Success(c, gin.H{
-			"status":      "expired",
-			"initialized": cfg.Initialized,
-		})
-		return
-	}
-
-	if ticket.Used {
-		var devInfo any
-		if ticket.PairedDeviceID != "" {
-			var pairedDev models.Device
-			if err := db.DB.Where("device_id = ?", ticket.PairedDeviceID).Limit(1).Find(&pairedDev).Error; err == nil && pairedDev.ID > 0 {
-				devInfo = gin.H{
-					"device_id": pairedDev.DeviceID,
-					"name":      pairedDev.Name,
-					"platform":  pairedDev.Platform,
-					"paired_at": pairedDev.PairedAt.Format(time.RFC3339),
-				}
-			}
-		}
-
-		Success(c, gin.H{
-			"status":      "paired",
-			"initialized": cfg.Initialized,
-			"device":      devInfo,
-		})
-		return
-	}
-
-	if time.Now().After(ticket.ExpiresAt) {
-		Success(c, gin.H{
-			"status":      "expired",
-			"initialized": cfg.Initialized,
-		})
-		return
-	}
-
-	Success(c, gin.H{
-		"status":      "pending",
-		"initialized": cfg.Initialized,
-	})
+// ConfirmPairing 兼容旧路由别名（滚动升级期间平滑过渡）
+func ConfirmPairing(c *gin.Context) {
+	ExchangeOIDCCode(c)
 }
 
 // ==========================================
-// 4. 设备列表与吊销管理
+// 2. 登录会话管理（兼容受保护接口）
 // ==========================================
 
-// GetTrustedDevices 获取已配对信任的设备列表（仅返回当前有效授信的设备）
+// GetTrustedDevices 获取当前有效的登录会话列表
 func GetTrustedDevices(c *gin.Context) {
 	var devices []models.Device
 	if err := db.DB.Where("status = ?", "active").Order("last_active_at DESC, id DESC").Find(&devices).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "获取设备列表失败: "+err.Error())
+		Error(c, http.StatusInternalServerError, "获取会话列表失败: "+err.Error())
 		return
 	}
 	currentDeviceID := c.GetString("device_id")
@@ -336,57 +218,53 @@ func GetTrustedDevices(c *gin.Context) {
 	Success(c, devices)
 }
 
-// RevokeDevice 吊销并注销指定设备
+// RevokeDevice 吊销指定会话
 func RevokeDevice(c *gin.Context) {
 	id := c.Param("id")
 	var device models.Device
 
-	// 支持通过数字主键 ID 或通过 device_id 字符查找
 	query := db.DB.Where("id = ? OR device_id = ?", id, id)
 	if err := query.First(&device).Error; err != nil {
-		Error(c, http.StatusNotFound, "未找到该设备或已被删除")
+		Error(c, http.StatusNotFound, "未找到该登录会话或已被注销")
 		return
 	}
 
-	// 关键：吊销的是最后一台 active 设备时必须拒绝 —— 否则系统里再无任何有效凭据，
-	// 主人将被**永久锁死**在门外（启动打印的一次性认领码早已消费、入口永久关闭）。
-	// 吊销非最后一台（包括当前请求所用的设备）仍允许：换机后主动吊销旧机是正常操作。
-	// 锁死后的自救通道：可由服务器 shell 以 `--reopen-claim` 启动标志重开认领入口
-	//（见 main.go：业务数据全部保留并重印一次性认领码）；除此之外**不提供任何网络旁路**。
-	//
-	// 关键（并发，第三轮 P1）：拒绝裁决必须在**同一写事务**内完成「计数 + 改写」——
-	// 原先在事务外先 Count 再 Save 是 check-then-act：仅剩两台 active 时，
-	// 两台并发吊销都能通过「count > 1」检查后各自写入 revoked，把 active 设备清空。
-	// SQLite 单写者保证下面这条条件 UPDATE 的子查询计数与改写原子；
-	// 目标已是 revoked 时跳过（幂等放行，重复吊销不报错）。
 	if device.Status == "active" {
-		err := db.DB.Transaction(func(tx *gorm.DB) error {
-			res := tx.Model(&models.Device{}).
-				Where("id = ? AND status = ? AND (SELECT COUNT(*) FROM devices AS d WHERE d.status = 'active') > 1", device.ID, "active").
-				Update("status", "revoked")
-			if res.Error != nil {
-				return res.Error
-			}
-			if res.RowsAffected == 1 {
-				return nil
-			}
-			// 没抢到改写权：要么只剩这一台（拒绝），要么刚好被并发请求吊销（幂等成功）
-			var cur models.Device
-			if err := tx.Where("id = ?", device.ID).First(&cur).Error; err != nil {
-				return err
-			}
-			if cur.Status != "active" {
-				return nil
-			}
-			return errLastActiveDevice
-		})
-		if err != nil {
-			if errors.Is(err, errLastActiveDevice) {
-				Error(c, http.StatusBadRequest, errLastActiveDevice.Error())
+		if config.AppConfig.OIDC.Enabled {
+			// OAuth2/OIDC 模式下用户随时可以通过 Vesper Auth 重新登录，不存在永久锁死风险
+			if err := db.DB.Model(&models.Device{}).Where("id = ?", device.ID).Update("status", "revoked").Error; err != nil {
+				Error(c, http.StatusInternalServerError, "注销会话失败: "+err.Error())
 				return
 			}
-			Error(c, http.StatusInternalServerError, "吊销设备失败: "+err.Error())
-			return
+		} else {
+			// 离线认领模式下保护最后一台 active 设备不被清空，防止永久锁死
+			err := db.DB.Transaction(func(tx *gorm.DB) error {
+				res := tx.Model(&models.Device{}).
+					Where("id = ? AND status = ? AND (SELECT COUNT(*) FROM devices AS d WHERE d.status = 'active') > 1", device.ID, "active").
+					Update("status", "revoked")
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected == 1 {
+					return nil
+				}
+				var cur models.Device
+				if err := tx.Where("id = ?", device.ID).First(&cur).Error; err != nil {
+					return err
+				}
+				if cur.Status != "active" {
+					return nil
+				}
+				return errLastActiveDevice
+			})
+			if err != nil {
+				if errors.Is(err, errLastActiveDevice) {
+					Error(c, http.StatusBadRequest, errLastActiveDevice.Error())
+					return
+				}
+				Error(c, http.StatusInternalServerError, "注销会话失败: "+err.Error())
+				return
+			}
 		}
 	}
 
@@ -394,11 +272,11 @@ func RevokeDevice(c *gin.Context) {
 		"id":        device.ID,
 		"device_id": device.DeviceID,
 		"status":    "revoked",
-		"message":   "设备已成功吊销，该设备的凭证已立即失效",
+		"message":   "会话已成功注销，该凭证已立即失效",
 	})
 }
 
-// UpdateDeviceName 修改已授信设备的备注名称及设备平台 (PUT /api/v1/auth/devices/:id)
+// UpdateDeviceName 修改登录会话备注名称及平台属性 (PUT /api/v1/auth/devices/:id)
 func UpdateDeviceName(c *gin.Context) {
 	id := c.Param("id")
 	var req struct {
@@ -422,7 +300,7 @@ func UpdateDeviceName(c *gin.Context) {
 
 	var device models.Device
 	if err := db.DB.Where("(id = ? OR device_id = ?) AND status = ?", id, id, "active").First(&device).Error; err != nil {
-		Error(c, http.StatusNotFound, "未找到该活动设备")
+		Error(c, http.StatusNotFound, "未找到该活动会话")
 		return
 	}
 
@@ -437,7 +315,7 @@ func UpdateDeviceName(c *gin.Context) {
 	}
 
 	if err := db.DB.Save(&device).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "更新设备信息失败: "+err.Error())
+		Error(c, http.StatusInternalServerError, "更新会话信息失败: "+err.Error())
 		return
 	}
 
@@ -445,35 +323,63 @@ func UpdateDeviceName(c *gin.Context) {
 }
 
 // ==========================================
-// 4. 会话探针与登出 (MOB-P1-69)
+// 3. 会话探针与账号登出
 // ==========================================
 
-// GetSessionStatus 探测当前请求是否具备主理人权限
-//
+// GetSessionStatus 探测当前请求是否具备已登录主理人身份，并附带当前账号摘要信息。
 // GET /api/v1/auth/session
-//
-// 浏览器端把令牌放进 HttpOnly Cookie 后，JS 读不到令牌本身，
-// 但仍需要知道「当前是不是主人」来决定是否渲染私密 UI。
-// 这个公开探针只回传角色，不回传任何凭据。
 func GetSessionStatus(c *gin.Context) {
 	isAdmin := middleware.IsAdmin(c)
 	role := "guest"
 	if isAdmin {
 		role = "admin"
 	}
-	Success(c, gin.H{
+
+	data := gin.H{
 		"is_admin": isAdmin,
 		"role":     role,
-	})
+	}
+
+	if isAdmin && db.DB != nil {
+		token := middleware.ExtractToken(c)
+		if token != "" {
+			var device models.Device
+			tHash := middleware.HashToken(token)
+			if err := db.DB.Where("token_hash = ? AND status = 'active'", tHash).Limit(1).Find(&device).Error; err == nil && device.ID > 0 {
+				data["session_id"] = device.DeviceID
+				data["device_id"] = device.DeviceID
+				data["platform"] = device.Platform
+				data["account"] = gin.H{
+					"sub":   device.AccountSub,
+					"name":  device.AccountName,
+					"email": device.AccountEmail,
+				}
+			}
+		}
+	}
+
+	Success(c, data)
 }
 
-// LogoutSession 登出：清除会话 Cookie
-//
+// LogoutSession 退出账号登录：清除浏览器 Cookie 并吊销当前会话令牌（同时支持 Cookie 与 Bearer Token）。
 // POST /api/v1/auth/logout
-//
-// 只清浏览器侧的 Cookie，不吊销设备记录 ——
-// 设备吊销是「主人显式操作」，那是另一条既有接口（DELETE /auth/devices/:id）。
 func LogoutSession(c *gin.Context) {
+	token := middleware.ExtractToken(c)
 	middleware.ClearSessionCookie(c)
+
+	if token != "" && db.DB != nil {
+		tHash := middleware.HashToken(token)
+		if config.AppConfig.OIDC.Enabled {
+			_ = db.DB.Model(&models.Device{}).
+				Where("token_hash = ? AND status = ?", tHash, "active").
+				Update("status", "revoked").Error
+		} else {
+			// 离线模式下避免单会话退出导致锁死，仅当存在其他活跃会话时同步吊销数据库记录
+			_ = db.DB.Model(&models.Device{}).
+				Where("token_hash = ? AND status = ? AND (SELECT COUNT(*) FROM devices AS d WHERE d.status = 'active') > 1", tHash, "active").
+				Update("status", "revoked").Error
+		}
+	}
+
 	Success(c, gin.H{"logged_out": true})
 }

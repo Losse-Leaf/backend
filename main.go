@@ -146,13 +146,10 @@ func main() {
 		// Vesper Auth OAuth 2.0 / OIDC + PKCE 统一单点登录与跨端回调
 		v1.GET("/auth/oidc/login", handlers.OIDCLogin)
 		v1.GET("/auth/oidc/callback", handlers.OIDCCallback)
-
-		// 设备配对握手/轮询 (公开接口；需系统已完成首次认领)
+		v1.POST("/auth/oidc/exchange", handlers.ExchangeOIDCCode)
+		// 兼容旧版客户端的回调换令牌路由（滚动升级期间平滑过渡）
 		v1.POST("/auth/pair/confirm", handlers.ConfirmPairing)
-		v1.GET("/auth/pair/status", handlers.PollPairingStatus)
-		v1.GET("/auth/pair/qr", handlers.RenderPairQRCode)
-		// 会话探针与登出 (MOB-P1-69)：浏览器端用 HttpOnly Cookie 承载令牌后，
-		// 需要一个不回传凭据的接口来判断「当前是不是主人」
+		// 会话探针与账号登出
 		v1.GET("/auth/session", handlers.GetSessionStatus)
 		v1.POST("/auth/logout", handlers.LogoutSession)
 
@@ -229,8 +226,7 @@ func main() {
 			write.PUT("/config", handlers.UpdateConfig)
 			write.PUT("/profile", handlers.UpdateCuratorProfile)
 
-			// Device Pairing & Management (受信任设备管理)
-			write.POST("/auth/pair/init", handlers.InitPairing)
+			// 登录会话管理
 			write.GET("/auth/devices", handlers.GetTrustedDevices)
 			write.PUT("/auth/devices/:id", handlers.UpdateDeviceName)
 			write.DELETE("/auth/devices/:id", handlers.RevokeDevice)

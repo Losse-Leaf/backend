@@ -194,29 +194,35 @@ type CuratorProfile struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Device 受信任设备表 (用于 macOS 桌面端、移动端免密配对组)
+// Device 登录会话与客户端凭证表 (Web Cookie / macOS / Android Bearer 会话)
 type Device struct {
 	ID           uint      `gorm:"primaryKey" json:"id"`
 	DeviceID     string    `gorm:"uniqueIndex;size:64;not null" json:"device_id"` // e.g. "dev_ios_48b19a27"
 	Name         string    `json:"name"`                                          // e.g. "iPhone 16 Pro"
 	Platform     string    `gorm:"index;size:32" json:"platform"`                 // ios, macos, android, web
 	DeviceModel  string    `json:"device_model,omitempty"`                        // e.g. "iPhone17,1"
+	AccountSub   string    `gorm:"index;size:128" json:"account_sub,omitempty"`   // OIDC Subject 标识
+	AccountName  string    `gorm:"size:128" json:"account_name,omitempty"`        // OIDC 账号显示名
+	AccountEmail string    `gorm:"size:255" json:"account_email,omitempty"`       // OIDC 账号邮箱
 	TokenHash    string    `gorm:"uniqueIndex;size:64;not null" json:"-"`         // SHA-256 哈希，绝不存明文
 	Status       string    `gorm:"index;default:active;size:32" json:"status"`    // active, revoked
-	IsCurrent    bool      `gorm:"-" json:"is_current"`                           // 当前请求所属设备 (Phase 2)
+	IsCurrent    bool      `gorm:"-" json:"is_current"`                           // 当前请求所属会话
 	PairedAt     time.Time `json:"paired_at"`
 	LastActiveAt time.Time `gorm:"index" json:"last_active_at"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// PairTicket 临时设备配对工单 (5分钟有效，单次核销 BE-19；仅保留二维码与配对链接 ticket 方式)
+// PairTicket 原生客户端 OAuth2/OIDC 一次性短效授权兑换码表（90 秒有效，单次原子核销）
 type PairTicket struct {
 	ID             uint       `gorm:"primaryKey" json:"id"`
-	Ticket         string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "pair_tk_9f82d1c6e4b8"
+	Ticket         string     `gorm:"uniqueIndex;size:64;not null" json:"ticket"` // e.g. "auth_code_9f82d1c6e4b8"
 	PinCode        string     `gorm:"size:16;default:''" json:"-"`                // 兼容已有 SQLite 数据库中可能残留的 NOT NULL 约束，不对外暴露
 	HubURL         string     `gorm:"size:255" json:"hub_url,omitempty"`
-	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该工单的设备标识
+	AccountSub     string     `gorm:"size:128" json:"account_sub,omitempty"`
+	AccountName    string     `gorm:"size:128" json:"account_name,omitempty"`
+	AccountEmail   string     `gorm:"size:255" json:"account_email,omitempty"`
+	PairedDeviceID string     `gorm:"size:64" json:"paired_device_id,omitempty"` // 核销该授权码的会话标识
 	ExpiresAt      time.Time  `gorm:"index;not null" json:"expires_at"`
 	Used           bool       `gorm:"index;default:false" json:"used"`
 	UsedAt         *time.Time `json:"used_at,omitempty"`

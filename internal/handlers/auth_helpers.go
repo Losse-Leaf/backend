@@ -49,8 +49,30 @@ func resolveHubURL(c *gin.Context) string {
 	return fmt.Sprintf("%s://%s", scheme, host)
 }
 
-// mintTrustedDevice 统一签发受信任设备实体与一次性明文设备子钥匙。
+// oidcAccountInfo OIDC 账号基础身份快照（写入会话记录并回传给客户端展示）
+type oidcAccountInfo struct {
+	Sub   string `json:"sub,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+}
+
+func (a oidcAccountInfo) DisplayLabel() string {
+	if s := strings.TrimSpace(a.Name); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(a.Email); s != "" {
+		return s
+	}
+	return strings.TrimSpace(a.Sub)
+}
+
+// mintTrustedDevice 统一签发会话实体与一次性明文访问令牌。
 func mintTrustedDevice(platform, defaultName, rawName, rawModel string, now time.Time) (models.Device, string) {
+	return mintAccountSession(platform, defaultName, rawName, rawModel, oidcAccountInfo{}, now)
+}
+
+// mintAccountSession 签发携带 OAuth2/OIDC 账号信息的客户端登录会话与访问令牌。
+func mintAccountSession(platform, defaultName, rawName, rawModel string, acct oidcAccountInfo, now time.Time) (models.Device, string) {
 	platform = strings.ToLower(strings.TrimSpace(platform))
 	if platform == "" {
 		platform = "device"
@@ -63,7 +85,16 @@ func mintTrustedDevice(platform, defaultName, rawName, rawModel string, now time
 		deviceName = defaultName
 	}
 	if deviceName == "" {
-		deviceName = fmt.Sprintf("受信任的 %s 设备", strings.ToUpper(platform))
+		switch platform {
+		case "android":
+			deviceName = "Android 客户端"
+		case "macos":
+			deviceName = "macOS 桌面端"
+		case "web":
+			deviceName = "Web 浏览器"
+		default:
+			deviceName = fmt.Sprintf("%s 客户端", strings.ToUpper(platform))
+		}
 	}
 
 	rawDeviceToken := fmt.Sprintf("lldt_%s", generateRandomHex(16))
@@ -72,6 +103,9 @@ func mintTrustedDevice(platform, defaultName, rawName, rawModel string, now time
 		Name:         deviceName,
 		Platform:     platform,
 		DeviceModel:  strings.TrimSpace(rawModel),
+		AccountSub:   strings.TrimSpace(acct.Sub),
+		AccountName:  strings.TrimSpace(acct.Name),
+		AccountEmail: strings.TrimSpace(acct.Email),
 		TokenHash:    middleware.HashToken(rawDeviceToken),
 		Status:       "active",
 		PairedAt:     now,
@@ -80,27 +114,30 @@ func mintTrustedDevice(platform, defaultName, rawName, rawModel string, now time
 	return device, rawDeviceToken
 }
 
-// issuePairTicket 在指定连接或事务内签发一枚指定 TTL 的一次性配对工单。
-func issuePairTicket(tx *gorm.DB, hubURL string, ttl time.Duration) (models.PairTicket, error) {
+// issueAuthExchangeCode 在指定连接或事务内签发一枚指定 TTL 的原生客户端一次性 OAuth2 回调兑换码。
+func issueAuthExchangeCode(tx *gorm.DB, hubURL string, ttl time.Duration, acct oidcAccountInfo) (models.PairTicket, error) {
 	if tx == nil {
 		tx = db.DB
 	}
-	pairTicket := models.PairTicket{
-		Ticket:    fmt.Sprintf("pair_tk_%s", generateRandomHex(12)),
-		HubURL:    hubURL,
-		ExpiresAt: time.Now().Add(ttl),
-		Used:      false,
+	codeRec := models.PairTicket{
+		Ticket:       fmt.Sprintf("auth_code_%s", generateRandomHex(16)),
+		HubURL:       hubURL,
+		AccountSub:   strings.TrimSpace(acct.Sub),
+		AccountName:  strings.TrimSpace(acct.Name),
+		AccountEmail: strings.TrimSpace(acct.Email),
+		ExpiresAt:    time.Now().Add(ttl),
+		Used:         false,
 	}
-	if err := tx.Create(&pairTicket).Error; err != nil {
-		return pairTicket, err
+	if err := tx.Create(&codeRec).Error; err != nil {
+		return codeRec, err
 	}
-	return pairTicket, nil
+	return codeRec, nil
 }
 
-// buildPairDeepLink 使用标准 URL 查询编码构建跨端配对深链。
-func buildPairDeepLink(hubURL, ticket string) string {
+// buildAuthCallbackDeepLink 构建标准 OAuth2 原生客户端回跳深链 (looseleaf://auth/callback?hub=...&code=...)。
+func buildAuthCallbackDeepLink(hubURL, code string) string {
 	q := url.Values{}
 	q.Set("hub", hubURL)
-	q.Set("ticket", ticket)
-	return "looseleaf://pair?" + q.Encode()
+	q.Set("code", code)
+	return "looseleaf://auth/callback?" + q.Encode()
 }

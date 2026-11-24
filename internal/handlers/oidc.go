@@ -230,30 +230,43 @@ func OIDCCallback(c *gin.Context) {
 		return
 	}
 
+	accountName := strings.TrimSpace(claims.Name)
+	if accountName == "" {
+		accountName = strings.TrimSpace(claims.PreferredUsername)
+	}
+	if accountName == "" {
+		accountName = strings.TrimSpace(claims.Nickname)
+	}
+	acct := oidcAccountInfo{
+		Sub:   strings.TrimSpace(claims.Sub),
+		Name:  accountName,
+		Email: strings.TrimSpace(claims.Email),
+	}
+
 	if entry.Platform == "macos" || entry.Platform == "android" {
 		hubURL := resolveHubURL(c)
-		var pairTicket models.PairTicket
+		var authCode models.PairTicket
 
 		txErr := db.DB.Transaction(func(tx *gorm.DB) error {
 			if err := ensureSiteInitializedInTx(tx, now); err != nil {
 				return err
 			}
 			var issueErr error
-			pairTicket, issueErr = issuePairTicket(tx, hubURL, oidcPairTicketTTL)
+			authCode, issueErr = issueAuthExchangeCode(tx, hubURL, oidcPairTicketTTL, acct)
 			return issueErr
 		})
 		if txErr != nil {
-			Error(c, http.StatusInternalServerError, "签发客户端一次性授权工单失败: "+txErr.Error())
+			Error(c, http.StatusInternalServerError, "签发客户端登录授权码失败: "+txErr.Error())
 			return
 		}
 
-		deepLink := buildPairDeepLink(hubURL, pairTicket.Ticket)
-		renderOIDCNativeBridgePage(c, entry.Platform, hubURL, deepLink)
+		deepLink := buildAuthCallbackDeepLink(hubURL, authCode.Ticket)
+		renderOIDCNativeBridgePage(c, entry.Platform, hubURL, deepLink, acct.DisplayLabel())
 		return
 	}
 
-	// Web 展厅端：事务内确保站点已初始化并签发受信任 Web 设备记录，种入 30 天 HttpOnly Cookie
-	device, rawDeviceToken := mintTrustedDevice("web", "Web 展厅 · Vesper Auth", entry.DeviceName, entry.DeviceModel, now)
+	// Web 展厅端：事务内确保站点已初始化并签发账号登录会话，种入 30 天 HttpOnly Cookie
+	device, rawDeviceToken := mintAccountSession("web", "Web 浏览器 · Vesper Auth", entry.DeviceName, entry.DeviceModel, acct, now)
 
 	txErr := db.DB.Transaction(func(tx *gorm.DB) error {
 		if err := ensureSiteInitializedInTx(tx, now); err != nil {
@@ -262,7 +275,7 @@ func OIDCCallback(c *gin.Context) {
 		return tx.Create(&device).Error
 	})
 	if txErr != nil {
-		Error(c, http.StatusInternalServerError, "签发主理人会话设备凭证失败: "+txErr.Error())
+		Error(c, http.StatusInternalServerError, "签发主理人登录会话失败: "+txErr.Error())
 		return
 	}
 
@@ -302,13 +315,13 @@ func ensureSiteInitializedInTx(tx *gorm.DB, now time.Time) error {
 type oidcBridgeTemplateData struct {
 	CSPNonce       string
 	PlatformLabel  string
+	AccountLabel   string
 	HubURL         string
 	DeepLinkURL    template.URL
-	DeepLinkText   string
 	ExpiresSeconds int
 }
 
-func renderOIDCNativeBridgePage(c *gin.Context, platform string, hubURL string, deepLink string) {
+func renderOIDCNativeBridgePage(c *gin.Context, platform string, hubURL string, deepLink string, accountLabel string) {
 	nonceBytes := make([]byte, 16)
 	_, _ = rand.Read(nonceBytes)
 	cspNonce := base64.StdEncoding.EncodeToString(nonceBytes)
@@ -341,13 +354,13 @@ func renderOIDCNativeBridgePage(c *gin.Context, platform string, hubURL string, 
 	err := oidcNativeBridgeTmpl.Execute(&buf, oidcBridgeTemplateData{
 		CSPNonce:       cspNonce,
 		PlatformLabel:  platformLabel,
+		AccountLabel:   strings.TrimSpace(accountLabel),
 		HubURL:         hubURL,
 		DeepLinkURL:    template.URL(deepLink),
-		DeepLinkText:   deepLink,
 		ExpiresSeconds: int(oidcPairTicketTTL.Seconds()),
 	})
 	if err != nil {
-		Error(c, http.StatusInternalServerError, "渲染授权回跳页失败")
+		Error(c, http.StatusInternalServerError, "渲染登录回跳页失败")
 		return
 	}
 

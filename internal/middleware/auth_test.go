@@ -38,17 +38,23 @@ func TestAdminAuthRequired(t *testing.T) {
 		r.POST("/api/v1/entries", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
-		r.POST("/api/v1/auth/pair/init", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"status": "bootstrap_pair_ok"})
+		r.GET("/api/v1/auth/devices", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "devices_ok"})
 		})
 
-		// 未初始化时不存在任何免密旁路：常规写接口与配对接口都必须 401。
-		for _, path := range []string{"/api/v1/entries", "/api/v1/auth/pair/init"} {
-			req := httptest.NewRequest(http.MethodPost, path, nil)
+		// 未初始化时不存在任何免密旁路：常规写接口与受保护会话接口都必须 401。
+		for _, tc := range []struct {
+			method string
+			path   string
+		}{
+			{http.MethodPost, "/api/v1/entries"},
+			{http.MethodGet, "/api/v1/auth/devices"},
+		} {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 			if w.Code != http.StatusUnauthorized {
-				t.Errorf("expected 401 on %s when uninitialized, got %d", path, w.Code)
+				t.Errorf("expected 401 on %s when uninitialized, got %d", tc.path, w.Code)
 			}
 		}
 	})
@@ -61,11 +67,11 @@ func TestAdminAuthRequired(t *testing.T) {
 
 		r := gin.New()
 		r.Use(AdminAuthRequired())
-		r.POST("/api/v1/auth/pair/init", func(c *gin.Context) {
+		r.GET("/api/v1/auth/devices", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		})
 
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 

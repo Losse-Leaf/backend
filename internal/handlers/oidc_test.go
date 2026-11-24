@@ -284,8 +284,10 @@ func setupOIDCTestRouter(t *testing.T, idp *mockOIDCIdP, allowedSubs []string) *
 		v1.POST("/auth/claim", ClaimDevice)
 		v1.GET("/auth/oidc/login", OIDCLogin)
 		v1.GET("/auth/oidc/callback", OIDCCallback)
+		v1.POST("/auth/oidc/exchange", ExchangeOIDCCode)
 		v1.POST("/auth/pair/confirm", ConfirmPairing)
 		v1.GET("/auth/session", GetSessionStatus)
+		v1.POST("/auth/logout", LogoutSession)
 
 		write := v1.Group("")
 		write.Use(middleware.AdminAuthRequired())
@@ -434,7 +436,7 @@ func TestOIDCNativeMacOSAndAndroidPairTicketFlow(t *testing.T) {
 	// 即使在全新未初始化库上直接从 macOS / Android 发起一键接入，也应自动完成激活与工单兑换
 	db.DB.Create(&models.SiteConfig{Initialized: false, SiteName: "散页"})
 
-	deepLinkRe := regexp.MustCompile(`looseleaf://pair\?[^"'<\s]+`)
+	deepLinkRe := regexp.MustCompile(`looseleaf://auth/callback\?[^"'<\s]+`)
 
 	for _, tc := range []struct {
 		platform    string
@@ -475,13 +477,13 @@ func TestOIDCNativeMacOSAndAndroidPairTicketFlow(t *testing.T) {
 			if strings.Contains(htmlBody, "#ZgotmplZ") {
 				t.Fatalf("bridge HTML must not contain sanitized template error #ZgotmplZ: %s", htmlBody)
 			}
-			if !strings.Contains(htmlBody, "打开《散页》完成授权") || !strings.Contains(htmlBody, "复制一次性授权深链") {
-				t.Fatalf("bridge HTML missing expected editorial fallback buttons")
+			if !strings.Contains(htmlBody, "打开《散页》完成登录") {
+				t.Fatalf("bridge HTML missing expected OAuth2 open-app button")
 			}
 
 			rawDeepLink := deepLinkRe.FindString(htmlBody)
 			if rawDeepLink == "" {
-				t.Fatalf("failed to find looseleaf://pair deep link in HTML: %s", htmlBody)
+				t.Fatalf("failed to find looseleaf://auth/callback deep link in HTML: %s", htmlBody)
 			}
 			// HTML 属性中的 &amp; 还原为 &
 			rawDeepLink = strings.ReplaceAll(rawDeepLink, "&amp;", "&")
@@ -490,65 +492,77 @@ func TestOIDCNativeMacOSAndAndroidPairTicketFlow(t *testing.T) {
 				t.Fatalf("parse deep link %q: %v", rawDeepLink, err)
 			}
 			hubParam := dlURL.Query().Get("hub")
-			ticketParam := dlURL.Query().Get("ticket")
-			if hubParam != "https://leaf.starryheavens.uk" || !strings.HasPrefix(ticketParam, "pair_tk_") {
-				t.Fatalf("unexpected deep link params: hub=%q ticket=%q", hubParam, ticketParam)
+			codeParam := dlURL.Query().Get("code")
+			if hubParam != "https://leaf.starryheavens.uk" || !strings.HasPrefix(codeParam, "auth_code_") {
+				t.Fatalf("unexpected deep link params: hub=%q code=%q", hubParam, codeParam)
 			}
 
-			// 校验工单有效期为 90 秒
+			// 校验授权码有效期为 90 秒且携带 OIDC 账号信息
 			var ticketRec models.PairTicket
-			if err := db.DB.Where("ticket = ?", ticketParam).First(&ticketRec).Error; err != nil {
-				t.Fatalf("pair ticket not persisted: %v", err)
+			if err := db.DB.Where("ticket = ?", codeParam).First(&ticketRec).Error; err != nil {
+				t.Fatalf("auth exchange code not persisted: %v", err)
+			}
+			if ticketRec.AccountSub != "usr_curator_001" || ticketRec.AccountEmail != "curator@starryheavens.uk" {
+				t.Fatalf("expected account identity persisted on code, got %+v", ticketRec)
 			}
 			ttl := time.Until(ticketRec.ExpiresAt)
 			if ttl <= 0 || ttl > 95*time.Second {
-				t.Fatalf("expected ~90s TTL for OIDC pair ticket, got %v", ttl)
+				t.Fatalf("expected ~90s TTL for OIDC exchange code, got %v", ttl)
 			}
 
-			// 模拟原生客户端捕获深链后调用 POST /api/v1/auth/pair/confirm 换取独立 Bearer Token
-			confirmBody, _ := json.Marshal(ConfirmPairingRequest{
-				Ticket:      ticketParam,
+			// 模拟原生客户端捕获深链后调用 POST /api/v1/auth/oidc/exchange 换取独立 Bearer Token
+			exchangeBody, _ := json.Marshal(ExchangeOIDCCodeRequest{
+				Code:        codeParam,
 				DeviceName:  tc.deviceName,
 				Platform:    tc.platform,
 				DeviceModel: tc.deviceModel,
 			})
-			confirmReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(confirmBody))
-			confirmReq.Header.Set("Content-Type", "application/json")
-			confirmW := httptest.NewRecorder()
-			r.ServeHTTP(confirmW, confirmReq)
-			if confirmW.Code != http.StatusOK {
-				t.Fatalf("expected 200 confirming pair ticket, got %d: %s", confirmW.Code, confirmW.Body.String())
+			exchangeReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/oidc/exchange", bytes.NewReader(exchangeBody))
+			exchangeReq.Header.Set("Content-Type", "application/json")
+			exchangeW := httptest.NewRecorder()
+			r.ServeHTTP(exchangeW, exchangeReq)
+			if exchangeW.Code != http.StatusOK {
+				t.Fatalf("expected 200 exchanging OAuth2 code, got %d: %s", exchangeW.Code, exchangeW.Body.String())
 			}
 
 			var confirmRes struct {
 				Data struct {
+					SessionID   string `json:"session_id"`
 					DeviceID    string `json:"device_id"`
+					AccessToken string `json:"access_token"`
 					DeviceToken string `json:"device_token"`
 					Platform    string `json:"platform"`
 					HubURL      string `json:"hub_url"`
+					Account     struct {
+						Sub   string `json:"sub"`
+						Email string `json:"email"`
+					} `json:"account"`
 				} `json:"data"`
 			}
-			_ = json.Unmarshal(confirmW.Body.Bytes(), &confirmRes)
-			if !strings.HasPrefix(confirmRes.Data.DeviceToken, "lldt_") || confirmRes.Data.Platform != tc.platform {
-				t.Fatalf("unexpected confirm response: %+v", confirmRes.Data)
+			_ = json.Unmarshal(exchangeW.Body.Bytes(), &confirmRes)
+			if !strings.HasPrefix(confirmRes.Data.AccessToken, "lldt_") ||
+				confirmRes.Data.AccessToken != confirmRes.Data.DeviceToken ||
+				confirmRes.Data.Platform != tc.platform ||
+				confirmRes.Data.Account.Email != "curator@starryheavens.uk" {
+				t.Fatalf("unexpected exchange response: %+v", confirmRes.Data)
 			}
 
 			// 使用签发的 Bearer Token 访问受保护接口
 			devReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
-			devReq.Header.Set("Authorization", "Bearer "+confirmRes.Data.DeviceToken)
+			devReq.Header.Set("Authorization", "Bearer "+confirmRes.Data.AccessToken)
 			devW := httptest.NewRecorder()
 			r.ServeHTTP(devW, devReq)
 			if devW.Code != http.StatusOK {
 				t.Fatalf("expected 200 with issued Bearer token, got %d: %s", devW.Code, devW.Body.String())
 			}
 
-			// 二次重放同一工单必须被拒绝
-			replayReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(confirmBody))
+			// 二次重放同一授权码必须被拒绝
+			replayReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/oidc/exchange", bytes.NewReader(exchangeBody))
 			replayReq.Header.Set("Content-Type", "application/json")
 			replayW := httptest.NewRecorder()
 			r.ServeHTTP(replayW, replayReq)
 			if replayW.Code != http.StatusBadRequest {
-				t.Fatalf("expected 400 on ticket replay, got %d", replayW.Code)
+				t.Fatalf("expected 400 on code replay, got %d", replayW.Code)
 			}
 		})
 	}

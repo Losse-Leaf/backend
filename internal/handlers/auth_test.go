@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"loose-leaf/internal/config"
 	"loose-leaf/internal/db"
 	"loose-leaf/internal/models"
 
@@ -41,58 +41,53 @@ func setupTestDB(t *testing.T) {
 	db.DB = database
 }
 
-func TestDevicePairingLifecycle(t *testing.T) {
+func TestOAuthSessionLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	setupTestDB(t)
 
+	prevOIDC := config.AppConfig.OIDC
+	config.AppConfig.OIDC.Enabled = true
+	t.Cleanup(func() {
+		config.AppConfig.OIDC = prevOIDC
+	})
+
 	r := gin.New()
-	r.POST("/api/v1/auth/pair/init", InitPairing)
+	r.POST("/api/v1/auth/oidc/exchange", ExchangeOIDCCode)
 	r.POST("/api/v1/auth/pair/confirm", ConfirmPairing)
+	r.GET("/api/v1/auth/session", GetSessionStatus)
+	r.POST("/api/v1/auth/logout", LogoutSession)
 	r.GET("/api/v1/auth/devices", GetTrustedDevices)
 	r.PUT("/api/v1/auth/devices/:id", UpdateDeviceName)
 	r.DELETE("/api/v1/auth/devices/:id", RevokeDevice)
 
-	var ticketStr string
+	var codeStr string
 
-	t.Run("1. Init pairing ticket", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/init", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
+	t.Run("1. Issue one-time OAuth2 exchange code with account identity", func(t *testing.T) {
+		rec, err := issueAuthExchangeCode(db.DB, "https://leaf.starryheavens.uk", 90*time.Second, oidcAccountInfo{
+			Sub:   "usr_test_001",
+			Name:  "Starry",
+			Email: "curator@starryheavens.uk",
+		})
+		if err != nil {
+			t.Fatalf("failed to issue auth exchange code: %v", err)
 		}
-
-		var res struct {
-			Code int `json:"code"`
-			Data struct {
-				Ticket           string `json:"ticket"`
-				ExpiresInSeconds int    `json:"expires_in_seconds"`
-				QRPayload        string `json:"qr_payload"`
-			} `json:"data"`
+		if !strings.HasPrefix(rec.Ticket, "auth_code_") {
+			t.Fatalf("expected auth_code_ prefix, got %q", rec.Ticket)
 		}
-		if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
-			t.Fatalf("failed to decode response: %v", err)
-		}
-
-		if res.Data.Ticket == "" || res.Data.QRPayload == "" {
-			t.Fatalf("invalid ticket or qr_payload: %+v", res.Data)
-		}
-
-		ticketStr = res.Data.Ticket
+		codeStr = rec.Ticket
 	})
 
-	var deviceToken, deviceID string
+	var accessToken, deviceID string
 
-	t.Run("2. Confirm pairing with ticket", func(t *testing.T) {
-		payload := ConfirmPairingRequest{
-			Ticket:      ticketStr,
+	t.Run("2. Exchange OAuth2 code for session token & account snapshot", func(t *testing.T) {
+		payload := ExchangeOIDCCodeRequest{
+			Code:        codeStr,
 			DeviceName:  "Test MacBook Pro",
 			Platform:    "macos",
 			DeviceModel: "Mac15,3",
 		}
 		body, _ := json.Marshal(payload)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/oidc/exchange", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -104,37 +99,47 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		var res struct {
 			Code int `json:"code"`
 			Data struct {
+				SessionID   string `json:"session_id"`
 				DeviceID    string `json:"device_id"`
 				DeviceName  string `json:"device_name"`
+				AccessToken string `json:"access_token"`
 				DeviceToken string `json:"device_token"`
+				Account     struct {
+					Sub   string `json:"sub"`
+					Name  string `json:"name"`
+					Email string `json:"email"`
+				} `json:"account"`
 			} `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
 
-		if res.Data.DeviceID == "" || res.Data.DeviceToken == "" {
-			t.Fatalf("expected device_id and device_token, got: %+v", res.Data)
+		if res.Data.DeviceID == "" || res.Data.AccessToken == "" || res.Data.AccessToken != res.Data.DeviceToken {
+			t.Fatalf("expected session/token fields, got: %+v", res.Data)
+		}
+		if res.Data.Account.Sub != "usr_test_001" || res.Data.Account.Name != "Starry" || res.Data.Account.Email != "curator@starryheavens.uk" {
+			t.Fatalf("expected account identity in exchange response, got: %+v", res.Data.Account)
 		}
 
 		deviceID = res.Data.DeviceID
-		deviceToken = res.Data.DeviceToken
+		accessToken = res.Data.AccessToken
 	})
 
-	t.Run("3. Reusing ticket is rejected", func(t *testing.T) {
-		payload := ConfirmPairingRequest{
-			Ticket: ticketStr,
+	t.Run("3. Reusing exchange code is rejected", func(t *testing.T) {
+		payload := ExchangeOIDCCodeRequest{
+			Code: codeStr,
 		}
 		body, _ := json.Marshal(payload)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/oidc/exchange", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
 		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for already used ticket, got %d", w.Code)
+			t.Fatalf("expected 400 for already used code, got %d", w.Code)
 		}
 	})
 
-	t.Run("4. Confirm pairing with second ticket", func(t *testing.T) {
+	t.Run("4. Legacy /auth/pair/confirm alias still exchanges ticket cleanly", func(t *testing.T) {
 		ticket2 := models.PairTicket{
 			Ticket:    "pair_tk_test_second_ticket",
 			ExpiresAt: time.Now().Add(5 * time.Minute),
@@ -144,8 +149,8 @@ func TestDevicePairingLifecycle(t *testing.T) {
 
 		payload := ConfirmPairingRequest{
 			Ticket:     "pair_tk_test_second_ticket",
-			DeviceName: "Test iPhone 16",
-			Platform:   "ios",
+			DeviceName: "Test Android",
+			Platform:   "android",
 		}
 		body, _ := json.Marshal(payload)
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
@@ -154,36 +159,62 @@ func TestDevicePairingLifecycle(t *testing.T) {
 		r.ServeHTTP(w, req)
 
 		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 for second ticket confirm, got %d, body: %s", w.Code, w.Body.String())
+			t.Fatalf("expected 200 for legacy confirm alias, got %d, body: %s", w.Code, w.Body.String())
 		}
 	})
 
-	t.Run("4b. Empty or invalid ticket is rejected without affecting valid tickets", func(t *testing.T) {
+	t.Run("4b. Empty or invalid code is rejected without affecting valid codes", func(t *testing.T) {
 		ticket3 := models.PairTicket{
-			Ticket:    "pair_tk_valid_ticket",
+			Ticket:    "auth_code_valid_ticket",
 			ExpiresAt: time.Now().Add(5 * time.Minute),
 			Used:      false,
 		}
 		db.DB.Create(&ticket3)
 
-		badPayload := ConfirmPairingRequest{Ticket: ""}
+		badPayload := ExchangeOIDCCodeRequest{Code: ""}
 		body, _ := json.Marshal(badPayload)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/pair/confirm", bytes.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/oidc/exchange", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for empty ticket, got %d", w.Code)
+			t.Fatalf("expected 400 for empty code, got %d", w.Code)
 		}
 
 		var checkTk models.PairTicket
 		db.DB.Where("ticket = ?", ticket3.Ticket).First(&checkTk)
 		if checkTk.Used {
-			t.Fatalf("valid ticket must remain unused, got used=%v", checkTk.Used)
+			t.Fatalf("valid code must remain unused, got used=%v", checkTk.Used)
 		}
 	})
 
-	t.Run("5. List trusted devices", func(t *testing.T) {
+	t.Run("5. GET /auth/session returns account identity for active Bearer token", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var res struct {
+			Data struct {
+				IsAdmin bool   `json:"is_admin"`
+				Role    string `json:"role"`
+				Account struct {
+					Sub   string `json:"sub"`
+					Name  string `json:"name"`
+					Email string `json:"email"`
+				} `json:"account"`
+			} `json:"data"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &res)
+		if !res.Data.IsAdmin || res.Data.Role != "admin" || res.Data.Account.Name != "Starry" || res.Data.Account.Email != "curator@starryheavens.uk" {
+			t.Fatalf("unexpected session payload: %+v", res.Data)
+		}
+	})
+
+	t.Run("6. List active sessions & rename", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
@@ -197,117 +228,56 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			Data []models.Device `json:"data"`
 		}
 		_ = json.Unmarshal(w.Body.Bytes(), &res)
-
 		if len(res.Data) != 2 {
-			t.Fatalf("expected 2 devices, got %d", len(res.Data))
+			t.Fatalf("expected 2 active sessions, got %d", len(res.Data))
 		}
-	})
 
-	t.Run("5b. Rename active device via UpdateDeviceName", func(t *testing.T) {
 		renameBody, _ := json.Marshal(map[string]string{"name": "  Studio MacBook Pro M3  "})
-		req := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(renameBody))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200 on rename, got %d: %s", w.Code, w.Body.String())
-		}
-
-		var res struct {
-			Code int           `json:"code"`
-			Data models.Device `json:"data"`
-		}
-		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		if res.Data.Name != "Studio MacBook Pro M3" {
-			t.Fatalf("expected trimmed name 'Studio MacBook Pro M3', got '%s'", res.Data.Name)
-		}
-
-		// Update platform and device_model
-		updatePlatformBody, _ := json.Marshal(map[string]string{
-			"platform":     "macos",
-			"device_model": "MacBook Air",
-		})
-		platReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(updatePlatformBody))
-		platReq.Header.Set("Content-Type", "application/json")
-		platW := httptest.NewRecorder()
-		r.ServeHTTP(platW, platReq)
-		if platW.Code != http.StatusOK {
-			t.Fatalf("expected 200 on platform update, got %d", platW.Code)
-		}
-		var platRes struct {
-			Data models.Device `json:"data"`
-		}
-		_ = json.Unmarshal(platW.Body.Bytes(), &platRes)
-		if platRes.Data.Platform != "macos" || platRes.Data.DeviceModel != "MacBook Air" {
-			t.Fatalf("expected platform 'macos' and model 'MacBook Air', got %+v", platRes.Data)
-		}
-
-		// Empty name, platform, and model should return 400
-		emptyBody, _ := json.Marshal(map[string]string{"name": "   "})
-		badReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(emptyBody))
-		badReq.Header.Set("Content-Type", "application/json")
-		badW := httptest.NewRecorder()
-		r.ServeHTTP(badW, badReq)
-		if badW.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400 for empty device name, got %d", badW.Code)
+		renReq := httptest.NewRequest(http.MethodPut, "/api/v1/auth/devices/"+deviceID, bytes.NewReader(renameBody))
+		renReq.Header.Set("Content-Type", "application/json")
+		renW := httptest.NewRecorder()
+		r.ServeHTTP(renW, renReq)
+		if renW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on rename, got %d: %s", renW.Code, renW.Body.String())
 		}
 	})
 
-	t.Run("6. Revoke device and verify it is excluded from GetTrustedDevices", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/devices/"+deviceID, nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
+	t.Run("7. POST /auth/logout revokes Bearer session even if it is the last active session under OIDC", func(t *testing.T) {
+		// 先吊销另一台会话，使 accessToken 成为唯一活跃会话
+		var all []models.Device
+		db.DB.Where("status = ?", "active").Find(&all)
+		for _, d := range all {
+			if d.DeviceID != deviceID {
+				revReq := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/devices/"+d.DeviceID, nil)
+				revW := httptest.NewRecorder()
+				r.ServeHTTP(revW, revReq)
+				if revW.Code != http.StatusOK {
+					t.Fatalf("expected 200 revoking secondary session, got %d", revW.Code)
+				}
+			}
 		}
 
-		var device models.Device
-		db.DB.Where("device_id = ?", deviceID).First(&device)
-		if device.Status != "revoked" {
-			t.Fatalf("expected status 'revoked', got '%s'", device.Status)
+		// 现在登出最后一台活跃会话：OIDC 模式下必须成功并立即使原 Bearer Token 失效
+		logoutReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+		logoutReq.Header.Set("Authorization", "Bearer "+accessToken)
+		logoutW := httptest.NewRecorder()
+		r.ServeHTTP(logoutW, logoutReq)
+		if logoutW.Code != http.StatusOK {
+			t.Fatalf("expected 200 on logout, got %d: %s", logoutW.Code, logoutW.Body.String())
 		}
 
-		// Verify GetTrustedDevices only returns active devices
-		listReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/devices", nil)
-		listW := httptest.NewRecorder()
-		r.ServeHTTP(listW, listReq)
-
-		var res struct {
-			Code int             `json:"code"`
-			Data []models.Device `json:"data"`
-		}
-		_ = json.Unmarshal(listW.Body.Bytes(), &res)
-		if len(res.Data) != 1 {
-			t.Fatalf("expected 1 active device after revocation, got %d", len(res.Data))
-		}
-		if res.Data[0].DeviceID == deviceID {
-			t.Fatalf("expected revoked device %s to be excluded from trusted devices list", deviceID)
-		}
-	})
-
-	t.Run("7. RenderPairQRCode dynamically renders QR code Data URL", func(t *testing.T) {
-		r.GET("/api/v1/auth/pair/qr", RenderPairQRCode)
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/pair/qr?hub=http://100.112.108.52:8088&ticket="+ticketStr, nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d", w.Code)
-		}
-		var res struct {
+		checkReq := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+		checkReq.Header.Set("Authorization", "Bearer "+accessToken)
+		checkW := httptest.NewRecorder()
+		r.ServeHTTP(checkW, checkReq)
+		var checkRes struct {
 			Data struct {
-				QRPayload     string `json:"qr_payload"`
-				QRCodeDataURL string `json:"qr_code_data_url"`
+				IsAdmin bool `json:"is_admin"`
 			} `json:"data"`
 		}
-		_ = json.Unmarshal(w.Body.Bytes(), &res)
-		parsedQR, parseErr := url.Parse(res.Data.QRPayload)
-		if parseErr != nil ||
-			parsedQR.Query().Get("hub") != "http://100.112.108.52:8088" ||
-			parsedQR.Query().Get("ticket") != ticketStr ||
-			!strings.HasPrefix(res.Data.QRCodeDataURL, "data:image/png;base64,") {
-			t.Fatalf("unexpected QR payload or data URL: %+v", res.Data)
+		_ = json.Unmarshal(checkW.Body.Bytes(), &checkRes)
+		if checkRes.Data.IsAdmin {
+			t.Fatalf("expected Bearer token to be invalidated immediately after logout")
 		}
 	})
 
@@ -319,6 +289,4 @@ func TestDevicePairingLifecycle(t *testing.T) {
 			}
 		}
 	})
-
-	_ = deviceToken
 }

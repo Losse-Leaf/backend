@@ -10,13 +10,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
 var alistHTTPClient = &http.Client{
 	Timeout: 60 * time.Second,
 }
+
+// alistPutMu 串行化同机 AList 镜像写入，避免多图并发上传触发 Google Drive 同名目录竞态或目录缓存陈旧。
+var alistPutMu sync.Mutex
 
 func getAlistConfig() (baseURL, token, mountPath string, enabled bool) {
 	baseURL = strings.TrimRight(strings.TrimSpace(os.Getenv("ALIST_BASE_URL")), "/")
@@ -75,6 +80,9 @@ func MirrorLocalToAlist(ctx context.Context, objectKey, contentType string) (str
 		return "", err
 	}
 
+	alistPutMu.Lock()
+	defer alistPutMu.Unlock()
+
 	alistPath := mountPath + "/" + cleanKey
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, baseURL+"/api/fs/put", f)
 	if err != nil {
@@ -105,7 +113,32 @@ func MirrorLocalToAlist(ctx context.Context, objectKey, contentType string) (str
 	if err := json.Unmarshal(raw, &res); err == nil && res.Code != 0 && res.Code != 200 {
 		return "", fmt.Errorf("AList put code %d: %s", res.Code, res.Message)
 	}
+	refreshAlistDirCache(ctx, baseURL, token, path.Dir(alistPath))
 	return alistPath, nil
+}
+
+func refreshAlistDirCache(ctx context.Context, baseURL, token, dir string) {
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"path":     dir,
+		"page":     1,
+		"per_page": 100,
+		"refresh":  true,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/fs/list", bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", token)
+	}
+	if resp, err := alistHTTPClient.Do(req); err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+		_ = resp.Body.Close()
+	}
 }
 
 // MirrorLocalToAlistAsync 后台异步将本地对象镜像至 AList 5TB 云盘。

@@ -135,6 +135,33 @@ func FetchFromAlistAndCacheLocal(ctx context.Context, objectKey string) ([]byte,
 	alistPath := mountPath + "/" + cleanKey
 	targetURL := baseURL + "/d/" + escapeObjectKeyPath(alistPath)
 
+	// 优先调用 /api/fs/get 获取带签名的下载链接（兼容 AList 开启 sign_all: true 的情况）
+	getPayload, _ := json.Marshal(map[string]any{"path": alistPath, "password": ""})
+	if getReq, gErr := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/fs/get", bytes.NewReader(getPayload)); gErr == nil {
+		getReq.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			getReq.Header.Set("Authorization", token)
+		}
+		if getResp, doErr := alistHTTPClient.Do(getReq); doErr == nil {
+			rawMeta, _ := io.ReadAll(io.LimitReader(getResp.Body, 64*1024))
+			_ = getResp.Body.Close()
+			var meta struct {
+				Code int `json:"code"`
+				Data struct {
+					Sign   string `json:"sign"`
+					RawURL string `json:"raw_url"`
+				} `json:"data"`
+			}
+			if getResp.StatusCode == http.StatusOK && json.Unmarshal(rawMeta, &meta) == nil && meta.Code == 200 {
+				if sign := strings.TrimSpace(meta.Data.Sign); sign != "" {
+					targetURL = baseURL + "/d/" + escapeObjectKeyPath(alistPath) + "?sign=" + url.QueryEscape(sign)
+				} else if rawURL := strings.TrimSpace(meta.Data.RawURL); rawURL != "" {
+					targetURL = rawURL
+				}
+			}
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, err
@@ -149,6 +176,10 @@ func FetchFromAlistAndCacheLocal(ctx context.Context, objectKey string) ([]byte,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("AList fetch HTTP %d", resp.StatusCode)
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "application/json") || strings.Contains(ct, "text/html") {
+		return nil, fmt.Errorf("AList returned unexpected content-type %q", ct)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 	if err != nil {

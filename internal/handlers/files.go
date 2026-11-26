@@ -352,9 +352,25 @@ func CompleteUpload(c *gin.Context) {
 		Height:           req.Height,
 	}
 
-	if err := db.DB.Create(&att).Error; err != nil {
+	if err := db.DB.Where(models.Attachment{ObjectKey: req.ObjectKey}).FirstOrCreate(&att).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "创建附件记录失败")
 		return
+	}
+	updates := map[string]any{}
+	if att.Width == 0 && req.Width > 0 {
+		updates["width"] = req.Width
+		att.Width = req.Width
+	}
+	if att.Height == 0 && req.Height > 0 {
+		updates["height"] = req.Height
+		att.Height = req.Height
+	}
+	if att.Size == 0 && req.Size > 0 {
+		updates["size"] = req.Size
+		att.Size = req.Size
+	}
+	if len(updates) > 0 {
+		_ = db.DB.Model(&att).Updates(updates).Error
 	}
 
 	att.URL = storage.SignResourceURL(att.ObjectKey)

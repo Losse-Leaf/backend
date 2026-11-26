@@ -169,7 +169,7 @@ type CreateEntryRequest struct {
 	Type            string `json:"type"`     // life, wish
 	Category        string `json:"category"` // "", Photography, Travel, Still Life, Motion
 	Title           string `json:"title"`
-	Content         string `json:"content" binding:"required"`
+	Content         string `json:"content"`
 	OccurredAt      string `json:"occurred_at"`
 	Location        string `json:"location"`
 	WishID          *uint  `json:"wish_id"`
@@ -182,7 +182,7 @@ type CreateEntryRequest struct {
 func CreateLifeEntry(c *gin.Context) {
 	var req CreateEntryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		Error(c, http.StatusBadRequest, "内容必填，且必须指定有效类型")
+		Error(c, http.StatusBadRequest, "请求参数无效")
 		return
 	}
 
@@ -202,6 +202,10 @@ func CreateLifeEntry(c *gin.Context) {
 
 	title := strings.TrimSpace(req.Title)
 	content := strings.TrimSpace(req.Content)
+	if title == "" && content == "" && len(req.AttachmentIDs) == 0 {
+		Error(c, http.StatusBadRequest, "标题、正文与照片不能同时为空")
+		return
+	}
 	if title == "" {
 		title = DeriveTitleFromContent(content, 40)
 	}

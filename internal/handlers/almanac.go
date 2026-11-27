@@ -129,10 +129,18 @@ func GetAnnualAlmanacSummary(c *gin.Context) {
 
 	for _, tx := range txs {
 		if tx.Type == "expense" {
-			totalExpense += tx.Amount
-			categoryBreakdown[tx.Category] += tx.Amount
-			if tx.WishID != nil || tx.Category == "好物购置" || tx.Category == "旅行度假" {
-				wishExpenses += tx.Amount
+			expensePart := tx.Amount
+			cat := tx.Category
+			if tx.Source == "installment_repay" {
+				expensePart = tx.FeeAmount
+				cat = "利息手续费"
+			}
+			if expensePart > 0 {
+				totalExpense += expensePart
+				categoryBreakdown[cat] += expensePart
+				if tx.WishID != nil || cat == "好物购置" || cat == "旅行度假" {
+					wishExpenses += expensePart
+				}
 			}
 		} else if tx.Type == "income" {
 			totalIncome += tx.Amount

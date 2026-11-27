@@ -289,6 +289,9 @@ func GetTransactions(c *gin.Context) {
 
 	now := config.NowInBeijing()
 	for i := range txs {
+		if !txs[i].OccurredAt.IsZero() {
+			txs[i].OccurredAt = txs[i].OccurredAt.In(config.BeijingLocation)
+		}
 		if txs[i].IsInstallment {
 			_, autoRemain := CalculateElapsedInstallmentMonths(txs[i].OccurredAt, txs[i].InstallmentMonths, txs[i].RepaymentDay, now)
 			if txs[i].InstallmentRemainMonths > autoRemain {
@@ -390,6 +393,10 @@ func UpdateTransaction(c *gin.Context) {
 	if txType := strings.TrimSpace(req.Type); txType != "" {
 		if !validTxTypes[txType] {
 			Error(c, http.StatusBadRequest, "type 仅支持 expense / income")
+			return
+		}
+		if tx.Source == "installment_repay" && txType != "expense" {
+			Error(c, http.StatusBadRequest, "分期还款账目类型不可修改")
 			return
 		}
 		tx.Type = txType

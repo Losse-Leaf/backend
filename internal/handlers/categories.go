@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -17,6 +19,41 @@ var validCategoryScopes = map[string]bool{
 	"payment": true,
 }
 
+// normalizeCategoryKeywords 统一规范化分类自动匹配关键词（逗号分隔、去重、去空白、限长）
+func normalizeCategoryKeywords(raw string) string {
+	replaced := strings.NewReplacer(
+		"，", ",",
+		"、", ",",
+		"；", ",",
+		";", ",",
+		"\r\n", ",",
+		"\n", ",",
+		"\r", ",",
+		"\t", ",",
+	).Replace(raw)
+	parts := strings.Split(replaced, ",")
+	seen := make(map[string]bool, len(parts))
+	cleaned := make([]string, 0, len(parts))
+	for _, p := range parts {
+		kw := strings.TrimSpace(p)
+		if kw == "" {
+			continue
+		}
+		lower := strings.ToLower(kw)
+		if seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		cleaned = append(cleaned, kw)
+	}
+	joined := strings.Join(cleaned, ",")
+	runes := []rune(joined)
+	if len(runes) > 500 {
+		return string(runes[:500])
+	}
+	return joined
+}
+
 // transactionCategoryAllowed 账目分类字典收口（表单契约修复）：
 // category 必须真实存在于有效字典，杜绝「income+餐饮」这类自由文本错挂。
 func transactionCategoryAllowed(txType, category string) bool {
@@ -28,8 +65,16 @@ func transactionCategoryAllowed(txType, category string) bool {
 	if txType == "income" {
 		scope = "income"
 	}
+	// 系统自动账单专用分类（如「好物购置」「利息手续费」）不在用户列表暴露，但内部校验必须始终放行
+	if scope == "expense" && db.HiddenSystemExpenseCategories[name] {
+		return true
+	}
 	var rowCount int64
-	db.DB.Model(&models.CategoryOption{}).Where("scope = ?", scope).Count(&rowCount)
+	rowQuery := db.DB.Model(&models.CategoryOption{}).Where("scope = ?", scope)
+	if scope == "expense" {
+		rowQuery = rowQuery.Where("name NOT IN ?", db.HiddenSystemExpenseNames())
+	}
+	rowQuery.Count(&rowCount)
 	if rowCount == 0 {
 		for _, def := range db.DefaultCategoriesMap[scope] {
 			if def == name {
@@ -48,6 +93,7 @@ func GetCategories(c *gin.Context) {
 	scope := strings.TrimSpace(c.Query("scope"))
 	query := db.DB.Model(&models.CategoryOption{}).
 		Where("scope IN ?", []string{"expense", "income", "payment"}).
+		Where("NOT (scope = 'expense' AND name IN ?)", db.HiddenSystemExpenseNames()).
 		Order("scope ASC, sort_order ASC, id ASC")
 	if scope != "" {
 		query = query.Where("scope = ?", scope)
@@ -57,6 +103,13 @@ func GetCategories(c *gin.Context) {
 	if err := query.Find(&items).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "获取分类字典失败")
 		return
+	}
+
+	usageMap := loadCategoryUsageCounts()
+	for i := range items {
+		if cnt, ok := usageMap[items[i].Scope+"|"+items[i].Name]; ok {
+			items[i].UsageCount = cnt
+		}
 	}
 
 	grouped := map[string][]string{
@@ -81,9 +134,73 @@ func GetCategories(c *gin.Context) {
 	})
 }
 
+func loadCategoryUsageCounts() map[string]int64 {
+	counts := make(map[string]int64)
+	type aggRow struct {
+		Name string
+		Cnt  int64
+	}
+
+	if db.DB.Migrator().HasTable(&models.Transaction{}) {
+		var expenseRows []aggRow
+		db.DB.Model(&models.Transaction{}).
+			Select("category AS name, COUNT(*) AS cnt").
+			Where("type = ?", "expense").
+			Group("category").
+			Scan(&expenseRows)
+		for _, r := range expenseRows {
+			if r.Name != "" {
+				counts["expense|"+r.Name] += r.Cnt
+			}
+		}
+
+		var incomeRows []aggRow
+		db.DB.Model(&models.Transaction{}).
+			Select("category AS name, COUNT(*) AS cnt").
+			Where("type = ?", "income").
+			Group("category").
+			Scan(&incomeRows)
+		for _, r := range incomeRows {
+			if r.Name != "" {
+				counts["income|"+r.Name] += r.Cnt
+			}
+		}
+
+		var paymentRows []aggRow
+		db.DB.Model(&models.Transaction{}).
+			Select("payment_method AS name, COUNT(*) AS cnt").
+			Where("payment_method != ''").
+			Group("payment_method").
+			Scan(&paymentRows)
+		for _, r := range paymentRows {
+			if r.Name != "" {
+				counts["payment|"+r.Name] += r.Cnt
+			}
+		}
+	}
+
+	if db.DB.Migrator().HasTable(&models.InstallmentPlan{}) {
+		var planRows []aggRow
+		db.DB.Model(&models.InstallmentPlan{}).
+			Select("category_name AS name, COUNT(*) AS cnt").
+			Where("category_name != ''").
+			Group("category_name").
+			Scan(&planRows)
+		for _, r := range planRows {
+			if r.Name != "" {
+				counts["expense|"+r.Name] += r.Cnt
+			}
+		}
+	}
+
+	return counts
+}
+
 type CreateCategoryRequest struct {
 	Scope     string `json:"scope" binding:"required"`
 	Name      string `json:"name" binding:"required"`
+	GroupName string `json:"group_name"`
+	Keywords  string `json:"keywords"`
 	SortOrder *int   `json:"sort_order"`
 }
 
@@ -106,6 +223,12 @@ func CreateCategory(c *gin.Context) {
 		return
 	}
 
+	// 检查是否为系统内部保留分类
+	if scope == "expense" && db.HiddenSystemExpenseCategories[name] {
+		Error(c, http.StatusBadRequest, "该名称为系统内部保留分类")
+		return
+	}
+
 	// 检查同模块下是否已存在同名分类
 	var existing models.CategoryOption
 	if err := db.DB.Where("scope = ? AND name = ?", scope, name).First(&existing).Error; err == nil && existing.ID > 0 {
@@ -125,6 +248,8 @@ func CreateCategory(c *gin.Context) {
 	item := models.CategoryOption{
 		Scope:     scope,
 		Name:      name,
+		GroupName: strings.TrimSpace(req.GroupName),
+		Keywords:  normalizeCategoryKeywords(req.Keywords),
 		SortOrder: sortOrder,
 		IsBuiltin: false,
 	}
@@ -137,12 +262,14 @@ func CreateCategory(c *gin.Context) {
 }
 
 type UpdateCategoryRequest struct {
-	Name          string `json:"name"`
-	SortOrder     *int   `json:"sort_order"`
-	RenameRecords *bool  `json:"rename_records"`
+	Name          string  `json:"name"`
+	GroupName     *string `json:"group_name"`
+	Keywords      *string `json:"keywords"`
+	SortOrder     *int    `json:"sort_order"`
+	RenameRecords *bool   `json:"rename_records"`
 }
 
-// UpdateCategory 修改分类名称或排序，并自动同步历史业务记录中的分类名
+// UpdateCategory 修改分类名称、分组、关键词或排序，并自动同步历史业务记录中的分类名
 func UpdateCategory(c *gin.Context) {
 	id := c.Param("id")
 	var item models.CategoryOption
@@ -169,6 +296,12 @@ func UpdateCategory(c *gin.Context) {
 		item.Name = newName
 	}
 
+	if req.GroupName != nil {
+		item.GroupName = strings.TrimSpace(*req.GroupName)
+	}
+	if req.Keywords != nil {
+		item.Keywords = normalizeCategoryKeywords(*req.Keywords)
+	}
 	if req.SortOrder != nil {
 		item.SortOrder = *req.SortOrder
 	}
@@ -191,6 +324,7 @@ func UpdateCategory(c *gin.Context) {
 		return
 	}
 
+	item.UsageCount = countCategoryRecordsInUse(item.Scope, item.Name)
 	Success(c, item)
 }
 
@@ -205,9 +339,22 @@ func cascadeRenameCategoryRecords(tx *gorm.DB, scope, oldName, newName string) e
 				return err
 			}
 		}
+		if tx.Migrator().HasTable(&models.CategoryRule{}) {
+			if err := tx.Model(&models.CategoryRule{}).Where("tx_type = 'expense' AND category = ?", oldName).Update("category", newName).Error; err != nil {
+				return err
+			}
+		}
 		return nil
 	case "income":
-		return tx.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName).Error
+		if err := tx.Model(&models.Transaction{}).Where("type = 'income' AND category = ?", oldName).Update("category", newName).Error; err != nil {
+			return err
+		}
+		if tx.Migrator().HasTable(&models.CategoryRule{}) {
+			if err := tx.Model(&models.CategoryRule{}).Where("tx_type = 'income' AND category = ?", oldName).Update("category", newName).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	case "payment":
 		return tx.Model(&models.Transaction{}).Where("payment_method = ?", oldName).Update("payment_method", newName).Error
 	}
@@ -233,7 +380,11 @@ func countCategoryRecordsInUse(scope, name string) int64 {
 	return total
 }
 
-// DeleteCategory 删除分类项 (保证每个模块至少保留 1 个分类；存在历史引用时拒绝删除)
+type DeleteCategoryRequest struct {
+	MigrateTo string `json:"migrate_to"`
+}
+
+// DeleteCategory 删除分类项 (保证每个模块至少保留 1 个分类；存在历史引用时支持 ?migrate_to= 迁移后删除)
 func DeleteCategory(c *gin.Context) {
 	id := c.Param("id")
 	var item models.CategoryOption
@@ -242,29 +393,64 @@ func DeleteCategory(c *gin.Context) {
 		return
 	}
 
-	if item.IsBuiltin && (item.Name == "利息手续费" || item.Name == "好物购置") {
+	if item.IsBuiltin && db.HiddenSystemExpenseCategories[item.Name] {
 		Error(c, http.StatusBadRequest, fmt.Sprintf("「%s」为系统内置分类，不可删除", item.Name))
 		return
 	}
 
 	var count int64
-	db.DB.Model(&models.CategoryOption{}).Where("scope = ?", item.Scope).Count(&count)
+	countQuery := db.DB.Model(&models.CategoryOption{}).Where("scope = ?", item.Scope)
+	if item.Scope == "expense" {
+		countQuery = countQuery.Where("name NOT IN ?", db.HiddenSystemExpenseNames())
+	}
+	countQuery.Count(&count)
 	if count <= 1 {
 		Error(c, http.StatusBadRequest, "每个分类模块至少需要保留 1 个分类项")
 		return
 	}
 
-	// 仍被历史业务记录引用的分类不可删除，否则旧记录将残留孤儿分类名 (BE-28)
-	if used := countCategoryRecordsInUse(item.Scope, item.Name); used > 0 {
+	migrateTo := strings.TrimSpace(c.Query("migrate_to"))
+	if migrateTo == "" && c.Request.Body != nil {
+		rawBytes, _ := io.ReadAll(io.LimitReader(c.Request.Body, 4096))
+		if len(strings.TrimSpace(string(rawBytes))) > 0 {
+			var bodyReq DeleteCategoryRequest
+			if err := json.Unmarshal(rawBytes, &bodyReq); err == nil {
+				migrateTo = strings.TrimSpace(bodyReq.MigrateTo)
+			}
+		}
+	}
+
+	if migrateTo != "" {
+		if migrateTo == item.Name {
+			Error(c, http.StatusBadRequest, "目标迁移分类不能与当前删除分类相同")
+			return
+		}
+		var target models.CategoryOption
+		if err := db.DB.Where("scope = ? AND name = ?", item.Scope, migrateTo).First(&target).Error; err != nil || target.ID == 0 {
+			Error(c, http.StatusBadRequest, "目标迁移分类不存在于当前模块字典")
+			return
+		}
+	}
+
+	// 仍被历史业务记录引用的分类：若未指定 migrate_to 则拒绝删除，否则在事务内迁移后删除
+	used := countCategoryRecordsInUse(item.Scope, item.Name)
+	if used > 0 && migrateTo == "" {
 		Error(c, http.StatusBadRequest,
 			fmt.Sprintf("「%s」仍被 %d 条历史记录引用，暂无法删除", item.Name, used))
 		return
 	}
 
-	if err := db.DB.Delete(&item).Error; err != nil {
-		Error(c, http.StatusInternalServerError, "删除分类失败")
+	if err := db.DB.Transaction(func(tx *gorm.DB) error {
+		if migrateTo != "" {
+			if err := cascadeRenameCategoryRecords(tx, item.Scope, item.Name, migrateTo); err != nil {
+				return err
+			}
+		}
+		return tx.Delete(&item).Error
+	}); err != nil {
+		Error(c, http.StatusInternalServerError, "删除分类失败: "+err.Error())
 		return
 	}
 
-	Success(c, gin.H{"id": item.ID, "deleted": true})
+	Success(c, gin.H{"id": item.ID, "deleted": true, "migrated_to": migrateTo})
 }

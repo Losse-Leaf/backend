@@ -29,7 +29,7 @@ func TestAlmanacSummaryExcludesRepayPrincipalAndTransactionsUseBeijingTZ(t *test
 	txPurchase := models.Transaction{
 		Amount:        120000,
 		Type:          "expense",
-		Category:      "数码器材",
+		Category:      "购物",
 		Title:         "耳机分期购买",
 		OccurredAt:    beijingNov1,
 		IsInstallment: true,
@@ -57,7 +57,7 @@ func TestAlmanacSummaryExcludesRepayPrincipalAndTransactionsUseBeijingTZ(t *test
 	createIncomeBody, _ := json.Marshal(map[string]any{
 		"amount":      500000,
 		"type":        "income",
-		"category":    "工资收入",
+		"category":    "工资",
 		"title":       "工资",
 		"occurred_at": "2026-10-31T17:00:00Z",
 	})
@@ -104,7 +104,7 @@ func TestAlmanacSummaryExcludesRepayPrincipalAndTransactionsUseBeijingTZ(t *test
 	updBody, _ := json.Marshal(map[string]any{
 		"amount":   40600,
 		"type":     "income",
-		"category": "工资收入",
+		"category": "工资",
 	})
 	reqUpd, _ := http.NewRequest("PUT", fmt.Sprintf("/api/v1/transactions/%d", txRepay.ID), bytes.NewBuffer(updBody))
 	reqUpd.Header.Set("Authorization", "Bearer "+token)

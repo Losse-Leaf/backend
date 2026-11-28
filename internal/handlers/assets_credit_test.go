@@ -184,7 +184,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		txReq := TransactionRequest{
 			Amount:                 239900,
 			Type:                   "expense",
-			Category:               "数码器材",
+			Category:               "购物",
 			Title:                  "AirPods Max 银色",
 			Note:                   "头戴式主动降噪耳机",
 			PaymentMethod:          "花呗分期",
@@ -211,7 +211,7 @@ func TestAssetsCreditAndDesensitization(t *testing.T) {
 		txWishReq := TransactionRequest{
 			Amount:        239900,
 			Type:          "expense",
-			Category:      "数码器材",
+			Category:      "购物",
 			Title:         "AirPods Max 银色",
 			PaymentMethod: "花呗",
 			WishID:        &wishItem.ID,

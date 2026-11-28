@@ -713,7 +713,7 @@ func ResolveWish(c *gin.Context) {
 		if req.CreateTransaction && req.ActualCost > 0 {
 			category := "好物购置"
 			if wish.Kind == "travel" {
-				category = "旅行度假"
+				category = "娱乐"
 			}
 			displayTitle := "心愿达成: " + wish.Title
 			if resType == "altered" && actualTitle != "" {

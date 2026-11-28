@@ -45,7 +45,7 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 		Title:                   "分期买笔记本",
 		Amount:                  1200000,
 		Type:                    "expense",
-		Category:                "数码器材",
+		Category:                "购物",
 		PaymentMethod:           "花呗",
 		OccurredAt:              time.Now(),
 		IsInstallment:           true,
@@ -66,7 +66,7 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 	// 场景一：请求**完全不带** is_installment（纯 PATCH 语义）
 	body, _ := json.Marshal(map[string]any{
 		"title":    "只改了标题",
-		"category": "数码器材",
+		"category": "购物",
 		"amount":   1200000,
 		"type":     "expense",
 	})
@@ -105,7 +105,7 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 	// 所以单传 false **必须**保持原值。
 	body2, _ := json.Marshal(map[string]any{
 		"title":          "老客户端只发了 false",
-		"category":       "数码器材",
+		"category":       "购物",
 		"amount":         1200000,
 		"type":           "expense",
 		"is_installment": false,
@@ -133,7 +133,7 @@ func TestUpdateTransactionKeepsInstallmentWhenNotCarried(t *testing.T) {
 	// 场景三：显式声明 clear_installment 才真的降级
 	body3, _ := json.Marshal(map[string]any{
 		"title":             "明确改成一次性",
-		"category":          "数码器材",
+		"category":          "购物",
 		"amount":            1200000,
 		"type":              "expense",
 		"is_installment":    false,

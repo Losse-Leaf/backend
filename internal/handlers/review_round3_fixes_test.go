@@ -117,7 +117,7 @@ func TestTransactionTypeWhitelist(t *testing.T) {
 
 	// 合法 type 创建 → 200
 	w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "income", "category": "工资收入",
+		"amount": 100, "type": "income", "category": "工资",
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("合法 type 创建失败: %d %s", w.Code, w.Body.String())
@@ -132,7 +132,7 @@ func TestTransactionTypeWhitelist(t *testing.T) {
 
 	// 非法 type 更新 → 400 且保持原值
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 100, "category": "工资收入", "type": "transfer",
+		"amount": 100, "category": "工资", "type": "transfer",
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("非法 type 更新应 400: %d %s", w.Code, w.Body.String())
 	}
@@ -144,7 +144,7 @@ func TestTransactionTypeWhitelist(t *testing.T) {
 
 	// type 空串 = 未携带 → 保持原值（更新语义与 MOB-P1-35 一致）
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 100, "category": "工资收入", "type": "",
+		"amount": 100, "category": "工资", "type": "",
 	}); w.Code != http.StatusOK {
 		t.Fatalf("空串 type 应视为未携带: %d %s", w.Code, w.Body.String())
 	}

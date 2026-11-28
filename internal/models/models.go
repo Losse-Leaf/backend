@@ -139,26 +139,43 @@ type InstallmentItem struct {
 // CategoryOption 用户自定义分类与字典配置表
 // Scope: "expense"(支出分类), "income"(收入分类), "payment"(支付方式)
 type CategoryOption struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	Scope     string    `gorm:"index:idx_cat_scope_name,unique;size:32;not null" json:"scope"`
-	Name      string    `gorm:"index:idx_cat_scope_name,unique;size:64;not null" json:"name"`
-	SortOrder int       `gorm:"default:0;index" json:"sort_order"`
-	IsBuiltin bool      `gorm:"default:false" json:"is_builtin"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	Scope      string    `gorm:"index:idx_cat_scope_name,unique;size:32;not null" json:"scope"`
+	Name       string    `gorm:"index:idx_cat_scope_name,unique;size:64;not null" json:"name"`
+	GroupName  string    `gorm:"size:32;default:''" json:"group_name,omitempty"`
+	Keywords   string    `gorm:"type:text;default:''" json:"keywords,omitempty"`
+	SortOrder  int       `gorm:"default:0;index" json:"sort_order"`
+	IsBuiltin  bool      `gorm:"default:false" json:"is_builtin"`
+	UsageCount int64     `gorm:"-" json:"usage_count"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// CategoryRule 商户/收款方自动归类记忆规则表
+type CategoryRule struct {
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	TxType      string    `gorm:"size:16;not null;uniqueIndex:idx_cat_rule_type_key" json:"tx_type"` // "expense" | "income"
+	MatchKey    string    `gorm:"size:128;not null;uniqueIndex:idx_cat_rule_type_key" json:"match_key"`
+	DisplayName string    `gorm:"size:128;not null" json:"display_name"`
+	Category    string    `gorm:"size:64;not null;index" json:"category"`
+	HitCount    int       `gorm:"default:1" json:"hit_count"`
+	Source      string    `gorm:"size:16;default:'learned'" json:"source"` // "learned" | "manual"
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // SiteConfig 站点全局配置 (RC-80)
 type SiteConfig struct {
-	ID               uint     `gorm:"primaryKey" json:"id"`
-	SiteName         string   `json:"site_name"`
-	SiteSubtitle     string   `json:"site_subtitle,omitempty"`
-	CuratorName      string   `json:"curator_name,omitempty"`
-	DefaultLocation  string   `json:"default_location,omitempty"`
-	SiteDesc         string   `json:"site_desc,omitempty"`
-	Initialized      bool     `gorm:"default:false" json:"initialized"`
-	PublicModulesRaw string   `gorm:"column:public_modules;type:text;default:'[]'" json:"-"`
-	PublicModules    []string `gorm:"-" json:"public_modules"`
+	ID                     uint     `gorm:"primaryKey" json:"id"`
+	SiteName               string   `json:"site_name"`
+	SiteSubtitle           string   `json:"site_subtitle,omitempty"`
+	CuratorName            string   `json:"curator_name,omitempty"`
+	DefaultLocation        string   `json:"default_location,omitempty"`
+	SiteDesc               string   `json:"site_desc,omitempty"`
+	Initialized            bool     `gorm:"default:false" json:"initialized"`
+	CategoryCatalogVersion int      `gorm:"default:0" json:"-"`
+	PublicModulesRaw       string   `gorm:"column:public_modules;type:text;default:'[]'" json:"-"`
+	PublicModules          []string `gorm:"-" json:"public_modules"`
 
 	// 对象存储动态配置 (支持通过管理后台在线配置 Cloudflare R2 / S3 兼容存储)
 	R2Disabled             bool   `gorm:"default:false" json:"-"`

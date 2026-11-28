@@ -41,19 +41,19 @@ func TestCreateTransactionInstallmentRequiresExpense(t *testing.T) {
 
 	// income + is_installment=true → 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "income", "category": "工资收入", "is_installment": true,
+		"amount": 100, "type": "income", "category": "工资", "is_installment": true,
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("income+分期创建应 400: %d %s", w.Code, w.Body.String())
 	}
 	// income + 携带分期字段（即便 is_installment 未置真）→ 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "income", "category": "工资收入", "installment_channel_code": "huabei",
+		"amount": 100, "type": "income", "category": "工资", "installment_channel_code": "huabei",
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("income 携带分期字段应 400: %d %s", w.Code, w.Body.String())
 	}
 	// income 纯净载荷 → 200
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "income", "category": "工资收入",
+		"amount": 100, "type": "income", "category": "工资",
 	}); w.Code != http.StatusOK {
 		t.Fatalf("纯净 income 创建应 200: %d %s", w.Code, w.Body.String())
 	}
@@ -64,7 +64,7 @@ func TestUpdateTransactionInstallmentTypeSwitchRejected(t *testing.T) {
 	seedCreditChannel(t, "huabei", 10)
 
 	tx := models.Transaction{
-		Amount: 120000, Type: "expense", Category: "数码器材",
+		Amount: 120000, Type: "expense", Category: "购物",
 		IsInstallment: true, InstallmentChannelCode: "huabei",
 		InstallmentTotalAmount: 120000, InstallmentMonths: 12,
 		InstallmentMonthlyPay: 10000, InstallmentRemainMonths: 12, RepaymentDay: 10,
@@ -76,7 +76,7 @@ func TestUpdateTransactionInstallmentTypeSwitchRejected(t *testing.T) {
 
 	// 把分期账改成 income → 400，账目保持 expense+分期
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 120000, "category": "数码器材", "type": "income",
+		"amount": 120000, "category": "购物", "type": "income",
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("分期账改 income 应 400: %d %s", w.Code, w.Body.String())
 	}
@@ -86,10 +86,10 @@ func TestUpdateTransactionInstallmentTypeSwitchRejected(t *testing.T) {
 		t.Fatalf("被拒绝的更新不得改写 type/is_installment: type=%s installment=%v", reloaded.Type, reloaded.IsInstallment)
 	}
 
-	// 显式 clear_installment + 改 income（分类同步换成 income 字典内的「二手回血」）：
+	// 显式 clear_installment + 改 income（分类同步换成 income 字典内的「退款」）：
 	// 先取消分期再改类型是合法操作 → 200
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 120000, "category": "二手回血", "type": "income", "clear_installment": true,
+		"amount": 120000, "category": "退款", "type": "income", "clear_installment": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("clear_installment 后改 income 应 200: %d %s", w.Code, w.Body.String())
 	}
@@ -121,7 +121,7 @@ func TestCreateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 
 	// 渠道存在：客户端自带矛盾还款日 25 被忽略，强制派生渠道还款日 10
 	tx := create(map[string]any{
-		"amount": 120000, "type": "expense", "category": "数码器材",
+		"amount": 120000, "type": "expense", "category": "购物",
 		"is_installment": true, "installment_channel_code": "huabei",
 		"installment_months": 12, "installment_total_amount": 120000, "repayment_day": 25,
 	})
@@ -132,7 +132,7 @@ func TestCreateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 	// custom 已升级为真实渠道行（启动迁移保证）：与普通渠道同规则 —— 单源化覆盖客户端值
 	seedCreditChannel(t, "custom", 15)
 	tx = create(map[string]any{
-		"amount": 80000, "type": "expense", "category": "数码器材",
+		"amount": 80000, "type": "expense", "category": "购物",
 		"is_installment": true, "installment_channel_code": "custom",
 		"installment_months": 6, "installment_total_amount": 80000, "repayment_day": 99,
 	})
@@ -140,7 +140,7 @@ func TestCreateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 		t.Fatalf("custom 渠道存在时客户端越界还款日应被单源化为 15, 实际 %d", tx.RepaymentDay)
 	}
 	tx = create(map[string]any{
-		"amount": 80000, "type": "expense", "category": "数码器材",
+		"amount": 80000, "type": "expense", "category": "购物",
 		"is_installment": true, "installment_channel_code": "custom",
 		"installment_months": 6, "installment_total_amount": 80000,
 	})
@@ -150,7 +150,7 @@ func TestCreateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 
 	// 伪造渠道 → 400
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "expense", "category": "数码器材",
+		"amount": 100, "type": "expense", "category": "购物",
 		"is_installment": true, "installment_channel_code": "ghost_bank",
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("伪造分期渠道应 400: %d %s", w.Code, w.Body.String())
@@ -162,7 +162,7 @@ func TestUpdateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 	seedCreditChannel(t, "huabei", 10)
 
 	tx := models.Transaction{
-		Amount: 120000, Type: "expense", Category: "数码器材",
+		Amount: 120000, Type: "expense", Category: "购物",
 		IsInstallment: true, InstallmentChannelCode: "huabei",
 		InstallmentTotalAmount: 120000, InstallmentMonths: 12,
 		InstallmentMonthlyPay: 10000, InstallmentRemainMonths: 12, RepaymentDay: 10,
@@ -174,7 +174,7 @@ func TestUpdateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 
 	// 客户端自带矛盾还款日 25：渠道存在 → 强制回渠道值 10
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 120000, "category": "数码器材", "type": "expense",
+		"amount": 120000, "category": "购物", "type": "expense",
 		"is_installment": true, "repayment_day": 25,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("更新失败: %d %s", w.Code, w.Body.String())
@@ -187,7 +187,7 @@ func TestUpdateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 
 	// 期数越上限 → 400
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 120000, "category": "数码器材", "type": "expense",
+		"amount": 120000, "category": "购物", "type": "expense",
 		"is_installment": true, "installment_months": 99,
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("分期期数 >60 应 400: %d %s", w.Code, w.Body.String())
@@ -195,7 +195,7 @@ func TestUpdateTransactionRepaymentDayDerivesFromChannel(t *testing.T) {
 
 	// 分期总额与账单金额不一致 → 400
 	if w := doJSON(r, http.MethodPut, path, token, map[string]any{
-		"amount": 120000, "category": "数码器材", "type": "expense",
+		"amount": 120000, "category": "购物", "type": "expense",
 		"is_installment": true, "installment_total_amount": 999,
 	}); w.Code != http.StatusBadRequest {
 		t.Fatalf("分期总额与金额不一致应 400: %d %s", w.Code, w.Body.String())
@@ -460,7 +460,7 @@ func TestEnsureCustomInstallmentChannelMigration(t *testing.T) {
 		setupContractRouter(t)
 		for _, day := range []int{25, 25, 10} {
 			tx := models.Transaction{
-				Amount: 100000, Type: "expense", Category: "数码器材",
+				Amount: 100000, Type: "expense", Category: "购物",
 				IsInstallment: true, InstallmentChannelCode: "custom",
 				InstallmentMonths: 12, InstallmentTotalAmount: 100000, RepaymentDay: day,
 			}
@@ -567,7 +567,7 @@ func TestTransactionCategoryDictionary(t *testing.T) {
 	}
 	// income 内建分类放行
 	if w := doJSON(r, http.MethodPost, "/api/v1/transactions", token, map[string]any{
-		"amount": 100, "type": "income", "category": "稿酬设计",
+		"amount": 100, "type": "income", "category": "副业",
 	}); w.Code != http.StatusOK {
 		t.Fatalf("income 内建分类应放行: %d %s", w.Code, w.Body.String())
 	}

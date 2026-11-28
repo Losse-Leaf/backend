@@ -211,10 +211,13 @@ func main() {
 			write.POST("/installment-items/:id/unpay", handlers.UnpayInstallmentItem)
 			write.POST("/installment-plans/:id/settle", handlers.SettleInstallmentPlan)
 
-			// 用户自定义分类字典管理 (支出/收入/支付方式)
+			// 用户自定义分类字典管理 (支出/收入/支付方式) 与自动归类记忆规则
 			write.POST("/categories", handlers.CreateCategory)
 			write.PUT("/categories/:id", handlers.UpdateCategory)
 			write.DELETE("/categories/:id", handlers.DeleteCategory)
+			write.GET("/category-rules", handlers.GetCategoryRules)
+			write.PUT("/category-rules", handlers.UpsertCategoryRule)
+			write.DELETE("/category-rules/:id", handlers.DeleteCategoryRule)
 
 			// Wishes (心愿单与记账联动)
 			write.POST("/wishes", handlers.CreateWish)

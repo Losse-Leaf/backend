@@ -366,6 +366,7 @@ func UpdateTransaction(c *gin.Context) {
 		Error(c, http.StatusNotFound, "账目记录不存在")
 		return
 	}
+	oldCategory := tx.Category
 
 	var req TransactionRequest
 	rawBytes, _ := io.ReadAll(c.Request.Body)
@@ -504,6 +505,9 @@ func UpdateTransaction(c *gin.Context) {
 	if err := db.DB.Save(&tx).Error; err != nil {
 		Error(c, http.StatusInternalServerError, "更新账目失败")
 		return
+	}
+	if tx.Source != "installment_repay" && tx.Category != oldCategory {
+		LearnMerchantCategoryRule(db.DB, tx.Type, tx.Title, tx.Category)
 	}
 	InvalidateStatsCache()
 
